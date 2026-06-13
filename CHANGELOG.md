@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-06-13
+
 ### Added
 - Initial implementation: streaming, query-grouped SAM/BAM in, BAM out.
 - Per-template unconverted-read decision using all primary + supplementary
@@ -60,4 +62,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   highest), so neither read's calls dominate the whole overlap. Improves accuracy
   for short-insert / cfDNA libraries and avoids redundant work.
 
-[Unreleased]: https://github.com/fulcrumgenomics/methylsieve/commits/main
+[Unreleased]: https://github.com/fulcrumgenomics/methylsieve/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/fulcrumgenomics/methylsieve/releases/tag/v0.1.0
