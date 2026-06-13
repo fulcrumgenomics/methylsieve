@@ -1,0 +1,30 @@
+# Fast smoke configuration: a couple of small datasets over a 1 Mb sub-region
+# of chr21, single replicate. Validates the whole simulate -> run -> score ->
+# aggregate path end to end in a few minutes. Run with:
+#   ./run.sh config/smoke.config.yaml
+datasets_tsv: config/smoke.datasets.tsv
+
+reference_url: https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr21.fa.gz
+reference: ""
+region_bed: config/smoke.region.bed
+
+methylation_rate: 0.75
+methylation_seed: 42
+conversion_mode: em-seq
+
+replicates: 1
+tools:
+  - methylsieve
+  - neb
+  - biscuit
+  # - bismark
+
+mixed_policy: non-converted
+
+methylsieve_mode: adaptive
+neb_c_count: 3
+biscuit_max_retention: 3
+
+methylsieve_bin: ../target/release/methylsieve
+holodeck_bin: holodeck
+neb_script: mark-nonconverted-reads.py

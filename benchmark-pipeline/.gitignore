@@ -1,0 +1,9 @@
+results/
+.results*/
+data/
+.snakemake/
+.pixi/
+.rust/
+*.log
+__pycache__/
+*.pyc

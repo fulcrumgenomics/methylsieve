@@ -1,0 +1,50 @@
+[package]
+name = "methylsieve"
+version = "0.1.0"
+authors = ["Tim Fennell <tim@fulcrumgenomics.com>"]
+description = "Fast per-template tagging and filtering of unconverted reads in bisulfite / EM-seq SAM/BAM files"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/fulcrumgenomics/methylsieve"
+repository = "https://github.com/fulcrumgenomics/methylsieve"
+keywords = ["bioinformatics", "genomics", "bisulfite", "methylation", "bam"]
+categories = ["science::bioinformatics", "command-line-utilities"]
+# Ship only what's needed to build/use the crate; keep dev/benchmark/docs trees
+# out of the published tarball (the README's images load from raw URLs).
+exclude = ["/benchmark-pipeline", "/dev", "/docs", "/.github"]
+
+[[bin]]
+name = "methylsieve"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+bgzf = "0.3.0"
+clap = { version = "4", features = ["derive", "wrap_help"] }
+env_logger = "0.11"
+fgumi-raw-bam = "0.2.0"
+libc = "0.2"
+libdeflater = "1.25"
+log = "0.4"
+memchr = "2"
+mimalloc = { version = "0.1", default-features = false }
+noodles-core = "0.20"
+noodles-fasta = "0.62"
+noodles-sam = "0.85"
+ringbuf = "0.5"
+wide = "1.4"
+
+[dev-dependencies]
+# Test-only: read methylsieve's BAM output back for assertions without
+# shelling out to `samtools`. noodles-util auto-detects SAM/BAM and yields
+# RecordBufs; noodles-bam's lazy reader is used where a test must observe the
+# physical aux tags. Versions track noodles-sam 0.85.
+noodles-bam = "0.90"
+noodles-util = { version = "0.80", features = ["alignment"] }
+tempfile = "3"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1

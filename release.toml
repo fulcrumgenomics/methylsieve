@@ -1,0 +1,52 @@
+# Configuration for `cargo release` (https://github.com/crate-ci/cargo-release).
+#
+# Releases are cut locally from `main` (not via CI):
+#
+#   cargo release 0.1.0 --execute  # first release: ship the current 0.1.0 (no bump)
+#   cargo release patch            # preview a 0.1.0 -> 0.1.1 release (dry-run by default)
+#   cargo release patch --execute  # actually bump, changelog, commit, tag, push, and publish
+#
+# A release run will: run the full CI gate (fmt + lint + test) as a pre-release
+# hook, bump the version in Cargo.toml/Cargo.lock, roll the CHANGELOG's
+# `[Unreleased]` section into a dated version section, commit, create an
+# annotated `vX.Y.Z` tag, push the branch and tag to origin, and publish to
+# crates.io.
+
+# Only ever release from main -- guards against tagging a feature branch.
+allow-branch = ["main"]
+
+# Publish the crate to crates.io as part of the release.
+publish = true
+
+# Build-verify the package before publishing (cargo publish does this anyway,
+# but being explicit documents intent).
+verify = true
+
+# Push the release commit and tag to origin after a successful publish.
+push = true
+
+# Commit/tag wording. The tag name defaults to `v{{version}}` for a single-
+# package repo, so it is left at the default.
+pre-release-commit-message = "chore: release version {{version}}"
+tag-message = "Release {{version}}"
+
+# Run the same gate CI runs before allowing a release to proceed.
+pre-release-hook = ["sh", "-c", "cargo ci-fmt && cargo ci-lint && cargo ci-test"]
+
+# Roll the CHANGELOG forward as part of the release commit. The `[Unreleased]`
+# heading gains a new dated version section beneath it (the accumulated notes
+# move under it), and the link-reference footer is rewritten so `[Unreleased]`
+# compares against the new tag with a fresh `[X.Y.Z]` link inserted.
+#
+# Two footer rules cover the lifetime of the changelog: the first rolls an
+# existing `compare/...HEAD` link forward (every release after the first), the
+# second converts the initial `commits/main` link on the very first release.
+# `min = 0` lets whichever rule does not apply match zero times. The compare-roll
+# rule is listed FIRST so it cannot match the `compare/...HEAD` link that the
+# first-release rule itself produces -- otherwise the footer is rewritten twice
+# in a single run.
+pre-release-replacements = [
+  { file = "CHANGELOG.md", search = "## \\[Unreleased\\]", replace = "## [Unreleased]\n\n## [{{version}}] - {{date}}", exactly = 1 },
+  { file = "CHANGELOG.md", search = "\\[Unreleased\\]: https://github.com/fulcrumgenomics/methylsieve/compare/v[0-9.]+\\.\\.\\.HEAD", replace = "[Unreleased]: https://github.com/fulcrumgenomics/methylsieve/compare/v{{version}}...HEAD\n[{{version}}]: https://github.com/fulcrumgenomics/methylsieve/compare/v{{prev_version}}...v{{version}}", min = 0 },
+  { file = "CHANGELOG.md", search = "\\[Unreleased\\]: https://github.com/fulcrumgenomics/methylsieve/commits/main", replace = "[Unreleased]: https://github.com/fulcrumgenomics/methylsieve/compare/v{{version}}...HEAD\n[{{version}}]: https://github.com/fulcrumgenomics/methylsieve/releases/tag/v{{version}}", min = 0 },
+]

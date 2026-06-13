@@ -1,0 +1,52 @@
+# methylsieve conversion-failure benchmark — main configuration.
+#
+# The dataset matrix lives in a separate TSV (one row per simulated dataset);
+# this file holds the globals shared across all datasets. Override any key on
+# the command line, e.g. `./run.sh -- --config replicates=1`.
+
+# ---- dataset matrix -------------------------------------------------------
+datasets_tsv: config/datasets.tsv
+
+# ---- reference ------------------------------------------------------------
+# By default the pipeline downloads UCSC hg38 chr21 and faidx's it. To use a
+# local reference instead, set `reference:` to a faidx'd FASTA path (it takes
+# precedence over reference_url).
+reference_url: https://hgdownload.soe.ucsc.edu/goldenPath/hg38/chromosomes/chr21.fa.gz
+reference: ""
+
+# Optional BED restricting simulation to these regions (holodeck `-b`). Leave
+# empty to simulate across the whole reference; set it for fast smoke runs.
+region_bed: ""
+
+# ---- methylation truth ----------------------------------------------------
+# A single `holodeck methylate` run (fixed seed) produces the methylation-
+# annotated VCF reused by every dataset, so all datasets share one methylome.
+methylation_rate: 0.75      # per-CpG methylation probability
+methylation_seed: 42        # fixed seed for the shared methylate step
+conversion_mode: em-seq     # holodeck simulate --methylation-mode (em-seq | taps)
+
+# ---- benchmark matrix -----------------------------------------------------
+replicates: 2               # timed repetitions per (dataset x tool)
+tools:                      # bismark needs `pixi install -e bismark` (heavy deps)
+  - methylsieve
+  - neb
+  - biscuit
+  - bismark
+
+# How a template whose two mates disagree (one flagged, one not) is folded into
+# sensitivity/specificity by collate.py: converted | non-converted | separate.
+# Default treats a split template as a positive (flagged) call.
+mixed_policy: non-converted
+
+# ---- tool invocation knobs ------------------------------------------------
+methylsieve_mode: adaptive  # methylsieve --mode (count | proportion | either | adaptive)
+neb_c_count: 3              # NEB --c_count: min non-CpG retained C's to flag a read
+biscuit_max_retention: 3    # imposed non-CpG retention threshold for a biscuit "call"
+
+# ---- binaries -------------------------------------------------------------
+# methylsieve is built from this repo by install.sh; holodeck, the NEB script,
+# biscuit, and bismark all come from conda via pixi and resolve on PATH. Override
+# here if your layout differs.
+methylsieve_bin: ../target/release/methylsieve
+holodeck_bin: holodeck
+neb_script: mark-nonconverted-reads.py

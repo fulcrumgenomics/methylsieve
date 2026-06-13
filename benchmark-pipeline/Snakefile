@@ -1,0 +1,416 @@
+# methylsieve conversion-failure benchmark.
+#
+# Measures runtime/CPU/RSS and detection accuracy (sensitivity/specificity/PPV)
+# of methylsieve vs peer conversion-failure callers, using holodeck's golden
+# BAM as ground truth. We deliberately SKIP alignment: holodeck writes a golden
+# BAM with correct coordinates plus a per-molecule `cf:i:{0|1}` truth tag, so
+# every tool runs directly on that BAM. This isolates conversion-filtering from
+# alignment quality and gives every tool the same, perfectly-aligned input.
+#
+# Flow:   fetch_reference -> methylate (once) -> simulate (per dataset)
+#         -> run_<tool> (timed) -> score -> aggregate -> results/benchmark.tsv
+#
+# All rules live in this one file; only the Python helpers are split out under
+# workflow/scripts/.
+#
+# ---- timed runs ----------------------------------------------------------
+# Each `run_<tool>` rule grabs the whole `bench` pool (size 100, set in run.sh
+# via `--resources bench=100`) so no two timed measurements overlap, keeping
+# wall-time free of contention. Untimed prep/score/aggregate rules claim
+# `bench=1` and run up to `--cores` freely between timed jobs.
+
+import csv
+import re
+
+configfile: "config/config.yaml"
+
+shell.prefix("set -euo pipefail; ")
+
+# ---- config ---------------------------------------------------------------
+DATASETS_TSV     = config["datasets_tsv"]
+REFERENCE_URL    = config.get("reference_url", "")
+REFERENCE_LOCAL  = config.get("reference", "")
+REGION_BED       = config.get("region_bed", "")
+METHYLATION_RATE = config["methylation_rate"]
+METHYLATION_SEED = config["methylation_seed"]
+CONVERSION_MODE  = config["conversion_mode"]
+REPLICATES       = int(config["replicates"])
+TOOLS            = list(config["tools"])
+MIXED_POLICY     = config["mixed_policy"]
+METHYLSIEVE_MODE = config.get("methylsieve_mode", "adaptive")
+NEB_C_COUNT      = int(config.get("neb_c_count", 3))
+BISCUIT_MAX_RET  = int(config.get("biscuit_max_retention", 3))
+
+METHYLSIEVE_BIN  = config["methylsieve_bin"]
+HOLODECK_BIN     = config["holodeck_bin"]
+NEB_SCRIPT       = config["neb_script"]
+
+REFERENCE     = "results/reference/genome.fa"
+METHYLOME_VCF = "results/meth/methylome.vcf.gz"
+REPS          = list(range(1, REPLICATES + 1))
+
+
+# ---- dataset matrix -------------------------------------------------------
+def load_datasets(path):
+    """Parse datasets.tsv into {id: {col: value}}; `id` is the index column."""
+    rows = {}
+    with open(path) as fh:
+        for raw in csv.DictReader(fh, delimiter="\t"):
+            row = {k: (v.strip() if v is not None else v) for k, v in raw.items() if k}
+            rows[row["id"]] = row
+    if not rows:
+        raise ValueError(f"no datasets found in {path}")
+    return rows
+
+
+DATASETS = load_datasets(DATASETS_TSV)
+IDS = list(DATASETS.keys())
+
+
+def is_paired(dataset_id):
+    return DATASETS[dataset_id]["layout"].upper() == "PE"
+
+
+def tool_output(wildcards):
+    """The timed primary output of run_<tool> that `score` reads."""
+    base = f"results/run/{wildcards.id}/{wildcards.tool}/rep{wildcards.rep}"
+    return {
+        "methylsieve": f"{base}/out.bam",
+        "neb":         f"{base}/out.sam",
+        "biscuit":     f"{base}/out.bam",
+        "bismark":     f"{base}/removed.bam",
+    }[wildcards.tool]
+
+
+wildcard_constraints:
+    id   = "|".join(re.escape(i) for i in IDS),
+    tool = "|".join(re.escape(t) for t in TOOLS),
+    rep  = r"\d+",
+
+
+# ---- targets --------------------------------------------------------------
+rule all:
+    input:
+        "results/benchmark.tsv",
+
+
+# ---- reference ------------------------------------------------------------
+rule fetch_reference:
+    output:
+        fa  = REFERENCE,
+        fai = REFERENCE + ".fai",
+    params:
+        url   = REFERENCE_URL,
+        local = REFERENCE_LOCAL,
+    resources:
+        bench = 1,
+    shell:
+        # Hard-unmask (uppercase) the reference. UCSC chromosomes/ FASTAs are
+        # SOFT-MASKED (~44% lowercase repeat bases); NEB mark-nonconverted-reads
+        # does a CASE-SENSITIVE reference base check and silently undercounts
+        # unconverted Cs in lowercase regions (missing ~1/3 of failures). We
+        # uppercase so the benchmark compares conversion detection, not
+        # reference-case handling; methylsieve/biscuit canonicalize case anyway.
+        r"""
+        mkdir -p $(dirname {output.fa})
+        if [ -n "{params.local}" ]; then
+            awk '/^>/{{print;next}}{{print toupper($0)}}' "{params.local}" > {output.fa}
+        else
+            curl -fsSL "{params.url}" -o {output.fa}.gz
+            gzip -dc {output.fa}.gz | awk '/^>/{{print;next}}{{print toupper($0)}}' > {output.fa}
+            rm -f {output.fa}.gz
+        fi
+        samtools faidx {output.fa}
+        """
+
+
+# ---- methylation truth (one shared methylome) -----------------------------
+rule methylate:
+    input:
+        fa  = REFERENCE,
+        fai = REFERENCE + ".fai",
+    output:
+        vcf = METHYLOME_VCF,
+    params:
+        holodeck = HOLODECK_BIN,
+        rate     = METHYLATION_RATE,
+        seed     = METHYLATION_SEED,
+    resources:
+        bench = 1,
+    shell:
+        r"""
+        mkdir -p $(dirname {output.vcf})
+        # holodeck >=0.3 models methylation per CpG context (island/shore/
+        # open-sea); set all three equal to keep a single uniform rate.
+        {params.holodeck} methylate \
+            -r {input.fa} \
+            -o {output.vcf} \
+            --methylation-rate-island {params.rate} \
+            --methylation-rate-shore {params.rate} \
+            --methylation-rate-open-sea {params.rate} \
+            --seed {params.seed}
+        """
+
+
+# ---- simulate one dataset (golden BAM carries cf:i truth) -----------------
+rule simulate:
+    input:
+        fa  = REFERENCE,
+        fai = REFERENCE + ".fai",
+        vcf = METHYLOME_VCF,
+    output:
+        golden = "results/sim/{id}/{id}.golden.bam",
+    params:
+        holodeck    = HOLODECK_BIN,
+        prefix      = "results/sim/{id}/{id}",
+        coverage    = lambda wc: DATASETS[wc.id]["coverage"],
+        read_length = lambda wc: DATASETS[wc.id]["read_length"],
+        frag_mean   = lambda wc: DATASETS[wc.id]["fragment_mean"],
+        frag_stddev = lambda wc: DATASETS[wc.id]["fragment_stddev"],
+        conv_rate   = lambda wc: DATASETS[wc.id]["conversion_rate"],
+        fail_rate   = lambda wc: DATASETS[wc.id]["failure_rate"],
+        seed        = lambda wc: DATASETS[wc.id]["seed"],
+        # Per-base error ramps from min (read start) to max (read end). Optional
+        # columns; default to holodeck's defaults when absent.
+        min_err     = lambda wc: DATASETS[wc.id].get("min_error_rate") or "0.001",
+        max_err     = lambda wc: DATASETS[wc.id].get("max_error_rate") or "0.01",
+        mode        = CONVERSION_MODE,
+        single_end  = lambda wc: "" if is_paired(wc.id) else "--single-end",
+        region      = lambda wc: (f"-b {REGION_BED}" if REGION_BED else ""),
+    resources:
+        bench = 1,
+    shell:
+        r"""
+        mkdir -p $(dirname {params.prefix})
+        # Emit an UNCOMPRESSED golden BAM (--compression 0). The query-grouped
+        # tools read it directly, mirroring an aligner streaming uncompressed BAM
+        # into the tool, so the timed window pays no BGZF-inflate tax.
+        {params.holodeck} simulate \
+            -r {input.fa} \
+            -v {input.vcf} \
+            -o {params.prefix} \
+            -c {params.coverage} \
+            -l {params.read_length} \
+            -d {params.frag_mean} \
+            -s {params.frag_stddev} \
+            --min-error-rate {params.min_err} \
+            --max-error-rate {params.max_err} \
+            --methylation-mode {params.mode} \
+            --methylation-conversion-rate {params.conv_rate} \
+            --methylation-failure-rate {params.fail_rate} \
+            --golden-bam \
+            --compression 0 \
+            --seed {params.seed} \
+            {params.single_end} {params.region}
+        # The pipeline is golden-BAM-only; holodeck also emits FASTQs we never
+        # consume. Drop them so they don't sit on disk (hundreds of MB/dataset).
+        rm -f {params.prefix}.r1.fastq.gz {params.prefix}.r2.fastq.gz
+        """
+
+
+# ---- timed tool runs (golden BAM in, tagged/filtered output out) ----------
+rule run_methylsieve:
+    input:
+        golden = "results/sim/{id}/{id}.golden.bam",
+        fa     = REFERENCE,
+        fai    = REFERENCE + ".fai",
+    output:
+        # temp(): the scored output BAM is deleted once `score` consumes it, so
+        # the (identical across reps) multi-hundred-MB outputs never accumulate.
+        bam      = temp("results/run/{id}/methylsieve/rep{rep}/out.bam"),
+        time_txt = "results/run/{id}/methylsieve/rep{rep}/time.txt",
+    params:
+        bin  = METHYLSIEVE_BIN,
+        mode = METHYLSIEVE_MODE,
+    threads: 3   # methylsieve: one input-IO + one worker + one output-IO thread
+    resources:
+        bench = 100,
+    shell:
+        r"""
+        # --no-check-crc skips BGZF CRC32 (off by default on a stdin pipe), so a
+        # file input mirrors the `aligner | methylsieve` deployment.
+        env time -v -o {output.time_txt} \
+            {params.bin} -i {input.golden} -o {output.bam} -r {input.fa} \
+                --mode {params.mode} --no-check-crc
+        """
+
+
+rule run_neb:
+    input:
+        golden = "results/sim/{id}/{id}.golden.bam",
+        fa     = REFERENCE,
+        fai    = REFERENCE + ".fai",
+    output:
+        sam      = temp("results/run/{id}/neb/rep{rep}/out.sam"),
+        time_txt = "results/run/{id}/neb/rep{rep}/time.txt",
+    params:
+        script  = NEB_SCRIPT,
+        c_count = NEB_C_COUNT,
+    threads: 1
+    resources:
+        bench = 100,
+    shell:
+        # NEB always writes SAM (pysam mode "wh"); --flag_reads OR's 0x200 onto
+        # a flagged read in addition to the always-present XX:Z:UC tag.
+        r"""
+        env time -v -o {output.time_txt} \
+            {params.script} \
+                --bam {input.golden} \
+                --reference {input.fa} \
+                --out {output.sam} \
+                --c_count {params.c_count} \
+                --flag_reads
+        """
+
+
+# biscuit is a coordinate-sorted-BAM tool: `bsconv` fetches reference context per
+# read through a locality-assuming cache, so the query-grouped golden BAM (random
+# genomic order) thrashes it (~60x slower). Sort once per dataset as UNTIMED prep
+# (biscuit's own aligner emits sorted BAMs, so this is its natural input); the
+# sort order never changes which reads bsconv flags. Shared across biscuit reps.
+rule sort_for_biscuit:
+    input:
+        golden = "results/sim/{id}/{id}.golden.bam",
+    output:
+        bam = temp("results/sim/{id}/{id}.coordsort.bam"),
+    threads: 4
+    resources:
+        bench = 1,
+    shell:
+        # -l 0: uncompressed sorted BAM so biscuit pays no inflate tax either
+        # (mirrors `samtools sort | biscuit bsconv`).
+        "samtools sort -@ {threads} -l 0 -o {output.bam} {input.golden}"
+
+
+rule run_biscuit:
+    input:
+        sorted = "results/sim/{id}/{id}.coordsort.bam",
+        fa     = REFERENCE,
+        fai    = REFERENCE + ".fai",
+    output:
+        bam      = temp("results/run/{id}/biscuit/rep{rep}/out.bam"),
+        time_txt = "results/run/{id}/biscuit/rep{rep}/time.txt",
+    params:
+        raw     = "results/run/{id}/biscuit/rep{rep}/out.raw",
+        max_ret = BISCUIT_MAX_RET,
+    threads: 1
+    resources:
+        bench = 100,
+    shell:
+        # `biscuit bsconv -m N -v` emits ONLY the reads whose non-CpG (CpH)
+        # retention exceeds N — i.e. the reads biscuit calls unconverted. Using
+        # `-m (threshold-1)` makes the cutoff "retention >= threshold". Like
+        # bismark's removed-seqs BAM, membership in this output is the call, so
+        # the scorer needs no tag parsing. Only biscuit is timed; the untimed
+        # `samtools view -b` normalizes its stdout (SAM or BAM) to BAM.
+        r"""
+        m=$(( {params.max_ret} - 1 ))
+        env time -v -o {output.time_txt} \
+            biscuit bsconv -m "$m" -v {input.fa} {input.sorted} > {params.raw}
+        samtools view -b -o {output.bam} {params.raw}
+        rm -f {params.raw}
+        """
+
+
+rule run_bismark:
+    # DEFERRED / optional. filter_non_conversion needs Bismark-native XM/XR/XG
+    # tags; holodeck's golden BAM carries them, so attempt it directly. Runs in
+    # the optional `bismark` pixi env. Enable by adding `bismark` to `tools`
+    # after `pixi install -e bismark`.
+    input:
+        golden = "results/sim/{id}/{id}.golden.bam",
+    output:
+        removed  = temp("results/run/{id}/bismark/rep{rep}/removed.bam"),
+        time_txt = "results/run/{id}/bismark/rep{rep}/time.txt",
+    params:
+        paired = lambda wc: "--paired" if is_paired(wc.id) else "--single",
+        outdir = "results/run/{id}/bismark/rep{rep}",
+    threads: 1
+    resources:
+        bench = 100,
+    shell:
+        # filter_non_conversion writes its outputs NEXT TO the input file, named
+        # after it (and may resolve symlinks). Copy the golden BAM into this
+        # rep-private dir and run on that local copy so every artifact lands
+        # here, instead of polluting results/sim/ and racing across reps. Only
+        # the tool is timed; the copy and cleanup are untimed.
+        r"""
+        mkdir -p {params.outdir}
+        cp -f {input.golden} {params.outdir}/in.bam
+        ( cd {params.outdir} && \
+          env time -v -o time.txt \
+            pixi run -e bismark filter_non_conversion {params.paired} in.bam )
+        removed=$(ls {params.outdir}/in*removed_seqs.bam 2>/dev/null | head -1 || true)
+        if [ -z "$removed" ]; then
+            echo "ERROR: bismark filter_non_conversion produced no *removed_seqs.bam" >&2
+            echo "       (the golden BAM was likely rejected as non-Bismark-native)." >&2
+            exit 1
+        fi
+        mv "$removed" {output.removed}
+        rm -f {params.outdir}/in.bam {params.outdir}/in*nonCG_filtered.bam \
+              {params.outdir}/in*non-conversion_filtering.txt
+        """
+
+
+# ---- score one (dataset x tool x rep) -------------------------------------
+rule score:
+    input:
+        golden   = "results/sim/{id}/{id}.golden.bam",
+        tool_out = tool_output,
+    output:
+        metrics = "results/score/{id}/{tool}/rep{rep}/metrics.tsv",
+    params:
+        caller = lambda wc: wc.tool,
+        layout = lambda wc: DATASETS[wc.id]["layout"],
+    resources:
+        bench = 1,
+    shell:
+        r"""
+        mkdir -p $(dirname {output.metrics})
+        python workflow/scripts/score_conversion.py \
+            --golden {input.golden} \
+            --tool-output {input.tool_out} \
+            --caller {params.caller} \
+            --layout {params.layout} \
+            --output {output.metrics}
+        """
+
+
+# ---- provenance -----------------------------------------------------------
+rule host_info:
+    output:
+        "results/host.json",
+    resources:
+        bench = 1,
+    shell:
+        "python workflow/scripts/host_info.py > {output}"
+
+
+# ---- aggregate into the big table -----------------------------------------
+rule aggregate:
+    input:
+        metrics  = expand("results/score/{id}/{tool}/rep{rep}/metrics.tsv",
+                           id=IDS, tool=TOOLS, rep=REPS),
+        times    = expand("results/run/{id}/{tool}/rep{rep}/time.txt",
+                           id=IDS, tool=TOOLS, rep=REPS),
+        host     = "results/host.json",
+        datasets = DATASETS_TSV,
+    output:
+        tsv = "results/benchmark.tsv",
+    params:
+        mixed_policy    = MIXED_POLICY,
+        methylsieve_bin = METHYLSIEVE_BIN,
+        holodeck_bin    = HOLODECK_BIN,
+    resources:
+        bench = 1,
+    shell:
+        r"""
+        python workflow/scripts/collate.py \
+            --results-dir results \
+            --datasets {input.datasets} \
+            --host {input.host} \
+            --mixed-policy {params.mixed_policy} \
+            --methylsieve-bin {params.methylsieve_bin} \
+            --holodeck-bin {params.holodeck_bin} \
+            --output {output.tsv}
+        """

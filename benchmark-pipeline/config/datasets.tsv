@@ -1,0 +1,6 @@
+id	layout	read_length	fragment_mean	fragment_stddev	coverage	conversion_rate	failure_rate	min_error_rate	max_error_rate	seed
+ins350_2x150	PE	150	350	50	32	0.999	0.01	0.001	0.02	101
+cfdna_2x150	PE	150	167	30	32	0.999	0.01	0.001	0.02	102
+ins350_1x150	SE	150	350	50	32	0.999	0.01	0.001	0.02	103
+cfdna-2nuc_1x400	SE	400	340	15	32	0.999	0.01	0.005	0.02	104
+ins350_2x150_hifail	PE	150	350	50	32	0.999	0.20	0.001	0.02	105

@@ -1,0 +1,32 @@
+[workspace]
+name = "methylsieve-bench"
+description = "Benchmark methylsieve vs peer bisulfite/EM-seq conversion-failure callers on holodeck golden BAMs"
+channels = ["conda-forge", "bioconda"]
+# Only the two platforms we actually run on. biscuit ships native arm64 + linux
+# builds and bismark is noarch, so both resolve here. Add linux-aarch64/osx-64
+# only after confirming the peer tools resolve there.
+platforms = ["osx-arm64", "linux-64"]
+
+[dependencies]
+python = ">=3.11"
+snakemake-minimal = ">=8"
+pandas = ">=2.0"
+pyyaml = ">=6"
+samtools = "*"   # faidx, view, sort
+pysam = "*"      # BAM I/O for score_conversion.py and the NEB script
+time = "*"       # GNU /usr/bin/time -v for wall/user/sys/rss measurement
+curl = "*"       # fetch the reference FASTA
+holodeck = ">=0.3"   # simulator: golden BAM with cf:i conversion-failure truth
+biscuit = "*"    # peer caller: `biscuit bsconv`
+mark-nonconverted-reads = "*"   # peer caller: NEB's mark-nonconverted-reads.py
+
+# bismark's filter_non_conversion is DEFERRED: it needs a Bismark-native BAM
+# (its own XM/XR/XG tags in mate-adjacent order). The conda package also pulls
+# in heavy aligners (bowtie2/hisat2/minimap2), so it lives in its own optional
+# environment to keep the default install lean. Enable with
+# `pixi install -e bismark` and add `bismark` to config.yaml's `tools` list.
+[feature.bismark.dependencies]
+bismark = "*"
+
+[environments]
+bismark = ["bismark"]
