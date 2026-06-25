@@ -132,16 +132,18 @@ impl RecordProcessor {
                     Some(if has(rec.flags(), FLAG_REVERSE) { (os, mid) } else { (mid, oe) })
                 });
                 let trim = RecordTrim { trim_lo, trim_hi, skip: overlap_iv.or(mate_terminus) };
-                self.tally_record(rec, trim, &mut counters);
-            }
-            // M-bias accumulation is independent of the decision tally: it sees
-            // every primary mapped record (no end-trim, no overlap dedup; BQ gate
-            // only) so the per-cycle curve isn't distorted. Off the hot path —
-            // only runs when M-bias output / masking is enabled.
-            if let Some(acc) = mbias.as_deref_mut()
-                && is_primary_mapped(rec.flags())
-            {
-                self.accumulate_mbias(rec, acc);
+                // When M-bias is being collected, a primary mapped record's
+                // decision tally and M-bias accumulation share a single reference
+                // scan: the M-bias sites (every called cytosine, no trim/dedup) are
+                // a superset of the decision's, so one walk feeds both. Supplementary
+                // evidence — and every record when M-bias is off — takes the plain
+                // decision walk, leaving the masking-off hot path untouched.
+                match mbias.as_deref_mut() {
+                    Some(acc) if is_primary_mapped(rec.flags()) => {
+                        self.tally_and_accumulate(rec, trim, &mut counters, acc);
+                    }
+                    _ => self.tally_record(rec, trim, &mut counters),
+                }
             }
         }
 
@@ -476,45 +478,64 @@ impl RecordProcessor {
         }
     }
 
-    /// Accumulate per-cycle M-bias for one primary mapped record into `acc`,
-    /// dispatching once on the reference encoding. Deliberately separate from
-    /// [`Self::tally_aligned`] (the decision walk) so that hot loop is never
-    /// perturbed: this walk applies only the base-quality gate — no end-trim, no
-    /// overlap dedup — so the curve reflects every called cytosine at its true
-    /// sequencing cycle. Only reached when M-bias output / masking is enabled.
-    fn accumulate_mbias(&self, rec: &RawRecord, acc: &mut MbiasAccumulator) {
+    /// Tally one primary mapped record's decision counts **and** its per-cycle
+    /// M-bias in a single reference scan, dispatching once on the encoding.
+    ///
+    /// Used in place of a separate [`Self::tally_aligned`] + M-bias pass whenever
+    /// M-bias is being collected (`--metrics-prefix` or, pre-freeze, masking):
+    /// the M-bias sites — every called cytosine at its true cycle, no end-trim and
+    /// no overlap dedup — are a superset of the decision's, so one walk feeds both
+    /// and `classify_site` runs once per site instead of twice. The masking-off
+    /// decision path never reaches here; it keeps using [`tally_aligned`]
+    /// untouched, so that codegen-sensitive hot loop is unaffected.
+    fn tally_and_accumulate(
+        &self,
+        rec: &RawRecord,
+        trim: RecordTrim,
+        counters: &mut PerContextCounters,
+        acc: &mut MbiasAccumulator,
+    ) {
         let tid = rec.ref_id();
         match self.reference.encoding() {
             RefEncoding::Bytes => {
                 if let Some(c) = self.reference.byte_codes(tid) {
-                    self.mbias_walk(rec, c, acc);
+                    self.fused_walk(rec, c, trim, counters, acc);
                 }
             }
             RefEncoding::Nibble => {
                 if let Some(c) = self.reference.nibble_codes(tid) {
-                    self.mbias_walk(rec, c, acc);
+                    self.fused_walk(rec, c, trim, counters, acc);
                 }
             }
             RefEncoding::TwoBit => {
                 if let Some(c) = self.reference.twobit_codes(tid) {
-                    self.mbias_walk(rec, c, acc);
+                    self.fused_walk(rec, c, trim, counters, acc);
                 }
             }
         }
     }
 
-    /// Walk one record's aligned positions over a concrete reference encoding,
-    /// recording each called cytosine's `(role, end, context, cycle)` into the
-    /// M-bias accumulator. The cycle is measured from the read's 5' start
-    /// (reverse records store SEQ forward-genomic, so their 5' end is the high
-    /// stored position); single-end reads additionally record from the 3' end.
+    /// Single-scan decision tally + M-bias accumulation for one primary mapped
+    /// record over a concrete reference encoding (monomorphized per [`RefCodes`]).
     ///
-    /// A simple per-span scan (opt-in diagnostic work, not the decision hot
-    /// path): like [`tally_span`] it pre-clips each aligned op to the valid
-    /// `[0, k1)` range so the inner loop carries no per-base bounds checks, but
-    /// it applies only the base-quality gate (no end-trim, no overlap dedup) and
-    /// shares the per-site classifier with [`tally_site`] via [`classify_site`].
-    fn mbias_walk<R: RefCodes + Copy>(&self, rec: &RawRecord, refc: R, acc: &mut MbiasAccumulator) {
+    /// The scan visits the full aligned range — every called cytosine — and
+    /// records each into the M-bias accumulator at its 5' cycle (reverse records
+    /// store SEQ forward-genomic, so their 5' end is the high stored position;
+    /// single-end reads also record from the 3' end). It additionally bumps the
+    /// decision counters for the subset of sites the decision walk would have
+    /// counted: stored read position inside the trim window `[keep_lo, keep_hi)`
+    /// and genomic position outside the interior skip — exactly the range
+    /// [`tally_span`] carves out, evaluated per site here (cheap, since the site
+    /// is already classified). `classify_site` and the per-base reference probe
+    /// thus run once instead of once per walk.
+    fn fused_walk<R: RefCodes + Copy>(
+        &self,
+        rec: &RawRecord,
+        refc: R,
+        trim: RecordTrim,
+        counters: &mut PerContextCounters,
+        acc: &mut MbiasAccumulator,
+    ) {
         let seq_len = rec.l_seq() as usize;
         let pos = rec.pos();
         if seq_len == 0 || pos < 0 {
@@ -525,8 +546,17 @@ impl RecordProcessor {
         let monitor_c = monitor_c_of(f);
         let monitored_base = if monitor_c { BASE_C } else { BASE_G };
         let role = read_role(f);
+        let is_se = role == ReadRole::Se;
         let reverse = has(f, FLAG_REVERSE);
         let min_bq = self.opts.min_base_quality;
+
+        // Decision-counter gate, mirroring `tally_span` exactly: a site counts
+        // toward the decision iff its stored read position is in `[keep_lo,
+        // keep_hi)` and its genomic position is outside the interior skip. M-bias
+        // records every site regardless. An absent skip is an empty interval.
+        let keep_lo = trim.trim_lo;
+        let keep_hi = seq_len.saturating_sub(trim.trim_hi);
+        let (skip_s, skip_e) = trim.skip.unwrap_or((usize::MAX, usize::MAX));
 
         let mut read_pos = 0usize;
         let mut ref_pos = pos as usize;
@@ -551,7 +581,7 @@ impl RecordProcessor {
                         {
                             let cycle_5p = if reverse { seq_len - 1 - rp } else { rp };
                             acc.record(role, ReadEnd::FivePrime, ctx, cycle_5p, unconverted);
-                            if role == ReadRole::Se {
+                            if is_se {
                                 acc.record(
                                     role,
                                     ReadEnd::ThreePrime,
@@ -559,6 +589,9 @@ impl RecordProcessor {
                                     seq_len - 1 - cycle_5p,
                                     unconverted,
                                 );
+                            }
+                            if rp >= keep_lo && rp < keep_hi && !(gp >= skip_s && gp < skip_e) {
+                                counters.record(ctx, unconverted);
                             }
                         }
                     }
@@ -1014,9 +1047,9 @@ struct SpanParams {
 /// drop it (base quality below `min_bq`, a chromosome edge with no neighbor, or
 /// a read base that is neither the unconverted nor converted call — SNP / N).
 /// `refc[gp]` is assumed to equal the monitored base. Shared by the decision
-/// tally ([`tally_site`]) and the M-bias walk ([`RecordProcessor::mbias_walk`])
-/// so the two agree on context/edge/drop rules; `#[inline]` so it folds into the
-/// decision hot loop with no call overhead.
+/// tally ([`tally_site`]) and the fused decision+M-bias walk
+/// ([`RecordProcessor::fused_walk`]) so the two agree on context/edge/drop rules;
+/// `#[inline]` so it folds into the decision hot loop with no call overhead.
 #[inline]
 fn classify_site<R: RefCodes>(
     rec: &RawRecord,
