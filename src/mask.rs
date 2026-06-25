@@ -1,33 +1,50 @@
 //! Q2 masking of M-biased bases.
 //!
-//! Once mask lengths are frozen from the M-bias curves, each primary mapped
-//! record has its biased qualities set to a low value (`--mbias-mask-quality`,
-//! default 2) so downstream base-quality-aware callers ignore them. Nothing
-//! else about the record changes — no clip, no POS/CIGAR/tag/mate rewrite — and
-//! masked bases fall below methylsieve's own `--min-base-quality` gate, so they
-//! drop out of its tallies for free.
+//! Once mask lengths are frozen from the M-bias curves, each maskable record has
+//! its biased qualities set to a low value (`--mbias-mask-quality`, default 2) so
+//! downstream base-quality-aware callers ignore them. Nothing else about the
+//! record changes — no clip, no POS/CIGAR/tag/mate rewrite — and masked bases
+//! fall below methylsieve's own `--min-base-quality` gate, so they drop out of
+//! its tallies for free.
 //!
-//! What gets masked, per primary mapped record:
+//! **Which records are masked.** Every record that has SEQ and real base
+//! qualities and is **not** a secondary alignment — i.e. primary, supplementary,
+//! and even unmapped records. Secondary alignments are *never* masked: their SEQ
+//! is frequently absent or a hard-clipped duplicate of the primary, and
+//! base-quality-aware methylation callers ignore secondaries, so masking them is
+//! pure risk for no downstream benefit. (M-bias *measurement* — the mask lengths
+//! themselves — is still learned from primary mapped records only.) Masking runs
+//! *after* the per-template unconverted decision, so it never affects that call;
+//! it is purely an output transform for downstream callers.
+//!
+//! What gets masked, per maskable record:
 //! - **Own 5':** the first `K` sequencing cycles (low stored positions for a
 //!   forward read, high for a reverse read — SEQ is stored genomic-forward).
+//!   Cycles hard-clipped off the 5' end (e.g. a split read's supplementary) are
+//!   absent from SEQ, so the stored window is shifted by the hard-clip length and
+//!   may be empty.
 //! - **Single-end 3':** additionally the last `K_3'` cycles (its far template
 //!   end is unknown, so both ends are learned and masked).
-//! - **Orphan 3' mirror:** a paired read whose mate is unmapped masks its 3' end
-//!   by the *mate role's* 5' length, in case it read through the whole template
-//!   (no mate is present to propagate from).
-//! - **Shared masked positions (any pair orientation):** a reference position
-//!   masked in one mate is also masked in the other wherever that mate covers it.
-//!   This is the masking analogue of the overlap "count each position once" rule,
-//!   driven by reference coverage rather than strand — so it handles FR, FF, RF,
-//!   and dovetailed pairs alike, and never touches a mate that doesn't actually
-//!   cover the masked position.
+//! - **Mate-5' mirror onto 3':** a paired read that can't recover its mate's
+//!   masked positions from reference coverage — because the read itself is
+//!   unmapped, or its mate is unmapped/absent — masks its 3' end by the *mate
+//!   role's* 5' length, in case it read through to the mate's 5'. (A defensive
+//!   over-estimate; harmless, since such reads carry no methylation calls unless
+//!   later realigned.)
+//! - **Shared masked positions (any orientation, any contig):** a reference
+//!   position masked in one mate is masked in the other wherever that mate covers
+//!   it, matched by contig. This is the masking analogue of the overlap "count
+//!   each position once" rule, driven by reference coverage rather than strand —
+//!   so it handles FR/FF/RF/dovetailed pairs and split-read supplementaries that
+//!   cross an SV breakpoint onto the mate's contig alike, and never touches a
+//!   mate that doesn't actually cover the masked position.
 
 use fgumi_raw_bam::RawRecord;
 
 use crate::mbias::{DetectParams, MbiasAccumulator, ReadEnd, ReadRole, detect_mask_length};
 use crate::record::{
-    FLAG_FIRST_SEGMENT, FLAG_MATE_UNMAPPED, FLAG_PAIRED, FLAG_REVERSE, has, is_primary_mapped,
-    read_role, ref_span_for_query_window,
+    FLAG_FIRST_SEGMENT, FLAG_LAST_SEGMENT, FLAG_MATE_UNMAPPED, FLAG_PAIRED, FLAG_REVERSE,
+    FLAG_SECONDARY, FLAG_UNMAPPED, has, read_role, ref_span_for_query_window,
 };
 
 /// Frozen 5'/3' mask lengths (in sequencing cycles) per read role, plus the
@@ -81,97 +98,110 @@ impl MaskPlan {
     }
 }
 
-/// Apply `plan` to every primary mapped record of one template, in place.
+/// Apply `plan` to every maskable record of one template, in place.
 ///
-/// Three phases so cross-mate propagation can read both mates before any
-/// mutation: (1) each record's *own* mask windows (5', plus SE 3' or orphan
-/// mirror); (2) propagate masked reference positions between the two primary
-/// mates by coverage; (3) write Q2 over all collected windows.
+/// Maskable = has SEQ + real qualities and is not a secondary alignment, so
+/// primary, supplementary, and unmapped records are all masked; secondaries are
+/// skipped (see module docs). Three phases so cross-mate propagation can read
+/// every record's own windows before any mutation: (1) each record's *own* mask
+/// windows (5', plus SE 3' or the mate-5' mirror); (2) propagate masked reference
+/// positions between the two mate sides by coverage, matched on contig; (3) write
+/// the mask quality over all collected windows.
 pub(crate) fn mask_template(plan: &MaskPlan, recs: &mut [RawRecord]) {
     let n = recs.len();
 
-    // Locate the two primary mapped paired mates (for cross-mate propagation).
-    let (mut r1, mut r2) = (None, None);
-    for (i, rec) in recs.iter().enumerate() {
+    // Does a mapped (non-secondary) record exist for each segment? A paired read
+    // falls back to the mate-5' mirror when its mate has no mapped record to
+    // propagate from.
+    let (mut mapped_r1, mut mapped_r2) = (false, false);
+    for rec in recs.iter() {
         let f = rec.flags();
-        if !is_primary_mapped(f) || !has(f, FLAG_PAIRED) {
+        if has(f, FLAG_UNMAPPED | FLAG_SECONDARY) {
             continue;
         }
-        if has(f, FLAG_FIRST_SEGMENT) {
-            r1.get_or_insert(i);
-        } else {
-            r2.get_or_insert(i);
-        }
+        mapped_r1 |= has(f, FLAG_FIRST_SEGMENT);
+        mapped_r2 |= has(f, FLAG_LAST_SEGMENT);
     }
 
-    // Phase 1 — each primary mapped record's own mask windows (stored positions).
+    // Phase 1 — each maskable record's own mask windows (stored positions).
     let mut windows: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
     for i in 0..n {
+        if !maskable(&recs[i]) {
+            continue;
+        }
         let f = recs[i].flags();
-        if !is_primary_mapped(f) {
-            continue;
-        }
         let seq_len = recs[i].l_seq() as usize;
-        if seq_len == 0 {
-            continue;
-        }
         let reverse = has(f, FLAG_REVERSE);
         let role = read_role(f);
+        let (left_hard, right_hard) = hard_clips(&recs[i]);
 
-        // Own 5': low stored for a forward read, high for a reverse read.
-        let k5 = plan.role_5p(role).min(seq_len);
-        if k5 > 0 {
-            windows[i].push(if reverse { (seq_len - k5, seq_len) } else { (0, k5) });
+        // Own 5' (all roles), hard-clip-aware.
+        if let Some(w) =
+            five_prime_window(reverse, plan.role_5p(role), seq_len, left_hard, right_hard)
+        {
+            windows[i].push(w);
         }
 
         if role == ReadRole::Se {
             // Single-end: also the learned 3' end.
-            let k3 = plan.k_se_3p.min(seq_len);
-            if k3 > 0 {
-                windows[i].push(if reverse { (0, k3) } else { (seq_len - k3, seq_len) });
+            if let Some(w) =
+                three_prime_window(reverse, plan.k_se_3p, seq_len, left_hard, right_hard)
+            {
+                windows[i].push(w);
             }
         } else {
-            // Orphan (mate unmapped or absent): no mate to propagate from, so
-            // mirror the mate role's 5' onto the 3' end in case the read ran
-            // through the whole template. Present mates are handled in phase 2.
-            let mate = if has(f, FLAG_FIRST_SEGMENT) { r2 } else { r1 };
-            if has(f, FLAG_MATE_UNMAPPED) || mate.is_none() {
-                let km = plan.role_5p(role.mate()).min(seq_len);
-                if km > 0 {
-                    windows[i].push(if reverse { (0, km) } else { (seq_len - km, seq_len) });
+            // Paired read that can't rely on reference-coverage propagation
+            // (phase 2) — its mate is unmapped/absent, or the read itself is
+            // unmapped — mirrors the mate role's 5' length onto its 3' end, in
+            // case it read through to the mate's 5'.
+            let mate_present = if has(f, FLAG_FIRST_SEGMENT) { mapped_r2 } else { mapped_r1 };
+            if has(f, FLAG_UNMAPPED) || has(f, FLAG_MATE_UNMAPPED) || !mate_present {
+                let km = plan.role_5p(role.mate());
+                if let Some(w) = three_prime_window(reverse, km, seq_len, left_hard, right_hard) {
+                    windows[i].push(w);
                 }
             }
         }
     }
 
-    // Phase 2 — propagate masked reference positions between the two primary
-    // mates (any orientation), when both are present, mapped, and co-located.
-    if let (Some(i1), Some(i2)) = (r1, r2)
-        && recs[i1].ref_id() >= 0
-        && recs[i1].ref_id() == recs[i2].ref_id()
-    {
-        let masked_ref_ranges = |idx: usize| -> Vec<(usize, usize)> {
-            windows[idx]
-                .iter()
-                .filter_map(|&(lo, hi)| ref_span_for_query_window(&recs[idx], lo, hi))
-                .collect()
-        };
-        let r1_ranges = masked_ref_ranges(i1);
-        let r2_ranges = masked_ref_ranges(i2);
-        // Whatever R2 masked, mask in R1 where R1 covers it, and vice versa.
-        for &(lo, hi) in &r2_ranges {
-            if let Some(w) = stored_window_for_ref(&recs[i1], lo, hi) {
-                windows[i1].push(w);
+    // Phase 2 — propagate masked reference positions between the two mate sides.
+    // Collect each side's own-window reference ranges (carrying contig) before
+    // applying anything, so propagated windows never feed back into the ranges.
+    // A position masked on one side is then masked in any propagatable record of
+    // the other side that covers it *on the same contig* — coverage- and
+    // contig-driven, so it spans split-read supplementaries that cross an SV
+    // breakpoint onto the mate's contig, not just same-contig primary mates.
+    let mut r1_ranges: Vec<(i32, usize, usize)> = Vec::new();
+    let mut r2_ranges: Vec<(i32, usize, usize)> = Vec::new();
+    for i in 0..n {
+        if windows[i].is_empty() || !propagatable(&recs[i]) {
+            continue;
+        }
+        let tid = recs[i].ref_id();
+        let side =
+            if has(recs[i].flags(), FLAG_FIRST_SEGMENT) { &mut r1_ranges } else { &mut r2_ranges };
+        for &(lo, hi) in &windows[i] {
+            if let Some((ref_lo, ref_hi)) = ref_span_for_query_window(&recs[i], lo, hi) {
+                side.push((tid, ref_lo, ref_hi));
             }
         }
-        for &(lo, hi) in &r1_ranges {
-            if let Some(w) = stored_window_for_ref(&recs[i2], lo, hi) {
-                windows[i2].push(w);
+    }
+    for i in 0..n {
+        if !propagatable(&recs[i]) {
+            continue;
+        }
+        let tid = recs[i].ref_id();
+        let other = if has(recs[i].flags(), FLAG_FIRST_SEGMENT) { &r2_ranges } else { &r1_ranges };
+        for &(rid, ref_lo, ref_hi) in other {
+            if rid == tid
+                && let Some(w) = stored_window_for_ref(&recs[i], ref_lo, ref_hi)
+            {
+                windows[i].push(w);
             }
         }
     }
 
-    // Phase 3 — write Q2 over every collected window.
+    // Phase 3 — write the mask quality over every collected window.
     for i in 0..n {
         if windows[i].is_empty() {
             continue;
@@ -184,6 +214,84 @@ pub(crate) fn mask_template(plan: &MaskPlan, recs: &mut [RawRecord]) {
             }
         }
     }
+}
+
+/// Whether a record carries sequence and real base qualities — QUAL present, not
+/// the `*` sentinel (stored as `0xFF`). The precondition for masking anything.
+fn has_seq_and_qual(rec: &RawRecord) -> bool {
+    rec.l_seq() as usize > 0 && rec.quality_scores().first().is_some_and(|&q| q != 0xFF)
+}
+
+/// Whether a record is eligible for masking: it has SEQ + real qualities and is
+/// not a secondary alignment.
+fn maskable(rec: &RawRecord) -> bool {
+    !has(rec.flags(), FLAG_SECONDARY) && has_seq_and_qual(rec)
+}
+
+/// Whether a record can take part in cross-mate reference-coverage propagation:
+/// maskable, mapped (so it has reference coordinates), and paired.
+fn propagatable(rec: &RawRecord) -> bool {
+    let f = rec.flags();
+    maskable(rec) && !has(f, FLAG_UNMAPPED) && has(f, FLAG_PAIRED) && rec.ref_id() >= 0
+}
+
+/// Leading and trailing hard-clip lengths (CIGAR `H` ops). Hard-clipped bases are
+/// absent from SEQ, so they offset the read's sequencing-cycle frame from the
+/// stored-position frame. `H` is only ever the first and/or last op; a single-op
+/// CIGAR can't be both, so trailing is taken only when there are at least two ops.
+fn hard_clips(rec: &RawRecord) -> (usize, usize) {
+    let mut ops = rec.cigar_ops_iter();
+    let Some(first) = ops.next() else {
+        return (0, 0);
+    };
+    let leading = if first & 0xf == 5 { (first >> 4) as usize } else { 0 };
+    let mut last = first;
+    let mut count = 1usize;
+    for op in ops {
+        last = op;
+        count += 1;
+    }
+    let trailing = if count > 1 && last & 0xf == 5 { (last >> 4) as usize } else { 0 };
+    (leading, trailing)
+}
+
+/// Stored half-open window covering the `k` sequencing cycles nearest the read's
+/// **5' end**, accounting for any 5' cycles hard-clipped out of SEQ. `None` when
+/// `k == 0` or every targeted cycle was hard-clipped away.
+///
+/// SEQ is stored genomic-forward, so a forward read's 5' is the low stored end
+/// (clipped by `left_hard`) and a reverse read's is the high stored end (clipped
+/// by `right_hard`). With no hard clips this is just `[0, k)` / `[len - k, len)`.
+fn five_prime_window(
+    reverse: bool,
+    k: usize,
+    len: usize,
+    left_hard: usize,
+    right_hard: usize,
+) -> Option<(usize, usize)> {
+    if k == 0 {
+        return None;
+    }
+    if reverse {
+        let start = (len + right_hard).saturating_sub(k);
+        (start < len).then_some((start, len))
+    } else {
+        let end = k.saturating_sub(left_hard).min(len);
+        (end > 0).then_some((0, end))
+    }
+}
+
+/// Stored window for the `k` cycles nearest the read's **3' end** — the mirror of
+/// [`five_prime_window`], since the 3' end is the 5' end of the opposite
+/// orientation.
+fn three_prime_window(
+    reverse: bool,
+    k: usize,
+    len: usize,
+    left_hard: usize,
+    right_hard: usize,
+) -> Option<(usize, usize)> {
+    five_prime_window(!reverse, k, len, left_hard, right_hard)
 }
 
 /// Stored half-open window `[q_lo, q_hi)` whose aligned reference positions fall
@@ -226,16 +334,11 @@ mod tests {
     use std::io::{BufRead, Cursor};
 
     use super::*;
-    use crate::record::FLAG_LAST_SEGMENT;
+    use crate::record::{FLAG_LAST_SEGMENT, FLAG_SUPPLEMENTARY};
     use crate::sam_reader::SamReader;
 
-    /// Parse SAM lines into `RawRecord`s (correct BAM layout).
-    fn parse(records: &[&str], contig_len: usize) -> Vec<RawRecord> {
-        let mut sam = format!("@HD\tVN:1.6\tSO:unsorted\n@SQ\tSN:chr1\tLN:{contig_len}\n");
-        for r in records {
-            sam.push_str(r);
-            sam.push('\n');
-        }
+    /// Read a complete SAM document (header + records) into `RawRecord`s.
+    fn read_sam(sam: String) -> Vec<RawRecord> {
         let boxed: Box<dyn BufRead> = Box::new(Cursor::new(sam.into_bytes()));
         let mut reader = SamReader::new(boxed);
         reader.read_header().unwrap();
@@ -247,9 +350,38 @@ mod tests {
         out
     }
 
+    /// Parse SAM lines against a single `chr1` contig.
+    fn parse(records: &[&str], contig_len: usize) -> Vec<RawRecord> {
+        parse_multi(&[("chr1", contig_len)], records)
+    }
+
+    /// Parse SAM lines against an explicit set of `(name, length)` contigs.
+    fn parse_multi(contigs: &[(&str, usize)], records: &[&str]) -> Vec<RawRecord> {
+        let mut sam = String::from("@HD\tVN:1.6\tSO:unsorted\n");
+        for (name, len) in contigs {
+            sam.push_str(&format!("@SQ\tSN:{name}\tLN:{len}\n"));
+        }
+        for r in records {
+            sam.push_str(r);
+            sam.push('\n');
+        }
+        read_sam(sam)
+    }
+
     fn line(qname: &str, flag: u16, pos: u32, cigar: &str, seq: &str) -> String {
+        line_on(qname, flag, "chr1", pos, cigar, seq)
+    }
+
+    /// A mapped SAM line on an explicit contig (`I`-quality, MAPQ 60).
+    fn line_on(qname: &str, flag: u16, rname: &str, pos: u32, cigar: &str, seq: &str) -> String {
         let qual = "I".repeat(seq.len());
-        format!("{qname}\t{flag}\tchr1\t{pos}\t60\t{cigar}\t*\t0\t0\t{seq}\t{qual}")
+        format!("{qname}\t{flag}\t{rname}\t{pos}\t60\t{cigar}\t*\t0\t0\t{seq}\t{qual}")
+    }
+
+    /// An unmapped SAM line (RNAME `*`, POS 0, CIGAR `*`, MAPQ 0).
+    fn line_unmapped(qname: &str, flag: u16, seq: &str) -> String {
+        let qual = "I".repeat(seq.len());
+        format!("{qname}\t{flag}\t*\t0\t0\t*\t*\t0\t0\t{seq}\t{qual}")
     }
 
     /// Quality bytes of a record (Phred, not ASCII). Phred 40 = input 'I'.
@@ -354,5 +486,113 @@ mod tests {
         assert_eq!(&q[0..2], &[2, 2], "own 5' (k_r1) masked");
         assert_eq!(&q[7..10], &[2, 2, 2], "3' mirrored by mate role k_r2");
         assert!(q[2..7].iter().all(|&b| b == 40));
+    }
+
+    /// A supplementary alignment is masked too, but its 5' hard-clipped cycles are
+    /// absent from SEQ, so the stored window shifts by the leading hard-clip
+    /// length: a K=8 5' mask with 5 cycles hard-clipped masks only the 3 present.
+    #[test]
+    fn hard_clipped_supplementary_shifts_5p_window() {
+        let mut recs = parse(&[&line("s", R1 | FLAG_SUPPLEMENTARY, 1, "5H10M", "CACACACACA")], 40);
+        mask_template(&MaskPlan::explicit(8, 0, 2), &mut recs);
+        let q = quals(&recs[0]);
+        assert_eq!(&q[0..3], &[2, 2, 2], "8-cycle 5' mask − 5 hard-clipped = 3 stored");
+        assert!(q[3..].iter().all(|&b| b == 40), "rest untouched");
+    }
+
+    /// When the whole 5' mask falls inside the hard-clipped region, nothing in
+    /// this record's SEQ is masked.
+    #[test]
+    fn hard_clipped_supplementary_fully_past_window_masks_nothing() {
+        let mut recs = parse(&[&line("s", R1 | FLAG_SUPPLEMENTARY, 1, "10H10M", "CACACACACA")], 40);
+        mask_template(&MaskPlan::explicit(8, 0, 2), &mut recs);
+        assert!(quals(&recs[0]).iter().all(|&b| b == 40), "5' mask entirely hard-clipped away");
+    }
+
+    /// An unmapped paired read is masked defensively at both ends: own 5' by its
+    /// role's length, and the 3' by the mate role's 5' length (mirror), since it
+    /// can't recover the mate's masked positions from coverage.
+    #[test]
+    fn unmapped_paired_read_masks_own_5p_and_mate_mirror_3p() {
+        let mut recs = parse(&[&line_unmapped("u", R1 | FLAG_UNMAPPED, "CACACACACA")], 20);
+        mask_template(&MaskPlan::explicit(3, 4, 2), &mut recs);
+        let q = quals(&recs[0]);
+        assert_eq!(&q[0..3], &[2, 2, 2], "own 5' (k_r1)");
+        assert!(q[3..6].iter().all(|&b| b == 40), "middle kept");
+        assert_eq!(&q[6..10], &[2, 2, 2, 2], "mate-5' (k_r2) mirror on 3'");
+    }
+
+    /// Reverse unmapped read: 5' is the high stored end, 3' the low end (we trust
+    /// the reverse flag even with no alignment).
+    #[test]
+    fn unmapped_reverse_read_masks_correct_ends() {
+        let mut recs =
+            parse(&[&line_unmapped("u", R1 | FLAG_UNMAPPED | FLAG_REVERSE, "CACACACACA")], 20);
+        mask_template(&MaskPlan::explicit(3, 4, 2), &mut recs);
+        let q = quals(&recs[0]);
+        assert_eq!(&q[7..10], &[2, 2, 2], "own 5' at high stored end");
+        assert_eq!(&q[0..4], &[2, 2, 2, 2], "mate-5' mirror on low (3') end");
+        assert!(q[4..7].iter().all(|&b| b == 40), "middle kept");
+    }
+
+    /// Secondary alignments are never masked, even with SEQ and qualities present.
+    #[test]
+    fn secondary_alignment_is_never_masked() {
+        let mut recs = parse(&[&line("x", R1 | FLAG_SECONDARY, 1, "10M", "CACACACACA")], 20);
+        mask_template(&MaskPlan::explicit(5, 5, 2), &mut recs);
+        assert!(quals(&recs[0]).iter().all(|&b| b == 40), "secondary untouched");
+    }
+
+    /// A record with no base qualities (QUAL = `*`) is skipped — we never
+    /// fabricate qualities, so the missing-quality sentinel is left intact.
+    #[test]
+    fn record_without_qualities_is_skipped() {
+        let mut recs = parse(&["n\t65\tchr1\t1\t60\t10M\t*\t0\t0\tCACACACACA\t*"], 20);
+        mask_template(&MaskPlan::explicit(5, 0, 2), &mut recs);
+        assert!(quals(&recs[0]).iter().all(|&b| b == 0xFF), "missing QUAL left as sentinel");
+    }
+
+    /// Split read across an SV breakpoint: R1's primary maps to chr1 and R2's to
+    /// chr3, but each read's *supplementary* lands on the mate's contig. Reference
+    /// coverage propagation must cross contigs so each 5'-hard-clipped
+    /// supplementary still gets masked at the mate's biased 5' positions.
+    #[test]
+    fn sv_split_read_propagates_across_contigs() {
+        let r1_prim =
+            line_on("p", FLAG_PAIRED | FLAG_FIRST_SEGMENT, "chr1", 1, "10M", "CACACACACA");
+        let r1_supp = line_on(
+            "p",
+            FLAG_PAIRED | FLAG_FIRST_SEGMENT | FLAG_SUPPLEMENTARY,
+            "chr3",
+            1,
+            "10H10M",
+            "CACACACACA",
+        );
+        let r2_prim = line_on("p", FLAG_PAIRED | FLAG_LAST_SEGMENT, "chr3", 1, "10M", "CACACACACA");
+        let r2_supp = line_on(
+            "p",
+            FLAG_PAIRED | FLAG_LAST_SEGMENT | FLAG_SUPPLEMENTARY,
+            "chr1",
+            1,
+            "10H10M",
+            "CACACACACA",
+        );
+        let mut recs =
+            parse_multi(&[("chr1", 40), ("chr3", 40)], &[&r1_prim, &r1_supp, &r2_prim, &r2_supp]);
+        mask_template(&MaskPlan::explicit(3, 4, 2), &mut recs); // k_r1=3, k_r2=4
+
+        // R1 primary (chr1): own 5' only; R2's ranges are on chr3, so no propagation.
+        assert_eq!(&quals(&recs[0])[0..3], &[2, 2, 2], "R1 primary own 5'");
+        assert!(quals(&recs[0])[3..].iter().all(|&b| b == 40));
+        // R1 supplementary (chr3): 5'-hard-clipped (no own window) → masked only by
+        // R2's chr3 5' positions [0,4) via cross-contig propagation.
+        assert_eq!(&quals(&recs[1])[0..4], &[2, 2, 2, 2], "R1 supp masked by R2's chr3 5'");
+        assert!(quals(&recs[1])[4..].iter().all(|&b| b == 40));
+        // R2 primary (chr3): own 5' only.
+        assert_eq!(&quals(&recs[2])[0..4], &[2, 2, 2, 2], "R2 primary own 5'");
+        assert!(quals(&recs[2])[4..].iter().all(|&b| b == 40));
+        // R2 supplementary (chr1): masked by R1's chr1 5' positions [0,3).
+        assert_eq!(&quals(&recs[3])[0..3], &[2, 2, 2], "R2 supp masked by R1's chr1 5'");
+        assert!(quals(&recs[3])[3..].iter().all(|&b| b == 40));
     }
 }
