@@ -1,14 +1,12 @@
 //! Metric TSVs written under `--metrics-prefix PREFIX`:
 //!
-//! - `PREFIX.summary.tsv` — per-context conversion summary, **folded** over a
-//!   `read` dimension: one `all` row per scope (genome first, then each
-//!   `--control-contig`) carrying the per-template decision counts, followed by
-//!   `R1`/`R2`/`SE` rows (genome only) with per-read conversion broken out. The
-//!   `all` row is decision-basis (overlap-deduped, end-trimmed, includes
-//!   supplementary evidence); the per-read rows are M-bias-basis (every primary
-//!   call, base-quality-gated, no dedup), so they intentionally need not sum to
-//!   `all`. The per-read rows also carry the applied 5'/3' mask lengths (blank
-//!   when masking was not run).
+//! - `PREFIX.summary.tsv` — one per-context conversion row per scope (genome
+//!   first, then each `--control-contig`). Every row is decision-basis:
+//!   overlap-deduped, end-trimmed, and including supplementary evidence — i.e.
+//!   exactly the sites the unconverted call acted on. The applied per-read mask
+//!   lengths (`r1_mask_5p`/`r2_mask_5p`/`se_mask_5p`/`se_mask_3p`, in sequencing
+//!   cycles) ride along as run-level columns, blank when masking was not run.
+//!   Per-read conversion broken out by cycle lives in `mbias.tsv`, not here.
 //! - `PREFIX.conversion-matrix.tsv` — per-`(checked, converted)` decision cell.
 //! - `PREFIX.mbias.tsv` — per-read-cycle methylation by `(read, end, context)`.
 //!
@@ -56,7 +54,7 @@ where
 {
     let sample = resolve_sample(header, sample_override, input_path);
     write_file(&with_suffix(prefix, "summary.tsv"), |w| {
-        write_summary(w, stats, mbias, mask_plan, &sample)
+        write_summary(w, stats, mask_plan, &sample)
     })?;
     write_file(&with_suffix(prefix, "conversion-matrix.tsv"), |w| {
         write_matrix(w, stats, &sample, &classify)
@@ -87,25 +85,47 @@ where
 
 // ── summary.tsv ───────────────────────────────────────────────────────────────
 
-/// One summary row. Template-level counts are `None` where they don't apply
-/// (e.g. `n_unconverted` on a per-read row — the decision is per-template);
-/// `n_templates`/`n_mapped`/`n_evaluated` are populated on every row.
+/// One summary row — one per scope, all decision-basis.
 struct Row<'a> {
     sample: &'a str,
     scope: &'a str,
-    read: &'a str,
     n_templates: u64,
     n_mapped: u64,
     n_evaluated: u64,
-    /// Template decision counts — only the `all` rows (per-template, not per-read).
-    n_unconverted: Option<u64>,
-    /// Chimeric-to-control count — only the genome `all` row (control diagnostic).
+    n_unconverted: u64,
+    /// Chimeric-to-control count — only the genome scope (control diagnostic);
+    /// `None` for control scopes.
     chimeric_to_control: Option<u64>,
     counters: PerContextCounters,
-    /// Applied 5'/3' mask lengths (sequencing cycles) — only per-read rows when
-    /// masking was run.
-    mask_5p: Option<usize>,
-    mask_3p: Option<usize>,
+    /// Applied per-read mask lengths from the frozen plan (a run-level property
+    /// repeated on every scope row), blank when masking was not run.
+    masks: MaskCols,
+}
+
+/// The four applied mask lengths (sequencing cycles). R1/R2 are 5'-only — their
+/// 3' end is the mate's domain — so only single-end reads carry a 3' mask. All
+/// `None` when masking was not run; for a single-library-type file the unused
+/// pair is simply blank (e.g. `se_*` for a purely paired run).
+#[derive(Clone, Copy, Default)]
+struct MaskCols {
+    r1_5p: Option<usize>,
+    r2_5p: Option<usize>,
+    se_5p: Option<usize>,
+    se_3p: Option<usize>,
+}
+
+impl MaskCols {
+    fn from_plan(plan: Option<&MaskPlan>) -> Self {
+        match plan {
+            None => Self::default(),
+            Some(p) => Self {
+                r1_5p: Some(p.role_5p(ReadRole::R1)),
+                r2_5p: Some(p.role_5p(ReadRole::R2)),
+                se_5p: Some(p.role_5p(ReadRole::Se)),
+                se_3p: Some(p.k_se_3p()),
+            },
+        }
+    }
 }
 
 type ColumnFn = fn(&Row) -> String;
@@ -136,16 +156,20 @@ const COLUMNS: &[(&str, ColumnFn)] = &[
     ("sample", |r| r.sample.to_string()),
     ("methylsieve_version", |_| METHYLSIEVE_BUILD.to_string()),
     ("scope", |r| r.scope.to_string()),
-    ("read", |r| r.read.to_string()),
-    ("mask_5p", |r| opt_usize(r.mask_5p)),
-    ("mask_3p", |r| opt_usize(r.mask_3p)),
+    ("r1_mask_5p", |r| opt_usize(r.masks.r1_5p)),
+    ("r2_mask_5p", |r| opt_usize(r.masks.r2_5p)),
+    ("se_mask_5p", |r| opt_usize(r.masks.se_5p)),
+    ("se_mask_3p", |r| opt_usize(r.masks.se_3p)),
     ("n_templates", |r| r.n_templates.to_string()),
     ("n_mapped", |r| r.n_mapped.to_string()),
     ("n_evaluated", |r| r.n_evaluated.to_string()),
-    ("n_unconverted", |r| opt(r.n_unconverted)),
-    ("frac_unconverted", |r| match r.n_unconverted {
-        Some(u) if r.n_evaluated > 0 => format!("{:.6}", u as f64 / r.n_evaluated as f64),
-        _ => String::new(),
+    ("n_unconverted", |r| r.n_unconverted.to_string()),
+    ("frac_unconverted", |r| {
+        if r.n_evaluated > 0 {
+            format!("{:.6}", r.n_unconverted as f64 / r.n_evaluated as f64)
+        } else {
+            String::new()
+        }
     }),
     ("chimeric_to_control_templates", |r| opt(r.chimeric_to_control)),
     ("CpA_obs", |r| r.counters.total_for(Context::CpA).to_string()),
@@ -181,97 +205,49 @@ const COLUMNS: &[(&str, ColumnFn)] = &[
     }),
 ];
 
-/// The `all` row for a scope (decision basis). `chimeric` is the genome-only
-/// control diagnostic (`None` for control scopes).
-fn all_row<'a>(sample: &'a str, scope: &'a ScopeStats, chimeric: Option<u64>) -> Row<'a> {
+/// One scope row (decision basis). `chimeric` is the genome-only control
+/// diagnostic (`None` for control scopes); `masks` is the run-level mask plan,
+/// repeated on every row.
+fn scope_row<'a>(
+    sample: &'a str,
+    scope: &'a ScopeStats,
+    chimeric: Option<u64>,
+    masks: MaskCols,
+) -> Row<'a> {
     Row {
         sample,
         scope: &scope.name,
-        read: "all",
         n_templates: scope.n_templates,
         n_mapped: scope.n_mapped,
         n_evaluated: scope.n_evaluated,
-        n_unconverted: Some(scope.n_unconverted),
+        n_unconverted: scope.n_unconverted,
         chimeric_to_control: chimeric,
         counters: scope.counters,
-        mask_5p: None,
-        mask_3p: None,
+        masks,
     }
 }
 
-/// Per-read context counters from the M-bias accumulator (5' end, summed over
-/// all cycles): every primary call of that role, base-quality-gated. Summing the
-/// 5' end alone counts each site exactly once — including single-end reads, where
-/// every site is recorded under both ends, so the 5' sum is already the full
-/// total (summing both ends would double-count).
-fn role_counters(mbias: &MbiasAccumulator, role: ReadRole) -> PerContextCounters {
-    let mut c = PerContextCounters::default();
-    for &ctx in &Context::ALL {
-        for cc in mbias.cycles(role, ReadEnd::FivePrime, ctx) {
-            c.add_counts(ctx, cc.meth(), cc.total());
-        }
-    }
-    c
-}
-
-/// Applied 5'/3' mask lengths for a role, from the frozen plan (`None` when
-/// masking was not run). Paired reads have no learned 3' mask (their 3' is the
-/// mate's domain), so `mask_3p` is reported for single-end reads only.
-fn role_mask(plan: Option<&MaskPlan>, role: ReadRole) -> (Option<usize>, Option<usize>) {
-    match plan {
-        None => (None, None),
-        Some(p) => match role {
-            ReadRole::R1 | ReadRole::R2 => (Some(p.role_5p(role)), None),
-            ReadRole::Se => (Some(p.role_5p(ReadRole::Se)), Some(p.k_se_3p())),
-        },
-    }
-}
-
-/// Render the folded summary: a header row, then per scope an `all` row; the
-/// genome scope additionally gets `R1`/`R2`/`SE` rows from the M-bias counts.
+/// Render the summary: a header row, then one decision-basis row per scope
+/// (genome first, then each control contig). The applied mask plan rides along
+/// as run-level columns on every row.
 fn write_summary(
     w: &mut dyn Write,
     stats: &Stats,
-    mbias: &MbiasAccumulator,
     mask_plan: Option<&MaskPlan>,
     sample: &str,
 ) -> std::io::Result<()> {
     let header: String = COLUMNS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join("\t");
     writeln!(w, "{header}")?;
 
+    let masks = MaskCols::from_plan(mask_plan);
     let render = |w: &mut dyn Write, row: &Row| -> std::io::Result<()> {
         let line: String = COLUMNS.iter().map(|(_, f)| f(row)).collect::<Vec<_>>().join("\t");
         writeln!(w, "{line}")
     };
 
-    render(w, &all_row(sample, &stats.genome, Some(stats.chimeric_to_control_templates)))?;
-    // Per-read rows (genome only): M-bias-basis counters, but template
-    // denominators (`n_*`) and mask lengths from the decision-side per-role
-    // counts. Emitted when the role has data.
-    for &role in &ReadRole::ALL {
-        if mbias.has_data(role, ReadEnd::FivePrime) {
-            let i = role.index();
-            let (mask_5p, mask_3p) = role_mask(mask_plan, role);
-            render(
-                w,
-                &Row {
-                    sample,
-                    scope: &stats.genome.name,
-                    read: role.label(),
-                    n_templates: stats.genome.n_templates,
-                    n_mapped: stats.genome.mapped_by_role[i],
-                    n_evaluated: stats.genome.evaluated_by_role[i],
-                    n_unconverted: None,
-                    chimeric_to_control: None,
-                    counters: role_counters(mbias, role),
-                    mask_5p,
-                    mask_3p,
-                },
-            )?;
-        }
-    }
+    render(w, &scope_row(sample, &stats.genome, Some(stats.chimeric_to_control_templates), masks))?;
     for control in &stats.controls {
-        render(w, &all_row(sample, control, None))?;
+        render(w, &scope_row(sample, control, None, masks))?;
     }
     Ok(())
 }
@@ -410,30 +386,17 @@ mod tests {
     fn genome_with(counters: PerContextCounters, n_eval: u64, n_unconv: u64) -> Stats {
         let mut s = Stats::new(&[]);
         s.genome.n_templates = n_eval;
+        s.genome.n_mapped = n_eval;
         s.genome.n_evaluated = n_eval;
         s.genome.n_unconverted = n_unconv;
         s.genome.counters = counters;
         s
     }
 
-    fn render_summary(stats: &Stats, mbias: &MbiasAccumulator) -> String {
+    fn render_summary(stats: &Stats, mask_plan: Option<&MaskPlan>) -> String {
         let mut buf = Vec::new();
-        write_summary(&mut buf, stats, mbias, None, "S1").unwrap();
+        write_summary(&mut buf, stats, mask_plan, "S1").unwrap();
         String::from_utf8(buf).unwrap()
-    }
-
-    #[test]
-    fn summary_has_read_column_and_all_row() {
-        let stats = genome_with(PerContextCounters::default(), 0, 0);
-        let mbias = MbiasAccumulator::new();
-        let text = render_summary(&stats, &mbias);
-        let mut lines = text.lines();
-        let hdr: Vec<&str> = lines.next().unwrap().split('\t').collect();
-        assert_eq!(hdr[3], "read");
-        let row: Vec<&str> = lines.next().unwrap().split('\t').collect();
-        assert_eq!(hdr.len(), row.len());
-        assert_eq!(row[2], "genome");
-        assert_eq!(row[3], "all");
     }
 
     /// Column index of a header name in the summary schema.
@@ -442,35 +405,46 @@ mod tests {
     }
 
     #[test]
-    fn per_read_rows_come_from_mbias() {
+    fn summary_is_one_decision_row_per_scope() {
         let mut counters = PerContextCounters::default();
-        counters.add_counts(Context::CpA, 1, 1000); // 1 unconverted of 1000
-        let mut stats = genome_with(counters, 100, 1);
-        stats.genome.mapped_by_role[ReadRole::R1.index()] = 80;
-        stats.genome.evaluated_by_role[ReadRole::R1.index()] = 70;
-        let mut mbias = MbiasAccumulator::new();
-        // R1: 2 unconverted of 10 CpA at cycle 0 → conv rate 0.8.
-        for i in 0..10 {
-            mbias.record(ReadRole::R1, ReadEnd::FivePrime, Context::CpA, 0, i < 2);
-        }
-        let text = render_summary(&stats, &mbias);
-        let r1 = text.lines().find(|l| l.contains("\tR1\t")).expect("R1 row present");
-        let cols: Vec<&str> = r1.split('\t').collect();
-        assert_eq!(cols[col("CpA_obs")], "10");
-        assert_eq!(cols[col("CpA_conv_rate")], "0.800000");
-        assert_eq!(cols[col("n_templates")], "100", "n_templates filled down");
-        assert_eq!(cols[col("n_mapped")], "80", "per-role mapped count");
-        assert_eq!(cols[col("n_evaluated")], "70", "per-role evaluated count");
-        assert_eq!(cols[col("n_unconverted")], "", "n_unconverted blank on per-read row");
-        assert_eq!(cols[col("mask_5p")], "", "no mask plan → blank");
+        counters.add_counts(Context::CpA, 1, 1000); // conv rate 0.999
+        let stats = genome_with(counters, 100, 3);
+        let text = render_summary(&stats, None);
+        let mut lines = text.lines();
+        let hdr: Vec<&str> = lines.next().unwrap().split('\t').collect();
+        // The per-read fold is gone — no `read` column, one row per scope.
+        assert!(!hdr.contains(&"read"), "read column removed");
+        let row: Vec<&str> = lines.next().unwrap().split('\t').collect();
+        assert_eq!(hdr.len(), row.len());
+        assert_eq!(row[col("scope")], "genome");
+        assert_eq!(row[col("n_templates")], "100");
+        assert_eq!(row[col("n_unconverted")], "3");
+        assert_eq!(row[col("frac_unconverted")], "0.030000");
+        assert_eq!(row[col("CpA_obs")], "1000");
+        assert_eq!(row[col("CpA_conv_rate")], "0.999000");
+        // No mask plan → all four mask columns blank.
+        assert_eq!(row[col("r1_mask_5p")], "");
+        assert_eq!(row[col("se_mask_3p")], "");
+        // Header + the single genome row only (no controls configured).
+        assert_eq!(text.lines().count(), 2);
     }
 
     #[test]
-    fn no_mbias_data_yields_only_all_rows() {
-        let stats = genome_with(PerContextCounters::default(), 5, 0);
-        let mbias = MbiasAccumulator::new();
-        // header + genome/all only.
-        assert_eq!(render_summary(&stats, &mbias).lines().count(), 2);
+    fn mask_plan_fills_mask_columns_on_every_scope_row() {
+        let mut stats = Stats::new(&["chrCtrl".to_string()]);
+        stats.genome.n_templates = 10;
+        let plan = MaskPlan::explicit(2, 22, 2);
+        let text = render_summary(&stats, Some(&plan));
+        for row in text.lines().skip(1) {
+            let cols: Vec<&str> = row.split('\t').collect();
+            assert_eq!(cols[col("r1_mask_5p")], "2");
+            assert_eq!(cols[col("r2_mask_5p")], "22");
+            // SE lengths default to 0 in an explicit (paired) plan.
+            assert_eq!(cols[col("se_mask_5p")], "0");
+            assert_eq!(cols[col("se_mask_3p")], "0");
+        }
+        // Header + genome + one control row.
+        assert_eq!(text.lines().count(), 3);
     }
 
     #[test]

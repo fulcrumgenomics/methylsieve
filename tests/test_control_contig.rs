@@ -38,12 +38,11 @@ fn control_reads_are_separated_and_chimeric_is_counted() {
     }
 
     let rows = read_stats_rows(&env.stats);
-    // The summary is folded over a `read` dimension; select the `all` rows.
-    let all_rows: Vec<_> = rows.iter().filter(|r| r["read"] == "all").collect();
-    assert_eq!(all_rows.len(), 2, "one `all` row for genome + one for the control");
-    let genome = rows.iter().find(|r| r["scope"] == "genome" && r["read"] == "all").unwrap();
+    // One decision row per scope: genome + the control.
+    assert_eq!(rows.len(), 2, "one row for genome + one for the control");
+    let genome = rows.iter().find(|r| r["scope"] == "genome").unwrap();
     assert_eq!(genome["chimeric_to_control_templates"], "1");
-    let lambda = rows.iter().find(|r| r["scope"] == "lambda" && r["read"] == "all").unwrap();
+    let lambda = rows.iter().find(|r| r["scope"] == "lambda").unwrap();
     assert_eq!(lambda["n_templates"], "1");
     assert_eq!(lambda["CpA_obs"], "5", "only the ctrl read tallies into lambda");
     assert_eq!(lambda["CpA_conv_rate"], "0.000000", "ctrl read fully unconverted");

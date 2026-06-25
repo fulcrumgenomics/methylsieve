@@ -98,13 +98,7 @@ impl RecordProcessor {
         let termini =
             if trimming { self.template_termini(block) } else { TemplateTermini::default() };
         let mut counters = PerContextCounters::default();
-        // Which roles (R1/R2/SE) have a mapped primary in this template — the
-        // per-read denominators reported in the summary.
-        let mut roles_mapped = [false; 3];
         for (i, rec) in block.iter().enumerate() {
-            if is_primary_mapped(rec.flags()) {
-                roles_mapped[read_role(rec.flags()).index()] = true;
-            }
             if self.is_evidence_record(rec) {
                 // Per-record trim: own 5' (or both ends for SE/orphan) via the read
                 // window, plus one interior genomic skip. The overlap dedup region
@@ -182,7 +176,7 @@ impl RecordProcessor {
                 if monitored > 0 {
                     scope.n_evaluated += 1;
                 }
-                scope.record_mapping(roles_mapped, monitored > 0);
+                scope.n_mapped += 1;
                 scope.counters.add(&counters);
                 self.stamp(block, Action::PassThrough, counts);
                 Ok(Disposition::Keep)
@@ -190,7 +184,7 @@ impl RecordProcessor {
             None => {
                 // Main (genome) template.
                 stats.genome.n_templates += 1;
-                stats.genome.record_mapping(roles_mapped, monitored > 0);
+                stats.genome.n_mapped += 1;
                 stats.genome.counters.add(&counters);
                 if self.opts.record_matrix {
                     // Histogram cell keyed by (checked, unconverted) over the
@@ -932,12 +926,6 @@ pub(crate) struct ScopeStats {
     pub(crate) n_unconverted: u64,
     /// Unconverted templates dropped under `--remove-unconverted`.
     pub(crate) n_removed: u64,
-    /// Templates with a mapped primary of each role (R1/R2/SE by
-    /// [`ReadRole::index`]) — the per-read denominators for the summary rows.
-    pub(crate) mapped_by_role: [u64; 3],
-    /// Evaluated templates (monitored sites > 0) with a mapped primary of each
-    /// role — the per-read evaluated counts.
-    pub(crate) evaluated_by_role: [u64; 3],
     /// Aggregated per-context tallies across the scope.
     pub(crate) counters: PerContextCounters,
 }
@@ -951,24 +939,7 @@ impl ScopeStats {
             n_evaluated: 0,
             n_unconverted: 0,
             n_removed: 0,
-            mapped_by_role: [0; 3],
-            evaluated_by_role: [0; 3],
             counters: PerContextCounters::default(),
-        }
-    }
-
-    /// Record one mapped template's per-role presence: `roles` flags which of
-    /// R1/R2/SE had a mapped primary, `evaluated` whether the template yielded any
-    /// monitored site. Bumps `n_mapped` plus the per-role denominators.
-    fn record_mapping(&mut self, roles: [bool; 3], evaluated: bool) {
-        self.n_mapped += 1;
-        for (r, &present) in roles.iter().enumerate() {
-            if present {
-                self.mapped_by_role[r] += 1;
-                if evaluated {
-                    self.evaluated_by_role[r] += 1;
-                }
-            }
         }
     }
 }
@@ -996,7 +967,8 @@ impl PerContextCounters {
     }
 
     /// Add `unconv` unconverted of `total` monitored sites to `ctx` (bulk form of
-    /// [`Self::record`], for aggregating from already-counted sources).
+    /// [`Self::record`], for seeding counters in tests).
+    #[cfg(test)]
     pub(crate) fn add_counts(&mut self, ctx: Context, unconv: u64, total: u64) {
         self.unconv[ctx.index()] += unconv;
         self.total[ctx.index()] += total;

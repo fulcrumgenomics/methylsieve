@@ -670,6 +670,24 @@ fn run(args: Args) -> Result<()> {
         args.compression_level,
     )?;
 
+    // `--mbias-mask` automates and supersedes the manual `--ignore-template-ends`
+    // trim: both neutralize the same physical fragment-end bias (an FR pair's two
+    // outer ends are exactly R1's and R2's 5' ends), so running them together
+    // would double-trim. When masking is on, the manual trim is forced off — and
+    // a warning is logged if the user set it explicitly.
+    let ignore_template_ends = if args.mbias_mask {
+        if args.ignore_template_ends > 0 {
+            log::warn!(
+                "--ignore-template-ends={} is ignored because --mbias-mask is set; masking learns \
+                 and removes fragment-end bias automatically",
+                args.ignore_template_ends
+            );
+        }
+        0
+    } else {
+        args.ignore_template_ends
+    };
+
     let opts = ProcessorOptions {
         contexts: args.contexts,
         mode: args.mode.into(),
@@ -677,7 +695,7 @@ fn run(args: Args) -> Result<()> {
         max_unconverted_fraction: args.max_unconverted_fraction,
         min_sites: args.min_sites,
         min_base_quality: args.min_base_quality,
-        ignore_template_ends: args.ignore_template_ends,
+        ignore_template_ends,
         ignore_supplementary_evidence: args.ignore_supplementary_evidence,
         tag: args.tag.clone(),
         count_tag: args.effective_count_tag(),
