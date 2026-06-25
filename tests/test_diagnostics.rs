@@ -12,7 +12,7 @@ fn unmapped_template_passes_through_untouched() {
     // unmapped, never evaluated.
     let env = TestEnv::new();
     let reference = RefBuilder::new().contig("chr1", REF);
-    let stats = env.stats.to_str().unwrap().to_string();
+    let stats = env.metrics_prefix.to_str().unwrap().to_string();
     let r1 = FLAG_PAIRED | FLAG_UNMAPPED | FLAG_MATE_UNMAPPED | FLAG_FIRST_SEGMENT;
     let r2 = FLAG_PAIRED | FLAG_UNMAPPED | FLAG_MATE_UNMAPPED | FLAG_LAST_SEGMENT;
     let sam = SamBuilder::new()
@@ -20,7 +20,7 @@ fn unmapped_template_passes_through_untouched() {
         .record("u", r1, "*", 0, "*", "CACACACACA", &q40(10))
         .record("u", r2, "*", 0, "*", "CACACACACA", &q40(10));
 
-    let recs = run_ok(&sam, &reference, &env, &["--stats", &stats]);
+    let recs = run_ok(&sam, &reference, &env, &["--metrics-prefix", &stats]);
     assert_eq!(recs.len(), 2);
     for rec in &recs {
         assert!(!has_tag(rec, [b'X', b'X']), "unmapped reads must not be tagged");
@@ -36,11 +36,11 @@ fn zero_site_template_is_counted_and_not_tagged() {
     // A read over an all-A region has no monitored C — zero sites.
     let env = TestEnv::new();
     let reference = RefBuilder::new().contig("chr1", "AAAAAAAAAA");
-    let stats = env.stats.to_str().unwrap().to_string();
+    let stats = env.metrics_prefix.to_str().unwrap().to_string();
     let sam =
         SamBuilder::new().sq("chr1", 10).record("z", 0, "chr1", 1, "10M", "AAAAAAAAAA", &q40(10));
 
-    let recs = run_ok(&sam, &reference, &env, &["--stats", &stats]);
+    let recs = run_ok(&sam, &reference, &env, &["--metrics-prefix", &stats]);
     assert!(!has_tag(&recs[0], [b'X', b'X']));
     let g = genome_stats(&env.stats);
     assert_eq!(g["zero_site_templates"], "1");
@@ -88,7 +88,7 @@ fn deletion_skips_reference_cytosines() {
     // (first block) and 6,8 (second block) = 4; the deleted C@4 is NOT tallied.
     let env = TestEnv::new();
     let reference = RefBuilder::new().contig("chr1", REF);
-    let stats = env.stats.to_str().unwrap().to_string();
+    let stats = env.metrics_prefix.to_str().unwrap().to_string();
     // Read bases (8) for ref 0-3 ("CACA") then ref 6-9 ("CACA"), all matching.
     let sam = SamBuilder::new().sq("chr1", REF.len()).record(
         "d",
@@ -99,7 +99,7 @@ fn deletion_skips_reference_cytosines() {
         "CACACACA",
         &q40(8),
     );
-    run_ok(&sam, &reference, &env, &["--stats", &stats]);
+    run_ok(&sam, &reference, &env, &["--metrics-prefix", &stats]);
     let g = genome_stats(&env.stats);
     assert_eq!(g["CA_total"], "4", "deleted C@4 must not be tallied");
     assert_eq!(g["CA_unconv"], "4");

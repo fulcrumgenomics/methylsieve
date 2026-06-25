@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **M-bias-aware masking** (`--mbias-mask`). A two-phase mode that buffers the
+  first `--mbias-buffer-templates` templates (default 500,000) to learn the
+  per-cycle CpG methylation curve for read 1 / read 2 / single-end reads, freezes
+  5' (and, for single-end, 3') mask lengths, then sets the biased bases'
+  qualities to `--mbias-mask-quality` (default 2) on every primary mapped record.
+  Mask length is the first 5' cycle whose smoothed methylation reaches
+  `--mbias-plateau-fraction` of the plateau (default 0.90), minus one, capped at
+  `--mbias-max-mask` (default 30). Beyond the own-5' mask: single-end reads mask
+  the 3' end too; orphans (mate unmapped) mirror the mate role's length onto the
+  3' end; proper pairs mask any 3' bases extending past the mate's post-mask 5'
+  end. Masking only lowers base qualities — no clip, no coordinate/CIGAR/tag/mate
+  rewrite — so it is effective for base-quality-aware callers and is not
+  idempotent. Masking off is performance-neutral with the prior release.
+- **Metric TSVs** under `--metrics-prefix PREFIX`, computed in a single streaming
+  pass: `PREFIX.mbias.tsv` (per-read-cycle methylation with Agresti–Coull CIs),
+  `PREFIX.mbias_bounds.tsv` (suggested mask lengths), and the conversion summary
+  folded over a per-read (`R1`/`R2`/`SE`) dimension.
+
+### Changed
+- **Breaking:** `--stats` and `--conversion-matrix` are replaced by a single
+  `--metrics-prefix PREFIX`, which writes `PREFIX.summary.tsv` (the former
+  `--stats`, now with a `read` column) and `PREFIX.conversion_matrix.tsv`. All
+  metric rates are emitted as fractions in `[0, 1]`.
+
 ## [0.1.0] - 2026-06-13
 
 ### Added

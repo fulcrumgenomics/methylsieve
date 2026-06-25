@@ -23,7 +23,7 @@ fn soft_clipped_bases_are_not_tallied() {
     // C@0,2,4,6 (all read as C) → 4 unconverted, 4 total. No trimming applied.
     let env = TestEnv::new();
     let reference = RefBuilder::new().contig("chr1", TOP);
-    let stats = env.stats.to_str().unwrap().to_string();
+    let stats = env.metrics_prefix.to_str().unwrap().to_string();
     let sam = SamBuilder::new().sq("chr1", TOP.len()).record(
         "r",
         0,
@@ -33,7 +33,7 @@ fn soft_clipped_bases_are_not_tallied() {
         "GGGCACACAC",
         &q40(10),
     );
-    run_ok(&sam, &reference, &env, &["--stats", &stats]);
+    run_ok(&sam, &reference, &env, &["--metrics-prefix", &stats]);
     assert_eq!(ca_total(&env), 4);
     assert_eq!(ca_unconv(&env), 4);
 }
@@ -44,7 +44,7 @@ fn single_end_trims_both_ends_forward() {
     // positions [3,7). Drops C@0,C@2 (5') and C@8 (3'); leaves C@4,C@6 → 2.
     let env = TestEnv::new();
     let reference = RefBuilder::new().contig("chr1", TOP);
-    let stats = env.stats.to_str().unwrap().to_string();
+    let stats = env.metrics_prefix.to_str().unwrap().to_string();
     let sam = SamBuilder::new().sq("chr1", TOP.len()).record(
         "r",
         0,
@@ -54,7 +54,7 @@ fn single_end_trims_both_ends_forward() {
         "CACACACACA",
         &q40(10),
     );
-    run_ok(&sam, &reference, &env, &["--ignore-template-ends", "3", "--stats", &stats]);
+    run_ok(&sam, &reference, &env, &["--ignore-template-ends", "3", "--metrics-prefix", &stats]);
     assert_eq!(ca_total(&env), 2);
     assert_eq!(ca_unconv(&env), 2);
 }
@@ -66,7 +66,7 @@ fn single_end_trims_both_ends_reverse() {
     // G@7,G@9 (high); leaves G@3,G@5 → 2 unconverted.
     let env = TestEnv::new();
     let reference = RefBuilder::new().contig("chr1", BOT);
-    let stats = env.stats.to_str().unwrap().to_string();
+    let stats = env.metrics_prefix.to_str().unwrap().to_string();
     let sam = SamBuilder::new().sq("chr1", BOT.len()).record(
         "r",
         FLAG_REVERSE,
@@ -76,7 +76,7 @@ fn single_end_trims_both_ends_reverse() {
         "TGTGTGTGTG",
         &q40(10),
     );
-    run_ok(&sam, &reference, &env, &["--ignore-template-ends", "3", "--stats", &stats]);
+    run_ok(&sam, &reference, &env, &["--ignore-template-ends", "3", "--metrics-prefix", &stats]);
     assert_eq!(ca_total(&env), 2);
     assert_eq!(ca_unconv(&env), 2);
 }
@@ -88,7 +88,7 @@ fn soft_clip_counts_toward_trim_budget() {
     // 7,8,9 (= C@ref4,ref6). Aligned C's at ref0,2,4,6 → keep ref0,ref2 → 2.
     let env = TestEnv::new();
     let reference = RefBuilder::new().contig("chr1", TOP);
-    let stats = env.stats.to_str().unwrap().to_string();
+    let stats = env.metrics_prefix.to_str().unwrap().to_string();
     let sam = SamBuilder::new().sq("chr1", TOP.len()).record(
         "r",
         0,
@@ -98,6 +98,6 @@ fn soft_clip_counts_toward_trim_budget() {
         "GGGCACACAC",
         &q40(10),
     );
-    run_ok(&sam, &reference, &env, &["--ignore-template-ends", "3", "--stats", &stats]);
+    run_ok(&sam, &reference, &env, &["--ignore-template-ends", "3", "--metrics-prefix", &stats]);
     assert_eq!(ca_unconv(&env), 2, "5' clip absorbs the 5' budget; 3' trim still drops 2");
 }

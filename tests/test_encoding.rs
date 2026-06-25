@@ -21,8 +21,8 @@ fn all_encodings_agree_on_acgt_reference() {
     let mut rows = Vec::new();
     for enc in ["bytes", "nibble", "twobit"] {
         let env = TestEnv::new();
-        let stats = env.stats.to_str().unwrap().to_string();
-        run_ok(&sam, &reference, &env, &["--ref-encoding", enc, "--stats", &stats]);
+        let stats = env.metrics_prefix.to_str().unwrap().to_string();
+        run_ok(&sam, &reference, &env, &["--ref-encoding", enc, "--metrics-prefix", &stats]);
         rows.push((enc, genome_stats(&env.stats)));
     }
 
@@ -46,12 +46,12 @@ fn default_encoding_is_twobit_equivalent_on_acgt() {
         SamBuilder::new().sq("chr1", REF.len()).record("r", 0, "chr1", 1, "20M", REF, &q40(20));
 
     let env_default = TestEnv::new();
-    let sd = env_default.stats.to_str().unwrap().to_string();
-    run_ok(&sam, &reference, &env_default, &["--stats", &sd]);
+    let sd = env_default.metrics_prefix.to_str().unwrap().to_string();
+    run_ok(&sam, &reference, &env_default, &["--metrics-prefix", &sd]);
 
     let env_bytes = TestEnv::new();
-    let sb = env_bytes.stats.to_str().unwrap().to_string();
-    run_ok(&sam, &reference, &env_bytes, &["--ref-encoding", "bytes", "--stats", &sb]);
+    let sb = env_bytes.metrics_prefix.to_str().unwrap().to_string();
+    run_ok(&sam, &reference, &env_bytes, &["--ref-encoding", "bytes", "--metrics-prefix", &sb]);
 
     assert_eq!(genome_stats(&env_default.stats), genome_stats(&env_bytes.stats));
 }

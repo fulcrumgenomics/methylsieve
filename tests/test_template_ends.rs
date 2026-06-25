@@ -33,14 +33,14 @@ fn long_insert_pair_trims_only_outer_ends() {
 
     // Baseline: no trim → all 10 monitored C's counted.
     let env0 = TestEnv::new();
-    let s0 = env0.stats.to_str().unwrap().to_string();
-    run_ok(&sam, &reference, &env0, &["--stats", &s0]);
+    let s0 = env0.metrics_prefix.to_str().unwrap().to_string();
+    run_ok(&sam, &reference, &env0, &["--metrics-prefix", &s0]);
     assert_eq!(ca_total(&env0), 10);
 
     // Trim 3: removes the two outer termini (C@0,2 and C@28) → 7 remain.
     let env = TestEnv::new();
-    let s = env.stats.to_str().unwrap().to_string();
-    run_ok(&sam, &reference, &env, &["--ignore-template-ends", "3", "--stats", &s]);
+    let s = env.metrics_prefix.to_str().unwrap().to_string();
+    run_ok(&sam, &reference, &env, &["--ignore-template-ends", "3", "--metrics-prefix", &s]);
     assert_eq!(ca_total(&env), 7, "only the two outer fragment ends are trimmed");
 }
 
@@ -60,13 +60,13 @@ fn overlapping_pair_trims_interior_terminus_via_genomic_skip() {
 
     // Baseline: overlap dedup → R1's 5 C's only.
     let env0 = TestEnv::new();
-    let s0 = env0.stats.to_str().unwrap().to_string();
-    run_ok(&sam, &reference, &env0, &["--stats", &s0]);
+    let s0 = env0.metrics_prefix.to_str().unwrap().to_string();
+    run_ok(&sam, &reference, &env0, &["--metrics-prefix", &s0]);
     assert_eq!(ca_total(&env0), 5);
 
     let env = TestEnv::new();
-    let s = env.stats.to_str().unwrap().to_string();
-    run_ok(&sam, &reference, &env, &["--ignore-template-ends", "3", "--stats", &s]);
+    let s = env.metrics_prefix.to_str().unwrap().to_string();
+    run_ok(&sam, &reference, &env, &["--ignore-template-ends", "3", "--metrics-prefix", &s]);
     assert_eq!(ca_total(&env), 2, "both genomic termini trimmed; interior C@4,6 remain");
 }
 
@@ -87,7 +87,7 @@ fn orphan_read_falls_back_to_both_ends() {
         &q40(10),
     );
     let env = TestEnv::new();
-    let s = env.stats.to_str().unwrap().to_string();
-    run_ok(&sam, &reference, &env, &["--ignore-template-ends", "3", "--stats", &s]);
+    let s = env.metrics_prefix.to_str().unwrap().to_string();
+    run_ok(&sam, &reference, &env, &["--ignore-template-ends", "3", "--metrics-prefix", &s]);
     assert_eq!(ca_total(&env), 2, "orphan trims both ends");
 }

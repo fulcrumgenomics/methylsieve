@@ -83,6 +83,17 @@ impl Context {
             Context::CpT => 3,
         }
     }
+
+    /// Canonical `CpX` label for TSV output.
+    #[must_use]
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Context::CpA => "CpA",
+            Context::CpC => "CpC",
+            Context::CpG => "CpG",
+            Context::CpT => "CpT",
+        }
+    }
 }
 
 /// Classify the context of a monitored **top-strand** C, given the reference

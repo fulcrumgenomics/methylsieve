@@ -135,6 +135,10 @@ pub struct TestEnv {
     pub input: PathBuf,
     pub reference: PathBuf,
     pub output: PathBuf,
+    /// `--metrics-prefix` value passed to the binary.
+    pub metrics_prefix: PathBuf,
+    /// The `PREFIX.summary.tsv` the metrics prefix produces (the per-context
+    /// conversion summary; named `stats` for brevity in assertions).
     pub stats: PathBuf,
 }
 
@@ -146,9 +150,15 @@ impl TestEnv {
             input: p.join("in.sam"),
             reference: p.join("ref.fa"),
             output: p.join("out.bam"),
-            stats: p.join("stats.tsv"),
+            metrics_prefix: p.join("metrics"),
+            stats: p.join("metrics.summary.tsv"),
             _tmp: tmp,
         }
+    }
+
+    /// `--metrics-prefix` as a `&str` for arg lists.
+    pub fn metrics_prefix_arg(&self) -> String {
+        self.metrics_prefix.to_str().unwrap().to_string()
     }
 }
 
@@ -252,6 +262,16 @@ pub fn tag_string(rec: &RecordBuf, tag: [u8; 2]) -> Option<String> {
 /// Whether a record carries an aux tag with the given two bytes.
 pub fn has_tag(rec: &RecordBuf, tag: [u8; 2]) -> bool {
     rec.data().get(&Tag::new(tag[0], tag[1])).is_some()
+}
+
+/// Phred quality scores of a record (raw values, not ASCII-offset).
+pub fn quality_scores(rec: &RecordBuf) -> Vec<u8> {
+    rec.quality_scores().as_ref().to_vec()
+}
+
+/// Count of leading bases at Phred quality `q` (e.g. the Q2 mask window).
+pub fn leading_quality_run(rec: &RecordBuf, q: u8) -> usize {
+    rec.quality_scores().as_ref().iter().take_while(|&&b| b == q).count()
 }
 
 // ── Stats TSV parsing ───────────────────────────────────────────────────────

@@ -12,7 +12,7 @@ const SEQ10: &str = "CACACACACA"; // 5 CpA top-strand C's
 fn control_reads_are_separated_and_chimeric_is_counted() {
     let env = TestEnv::new();
     let reference = RefBuilder::new().contig("chr1", SEQ10).contig("lambda", SEQ10);
-    let stats = env.stats.to_str().unwrap().to_string();
+    let stats = env.metrics_prefix.to_str().unwrap().to_string();
     let sam = SamBuilder::new()
         .sq("chr1", SEQ10.len())
         .sq("lambda", SEQ10.len())
@@ -24,7 +24,8 @@ fn control_reads_are_separated_and_chimeric_is_counted() {
         .record("chim", 0, "chr1", 1, "10M", "CATATATATA", &q40(10))
         .record("chim", FLAG_SUPPLEMENTARY, "lambda", 1, "10M", "CACATATATA", &q40(10));
 
-    let recs = run_ok(&sam, &reference, &env, &["--control-contig", "lambda", "--stats", &stats]);
+    let recs =
+        run_ok(&sam, &reference, &env, &["--control-contig", "lambda", "--metrics-prefix", &stats]);
 
     for rec in &recs {
         let name = rec.name().unwrap().to_string();
@@ -37,12 +38,12 @@ fn control_reads_are_separated_and_chimeric_is_counted() {
     }
 
     let rows = read_stats_rows(&env.stats);
-    assert_eq!(rows.len(), 2, "genome + one control row");
-    let genome = &rows[0];
-    assert_eq!(genome["scope"], "genome");
+    // The summary is folded over a `read` dimension; select the `all` rows.
+    let all_rows: Vec<_> = rows.iter().filter(|r| r["read"] == "all").collect();
+    assert_eq!(all_rows.len(), 2, "one `all` row for genome + one for the control");
+    let genome = rows.iter().find(|r| r["scope"] == "genome" && r["read"] == "all").unwrap();
     assert_eq!(genome["chimeric_to_control_templates"], "1");
-    let lambda = &rows[1];
-    assert_eq!(lambda["scope"], "lambda");
+    let lambda = rows.iter().find(|r| r["scope"] == "lambda" && r["read"] == "all").unwrap();
     assert_eq!(lambda["n_templates"], "1");
     assert_eq!(lambda["CA_total"], "5", "only the ctrl read tallies into lambda");
     // CA_total counts every monitored CpA site (converted + unconverted). Each

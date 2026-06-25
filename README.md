@@ -163,7 +163,7 @@ never flags a template with fewer than `--min-sites` sites**, no matter how badl
 converted — those reads pass through. `count`, `either`, and `adaptive` still
 evaluate them via the count test. In `proportion` mode methylsieve prints a stderr
 warning with the count of templates that escaped, and the
-`below_min_sites_templates` column in `--stats` exposes that population in every
+`below_min_sites_templates` column in the metrics summary exposes that population in every
 mode.
 
 ## Defaults and tuning
@@ -190,7 +190,7 @@ Two caveats:
 - **Short-insert / cfDNA libraries** have few monitored sites per template (a
   130 bp fragment yields ~25 CpH sites after quality filtering and overlap
   dedup), so most templates fall below `--min-sites = 40` and lean on the count
-  fallback. Watch `below_min_sites_templates` in `--stats`; consider a lower
+  fallback. Watch `below_min_sites_templates` in the metrics summary; consider a lower
   floor (with the coupling above) if it dominates.
 - **Samples with real non-CpG methylation** (plant, neuronal, embryonic-stem
   tissues, where mCH can reach a few percent) will read genuine methylation as
@@ -224,49 +224,64 @@ the adaptive-leniency case above. Rename it with `--count-tag <NAME>` or disable
 it with `--no-count-tag`. It adds ~8 bytes per record and ~10% CPU; in the
 rate-limited alignment pipe that cost is hidden behind the aligner.
 
-### Stats TSV (`--stats`)
+### Metric TSVs (`--metrics-prefix`)
 
-One row for the `genome` scope (everything off a control contig) plus one per
-`--control-contig`. All four contexts are reported regardless of the decision
-subset, so CpG retention on a methylated control reads as a built-in sanity
-check. The last four columns are whole-run diagnostics, populated on the
-`genome` row only.
+`--metrics-prefix PREFIX` writes a set of TSVs in a single streaming pass (the
+output BAM is unchanged):
+
+- **`PREFIX.summary.tsv`** — per-context conversion summary (below).
+- **`PREFIX.mbias.tsv`** — per-read-cycle methylation (the M-bias curve).
+- **`PREFIX.mbias_bounds.tsv`** — suggested 5'/3' mask lengths per read.
+- **`PREFIX.conversion_matrix.tsv`** — the per-template decision histogram.
+
+All rates are fractions in `[0, 1]`, never percentages.
+
+**`summary.tsv`** is folded over a `read` dimension. Each scope (the `genome`
+scope, plus one per `--control-contig`) gets an `all` row carrying the
+per-template decision counts and the whole-run diagnostics (genome `all` only);
+the genome scope additionally gets `R1`, `R2`, and `SE` rows breaking conversion
+out per read. The `all` row is *decision-basis* (overlap-deduped, end-trimmed,
+includes supplementary evidence); the per-read rows are *M-bias-basis* (every
+primary call, base-quality-gated, no dedup) — so the per-read rows need not sum
+to `all`. All four contexts are reported regardless of the decision subset, so
+CpG retention on a methylated control reads as a built-in sanity check.
 
 | column | description |
 |--------|-------------|
 | `sample` | Sample name — `--sample` if given, else the unique `@RG SM:` values comma-joined. |
 | `methylsieve_version` | Version of methylsieve that wrote the row. |
 | `scope` | `genome`, or a `--control-contig` name. |
-| `n_templates` | Templates routed to this scope (mapped, unmapped, and zero-site alike). |
-| `n_evaluated` | Templates that produced at least one monitored site. |
-| `n_unconverted` | Evaluated templates called unconverted (always 0 for control scopes). |
+| `read` | `all` (the scope total), or `R1` / `R2` / `SE` (genome per-read breakdown). |
+| `n_templates` | Templates routed to this scope (`all` rows only). |
+| `n_evaluated` | Templates that produced at least one monitored site (`all` rows only). |
+| `n_unconverted` | Evaluated templates called unconverted (`all` rows; always 0 for control scopes). |
 | `n_removed` | Unconverted templates dropped from the output (`--remove-unconverted`). |
 | `frac_unconverted` | `n_unconverted / n_evaluated` (blank when none evaluated). |
-| `CA_unconv` / `CA_total` | Unconverted and total monitored CpA sites in the scope. |
+| `CA_unconv` / `CA_total` | Unconverted and total monitored CpA sites. |
 | `CC_unconv` / `CC_total` | The same, for CpC. |
 | `CT_unconv` / `CT_total` | The same, for CpT. |
 | `CG_unconv` / `CG_total` | The same, for CpG (reported, but excluded from the default decision). |
-| `conv_rate_CpA` | CpA conversion rate, `1 − CA_unconv/CA_total` (blank when no sites). |
-| `conv_rate_CpC` | CpC conversion rate. |
-| `conv_rate_CpT` | CpT conversion rate. |
-| `conv_rate_CpG` | CpG conversion rate (genuine methylation lives here; high retention on a methylated control is the sanity check). |
+| `conv_rate_CpA` … `conv_rate_CpG` | Per-context conversion rate, `1 − unconv/total` (blank when no sites). High CpG retention on a methylated control is the sanity check. |
 | `chimeric_to_control_templates` | Genome templates with a supplementary alignment on a control contig. |
 | `unmapped_templates` | Templates whose primary R1 was unmapped (never tallied or decided). |
 | `zero_site_templates` | Templates with no monitored sites (decided converted by default). |
 | `below_min_sites_templates` | Genome templates with evidence but fewer than `--min-sites` sites (the proportion test cannot evaluate them). |
 
-### Conversion matrix (`--conversion-matrix`)
+**`mbias.tsv`** has one row per `(read, end, context, cycle)` with coverage:
+`sample, read, end, context, cycle, n_methylated, n_total, frac_methylation,
+ci_lo, ci_hi` (95% Agresti–Coull interval). `end` is `5p` for paired/orphan
+reads; single-end reads also report `3p`. **`mbias_bounds.tsv`** gives the
+detector's suggested `suggested_mask` (leading cycles to mask) per `read`/`end`.
 
-The per-template decision histogram for the `genome` scope — one row per observed
-`(checked_sites, unconverted_sites)` cell over the decision contexts. Each cell's
-verdict is replayed from the live thresholds, so it never drifts from the calls
-written to the BAM, which makes the decision boundary legible: the converted and
-conversion-failed populations are visible in the (sites, retained) plane, along
-with exactly where the `--mode`/threshold cut falls.
+**`conversion_matrix.tsv`** is the per-template decision histogram for the
+`genome` scope — one row per observed `(checked_sites, unconverted_sites)` cell
+over the decision contexts. Each cell's verdict is replayed from the live
+thresholds, so it never drifts from the calls written to the BAM, making the
+decision boundary legible.
 
 | column | description |
 |--------|-------------|
-| `sample` | Sample name (as in `--stats`). |
+| `sample` | Sample name. |
 | `checked_sites` | Monitored sites examined per template in this cell — the decision denominator (`n`). |
 | `unconverted_sites` | Unconverted monitored sites — the decision numerator (`u`). |
 | `conversion_rate` | `1 − unconverted_sites/checked_sites` (blank when `checked_sites` is 0). |
@@ -290,7 +305,42 @@ original fragment — the positions prone to end-repair fill-in and A-tailing
 artifacts. For a mapped pair these are the 5' sequenced ends of R1 and R2, trimmed
 by *genomic* position, so an overlapped end is dropped in both mates while the
 reads' interior ends remain; single-end / orphan reads have both ends trimmed.
-Default 0 (off).
+Default 0 (off). This trims the *tally* only; the emitted reads are unchanged.
+To alter the reads themselves, see M-bias masking below.
+
+### M-bias-aware masking (`--mbias-mask`)
+
+End-repair fill-in skews the methylation calls at the first sequencing cycles of
+a read — especially read 2 — so the per-cycle methylation rate ramps up to a
+plateau over the first 10–25 bp. `--mbias-mask` measures that ramp and neutralizes
+the biased bases:
+
+1. **Learn.** Buffer the first `--mbias-buffer-templates` templates (default
+   500,000) and accumulate the per-cycle CpG methylation curve for R1, R2, and
+   single-end reads.
+2. **Freeze.** For each read class, the mask length is the first 5' cycle whose
+   smoothed methylation reaches `--mbias-plateau-fraction` of the plateau
+   (default 0.90), minus one — capped at `--mbias-max-mask` (default 30). Single-end
+   reads also learn a 3' length (their far template end is unknown).
+3. **Mask.** Set the biased bases' qualities to `--mbias-mask-quality` (default 2)
+   on every primary mapped record — the first *K* cycles from the 5' end, and:
+   - **single-end:** also the last *K₃'* cycles;
+   - **orphans** (mate unmapped): the 3' end by the mate role's length, in case the
+     read ran through the whole template;
+   - **proper pairs:** any 3' bases extending past the mate's post-mask 5' end.
+
+Nothing else about the alignment changes — no clip, no coordinate/CIGAR/tag/mate
+rewrite. Masked bases fall below `--min-base-quality`, so they also drop out of
+methylsieve's own tally.
+
+> **Effective only for base-quality-aware callers.** Masking lowers qualities; a
+> downstream methylation caller must honor base quality for it to matter
+> (MethylDackel's `-q` does; Bismark's methylation extractor does not filter by
+> base quality). The mode is **not idempotent** — don't re-run it on an
+> already-masked BAM, since the second pass would learn the curve from masked data.
+
+Pair with `--metrics-prefix` to inspect the learned curve (`PREFIX.mbias.tsv`)
+and the chosen mask lengths (`PREFIX.mbias_bounds.tsv`).
 
 ### Single-end reads
 
@@ -300,7 +350,7 @@ reverse-mapped reads and supplementaries are handled correctly.
 ### Spike-in controls
 
 `--control-contig NAME` (repeatable) routes reads whose primary maps to a control
-(e.g. unmethylated lambda, methylated pUC19) into their own `--stats` row and
+(e.g. unmethylated lambda, methylated pUC19) into their own metrics-summary row and
 excludes them from tagging, so the conversion rate can be read directly off the
 control.
 
@@ -340,7 +390,7 @@ With spike-in controls and a stats TSV:
 
 ```bash
 methylsieve -r genome.fa -i in.bam -o out.bam \
-  --control-contig lambda --control-contig pUC19 --stats stats.tsv
+  --control-contig lambda --control-contig pUC19 --metrics-prefix run
 ```
 
 Inspect why a specific read was or was not flagged — the `ch` tag shows the

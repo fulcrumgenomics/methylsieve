@@ -27,28 +27,14 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use fgumi_raw_bam::RawRecord;
 
-use crate::raw_writer::RawBamWriter;
+use crate::mbias::{MbiasAccumulator, ReadEnd, ReadRole};
+use crate::record::{
+    FLAG_FIRST_SEGMENT, FLAG_LAST_SEGMENT, FLAG_PAIRED, FLAG_QC_FAIL, FLAG_REVERSE, FLAG_SECONDARY,
+    FLAG_SUPPLEMENTARY, FLAG_UNMAPPED, five_prime_ref_span, has, is_primary_mapped, monitor_c_of,
+    read_role, three_prime_ref_span,
+};
 use crate::reference::{BASE_A, BASE_C, BASE_G, BASE_T, Context, RefCodes, RefEncoding, Reference};
 use crate::{ContextMask, TagSpec};
-
-// ── SAM flag constants ──────────────────────────────────────────────────────
-
-/// SAM FLAG 0x1: template has multiple segments (paired-end).
-pub(crate) const FLAG_PAIRED: u16 = 0x1;
-/// SAM FLAG 0x4: segment unmapped.
-pub(crate) const FLAG_UNMAPPED: u16 = 0x4;
-/// SAM FLAG 0x10: this segment is on the reverse strand.
-pub(crate) const FLAG_REVERSE: u16 = 0x10;
-/// SAM FLAG 0x40: first segment in the template (R1).
-pub(crate) const FLAG_FIRST_SEGMENT: u16 = 0x40;
-/// SAM FLAG 0x80: last segment in the template (R2).
-pub(crate) const FLAG_LAST_SEGMENT: u16 = 0x80;
-/// SAM FLAG 0x100: secondary alignment.
-pub(crate) const FLAG_SECONDARY: u16 = 0x100;
-/// SAM FLAG 0x200: QC-fail (the bit we OR in for unconverted templates).
-pub(crate) const FLAG_QC_FAIL: u16 = 0x200;
-/// SAM FLAG 0x800: supplementary (chimeric) alignment.
-pub(crate) const FLAG_SUPPLEMENTARY: u16 = 0x800;
 
 // ── Processor ───────────────────────────────────────────────────────────────
 
@@ -74,12 +60,18 @@ impl RecordProcessor {
     /// # Errors
     /// Returns an error if the block is not query-grouped (no primary present)
     /// or the output write fails.
+    /// Classify, tally, accumulate M-bias, decide, and **stamp** every record of
+    /// the template with the conversion tag / flag (no write). Returns whether
+    /// the template should be emitted ([`Disposition::Keep`]) or dropped
+    /// (`--remove-unconverted`). The caller owns emission, so it can buffer the
+    /// stamped records (M-bias learn phase), mask them, or write them straight
+    /// through.
     pub(crate) fn process_block(
         &self,
         block: &mut [RawRecord],
         stats: &mut Stats,
-        out: &mut RawBamWriter,
-    ) -> Result<()> {
+        mut mbias: Option<&mut MbiasAccumulator>,
+    ) -> Result<Disposition> {
         stats.total_templates += 1;
 
         let class_idx = self.classification_index(block)?;
@@ -89,7 +81,8 @@ impl RecordProcessor {
         if has(class_rec.flags(), FLAG_UNMAPPED) {
             stats.genome.n_templates += 1;
             stats.unmapped_templates += 1;
-            return self.emit(block, Action::PassThrough, (0, 0), out);
+            self.stamp(block, Action::PassThrough, (0, 0));
+            return Ok(Disposition::Keep);
         }
 
         let tid = class_rec.ref_id();
@@ -141,6 +134,15 @@ impl RecordProcessor {
                 let trim = RecordTrim { trim_lo, trim_hi, skip: overlap_iv.or(mate_terminus) };
                 self.tally_record(rec, trim, &mut counters);
             }
+            // M-bias accumulation is independent of the decision tally: it sees
+            // every primary mapped record (no end-trim, no overlap dedup; BQ gate
+            // only) so the per-cycle curve isn't distorted. Off the hot path —
+            // only runs when M-bias output / masking is enabled.
+            if let Some(acc) = mbias.as_deref_mut()
+                && is_primary_mapped(rec.flags())
+            {
+                self.accumulate_mbias(rec, acc);
+            }
         }
 
         // Diagnostic (main templates only): did a *supplementary* land on a
@@ -173,7 +175,8 @@ impl RecordProcessor {
                     scope.n_evaluated += 1;
                 }
                 scope.counters.add(&counters);
-                self.emit(block, Action::PassThrough, counts, out)
+                self.stamp(block, Action::PassThrough, counts);
+                Ok(Disposition::Keep)
             }
             None => {
                 // Main (genome) template.
@@ -212,7 +215,11 @@ impl RecordProcessor {
                 } else {
                     Action::PassThrough
                 };
-                self.emit(block, action, counts, out)
+                if action == Action::Remove {
+                    return Ok(Disposition::Drop);
+                }
+                self.stamp(block, action, counts);
+                Ok(Disposition::Keep)
             }
         }
     }
@@ -469,6 +476,102 @@ impl RecordProcessor {
         }
     }
 
+    /// Accumulate per-cycle M-bias for one primary mapped record into `acc`,
+    /// dispatching once on the reference encoding. Deliberately separate from
+    /// [`Self::tally_aligned`] (the decision walk) so that hot loop is never
+    /// perturbed: this walk applies only the base-quality gate — no end-trim, no
+    /// overlap dedup — so the curve reflects every called cytosine at its true
+    /// sequencing cycle. Only reached when M-bias output / masking is enabled.
+    fn accumulate_mbias(&self, rec: &RawRecord, acc: &mut MbiasAccumulator) {
+        let tid = rec.ref_id();
+        match self.reference.encoding() {
+            RefEncoding::Bytes => {
+                if let Some(c) = self.reference.byte_codes(tid) {
+                    self.mbias_walk(rec, c, acc);
+                }
+            }
+            RefEncoding::Nibble => {
+                if let Some(c) = self.reference.nibble_codes(tid) {
+                    self.mbias_walk(rec, c, acc);
+                }
+            }
+            RefEncoding::TwoBit => {
+                if let Some(c) = self.reference.twobit_codes(tid) {
+                    self.mbias_walk(rec, c, acc);
+                }
+            }
+        }
+    }
+
+    /// Walk one record's aligned positions over a concrete reference encoding,
+    /// recording each called cytosine's `(role, end, context, cycle)` into the
+    /// M-bias accumulator. The cycle is measured from the read's 5' start
+    /// (reverse records store SEQ forward-genomic, so their 5' end is the high
+    /// stored position); single-end reads additionally record from the 3' end.
+    ///
+    /// A simple per-span scan (opt-in diagnostic work, not the decision hot
+    /// path): like [`tally_span`] it pre-clips each aligned op to the valid
+    /// `[0, k1)` range so the inner loop carries no per-base bounds checks, but
+    /// it applies only the base-quality gate (no end-trim, no overlap dedup) and
+    /// shares the per-site classifier with [`tally_site`] via [`classify_site`].
+    fn mbias_walk<R: RefCodes + Copy>(&self, rec: &RawRecord, refc: R, acc: &mut MbiasAccumulator) {
+        let seq_len = rec.l_seq() as usize;
+        let pos = rec.pos();
+        if seq_len == 0 || pos < 0 {
+            return;
+        }
+        let ref_len = refc.len();
+        let f = rec.flags();
+        let monitor_c = monitor_c_of(f);
+        let monitored_base = if monitor_c { BASE_C } else { BASE_G };
+        let role = read_role(f);
+        let reverse = has(f, FLAG_REVERSE);
+        let min_bq = self.opts.min_base_quality;
+
+        let mut read_pos = 0usize;
+        let mut ref_pos = pos as usize;
+        for op in rec.cigar_ops_iter() {
+            let len = (op >> 4) as usize;
+            match op & 0xf {
+                // M, =, X — aligned; both read and reference advance.
+                0 | 7 | 8 => {
+                    // Clip the op to positions valid in both SEQ and the contig,
+                    // so the inner loop needs no per-base bounds test.
+                    let k1 = len
+                        .min(seq_len.saturating_sub(read_pos))
+                        .min(ref_len.saturating_sub(ref_pos));
+                    for k in 0..k1 {
+                        let gp = ref_pos + k;
+                        if !refc.monitors(gp, monitored_base) {
+                            continue;
+                        }
+                        let rp = read_pos + k;
+                        if let Some((ctx, unconverted)) =
+                            classify_site(rec, refc, rp, gp, monitor_c, min_bq, ref_len)
+                        {
+                            let cycle_5p = if reverse { seq_len - 1 - rp } else { rp };
+                            acc.record(role, ReadEnd::FivePrime, ctx, cycle_5p, unconverted);
+                            if role == ReadRole::Se {
+                                acc.record(
+                                    role,
+                                    ReadEnd::ThreePrime,
+                                    ctx,
+                                    seq_len - 1 - cycle_5p,
+                                    unconverted,
+                                );
+                            }
+                        }
+                    }
+                    read_pos += len;
+                    ref_pos += len;
+                }
+                1 | 4 => read_pos += len,
+                2 | 3 => ref_pos += len,
+                _ => {}
+            }
+        }
+    }
+
     /// Decide whether a template is unconverted from its aggregated counts.
     /// Thin wrapper over [`Self::classify`] on the threshold-context totals.
     fn decide(&self, counters: &PerContextCounters) -> bool {
@@ -518,20 +621,12 @@ impl RecordProcessor {
         }
     }
 
-    /// Apply `action` to every record of the block and write to `out`.
-    /// Apply `action` to every record of the block and write to `out`. `counts`
-    /// is the template's `(unconverted, total)` over the decision contexts, used
-    /// only for the optional `--count-tag` annotation.
-    fn emit(
-        &self,
-        block: &mut [RawRecord],
-        action: Action,
-        counts: (u64, u64),
-        out: &mut RawBamWriter,
-    ) -> Result<()> {
-        if action == Action::Remove {
-            return Ok(());
-        }
+    /// Stamp every record of the template with the conversion tag / QC-fail flag
+    /// (for [`Action::Mark`]) and the optional per-record count tag. Mutates in
+    /// place; does not write. `counts` is the template's `(unconverted, total)`
+    /// over the decision contexts (for `--count-tag`). Not called for
+    /// [`Action::Remove`] (the caller drops the template instead).
+    fn stamp(&self, block: &mut [RawRecord], action: Action, counts: (u64, u64)) {
         // The count tag is a per-template aggregate (u/n over the decision
         // contexts): build the value once, stamp every record. Applied on every
         // template, flagged or not, so a user can inspect surprises either way.
@@ -551,10 +646,17 @@ impl RecordProcessor {
             {
                 rec.tags_editor().append_string(tag, value.as_bytes());
             }
-            out.write_record(rec)?;
         }
-        Ok(())
     }
+}
+
+/// Whether a processed template should be emitted or dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Disposition {
+    /// Emit every record (already stamped).
+    Keep,
+    /// Drop the whole template (`--remove-unconverted`).
+    Drop,
 }
 
 /// How the per-template unconverted decision combines the count and proportion
@@ -811,9 +913,9 @@ impl ScopeStats {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct PerContextCounters {
     /// Unconverted cytosines (ref C read as C / ref G read as G) per context.
-    pub(crate) unconv: [u64; 4],
+    unconv: [u64; 4],
     /// Total monitored & called cytosines (converted + unconverted) per context.
-    pub(crate) total: [u64; 4],
+    total: [u64; 4],
 }
 
 impl PerContextCounters {
@@ -824,6 +926,25 @@ impl PerContextCounters {
         if unconverted {
             self.unconv[i] += 1;
         }
+    }
+
+    /// Add `unconv` unconverted of `total` monitored sites to `ctx` (bulk form of
+    /// [`Self::record`], for aggregating from already-counted sources).
+    pub(crate) fn add_counts(&mut self, ctx: Context, unconv: u64, total: u64) {
+        self.unconv[ctx.index()] += unconv;
+        self.total[ctx.index()] += total;
+    }
+
+    /// Unconverted count for one context.
+    #[must_use]
+    pub(crate) fn unconv_for(&self, ctx: Context) -> u64 {
+        self.unconv[ctx.index()]
+    }
+
+    /// Total monitored count for one context.
+    #[must_use]
+    pub(crate) fn total_for(&self, ctx: Context) -> u64 {
+        self.total[ctx.index()]
     }
 
     /// Accumulate `other` into `self`.
@@ -863,7 +984,7 @@ impl PerContextCounters {
 
 /// Fixed-per-record parameters threaded into the span kernels.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct SpanParams {
+struct SpanParams {
     /// Whether this record monitors reference C (top) or G (bottom).
     pub(crate) monitor_c: bool,
     /// The monitored 4-bit reference base code (C=2 or G=4).
@@ -888,9 +1009,50 @@ pub(crate) struct SpanParams {
     pub(crate) skip: Option<(usize, usize)>,
 }
 
-/// Classify a single already-matched monitored cytosine at read position `rp` /
-/// reference position `gp` and record it. `ref_codes[gp]` is assumed to equal
-/// the monitored base and `gp < ref_len`.
+/// Classify one already-matched monitored cytosine at read position `rp` /
+/// reference position `gp`: returns its `(context, unconverted)`, or `None` to
+/// drop it (base quality below `min_bq`, a chromosome edge with no neighbor, or
+/// a read base that is neither the unconverted nor converted call — SNP / N).
+/// `refc[gp]` is assumed to equal the monitored base. Shared by the decision
+/// tally ([`tally_site`]) and the M-bias walk ([`RecordProcessor::mbias_walk`])
+/// so the two agree on context/edge/drop rules; `#[inline]` so it folds into the
+/// decision hot loop with no call overhead.
+#[inline]
+fn classify_site<R: RefCodes>(
+    rec: &RawRecord,
+    refc: R,
+    rp: usize,
+    gp: usize,
+    monitor_c: bool,
+    min_bq: u8,
+    ref_len: usize,
+) -> Option<(Context, bool)> {
+    if rec.get_qual(rp) < min_bq {
+        return None;
+    }
+    // Context from the reference neighbor (chrom-end safe), decoded in the
+    // encoding's native space (no per-neighbor 4-bit decode for packed layouts).
+    let ctx = if monitor_c {
+        if gp + 1 >= ref_len {
+            return None;
+        }
+        refc.ctx_top(gp + 1)
+    } else {
+        if gp == 0 {
+            return None;
+        }
+        refc.ctx_bottom(gp - 1)
+    }?;
+    let unconverted = match (monitor_c, rec.get_base(rp)) {
+        (true, BASE_C) | (false, BASE_G) => true,  // unconverted
+        (true, BASE_T) | (false, BASE_A) => false, // converted
+        _ => return None,                          // SNP / N — drop
+    };
+    Some((ctx, unconverted))
+}
+
+/// Classify a single already-matched monitored cytosine and record it into the
+/// decision counters. `refc[gp]` is assumed to equal the monitored base.
 #[inline]
 fn tally_site<R: RefCodes>(
     rec: &RawRecord,
@@ -900,39 +1062,11 @@ fn tally_site<R: RefCodes>(
     p: &SpanParams,
     counters: &mut PerContextCounters,
 ) {
-    if rec.get_qual(rp) < p.min_bq {
-        return;
+    if let Some((ctx, unconverted)) =
+        classify_site(rec, refc, rp, gp, p.monitor_c, p.min_bq, p.ref_len)
+    {
+        counters.record(ctx, unconverted);
     }
-    // Context from the reference neighbor (chrom-end safe), decoded in the
-    // encoding's native space (no per-neighbor 4-bit decode for packed layouts).
-    let ctx = if p.monitor_c {
-        if gp + 1 >= p.ref_len {
-            return;
-        }
-        refc.ctx_top(gp + 1)
-    } else {
-        if gp == 0 {
-            return;
-        }
-        refc.ctx_bottom(gp - 1)
-    };
-    let Some(ctx) = ctx else { return };
-
-    let readb = rec.get_base(rp);
-    let unconverted = if p.monitor_c {
-        match readb {
-            BASE_C => true,  // unconverted
-            BASE_T => false, // converted
-            _ => return,     // SNP / N — drop
-        }
-    } else {
-        match readb {
-            BASE_G => true,
-            BASE_A => false,
-            _ => return,
-        }
-    };
-    counters.record(ctx, unconverted);
 }
 
 /// Tally a contiguous run of aligned positions `[lo, hi)` (in local `k`
@@ -975,7 +1109,7 @@ fn tally_run<R: RefCodes + Copy>(
 /// excluded middle. (Keeping the skip handling inline matters: any out-of-line
 /// helper here stops `tally_span` from fusing into the caller and regresses the
 /// hot path.)
-pub(crate) fn tally_span<R: RefCodes + Copy>(
+fn tally_span<R: RefCodes + Copy>(
     rec: &RawRecord,
     refc: R,
     rp_start: usize,
@@ -1003,92 +1137,6 @@ pub(crate) fn tally_span<R: RefCodes + Copy>(
             tally_run(rec, refc, rp_start, gp_start, sk1, k1, p, counters);
         }
     }
-}
-
-// ── Flag & CIGAR helpers ────────────────────────────────────────────────────
-
-#[inline]
-fn has(flags: u16, bit: u16) -> bool {
-    flags & bit != 0
-}
-
-/// Whether a record monitors reference C (top, `true`) or G (bottom, `false`),
-/// per the per-record MethylDackel rule: treat single-end and R1 the same, then
-/// XOR with the record's own reverse bit.
-#[inline]
-fn monitor_c_of(flags: u16) -> bool {
-    let treat_as_read1 = has(flags, FLAG_FIRST_SEGMENT) || !has(flags, FLAG_PAIRED);
-    treat_as_read1 ^ has(flags, FLAG_REVERSE)
-}
-
-/// Reference half-open interval `[start, end)` covered by the alignment of the
-/// stored query positions in `[q_lo, q_hi)`. Returns `None` if no aligned base
-/// falls in that window (e.g. a fully soft-clipped end). Insertions/soft-clips
-/// inside the window consume query budget but contribute no reference positions;
-/// a deletion inside the window stretches the returned span across the gap, so
-/// the result is a single contiguous interval. Assumes `rec.pos() >= 0`.
-fn ref_span_for_query_window(rec: &RawRecord, q_lo: usize, q_hi: usize) -> Option<(usize, usize)> {
-    if q_lo >= q_hi {
-        return None;
-    }
-    let mut qpos = 0usize;
-    let mut rpos = rec.pos().max(0) as usize;
-    let mut lo = usize::MAX;
-    let mut hi = 0usize;
-    for op in rec.cigar_ops_iter() {
-        let len = (op >> 4) as usize;
-        match op & 0xf {
-            // M, =, X — aligned 1:1; intersect this op's query range with the window.
-            0 | 7 | 8 => {
-                let a = qpos.max(q_lo);
-                let b = (qpos + len).min(q_hi);
-                if a < b {
-                    lo = lo.min(rpos + (a - qpos));
-                    hi = hi.max(rpos + (b - qpos));
-                }
-                qpos += len;
-                rpos += len;
-            }
-            // I, S — consume query only.
-            1 | 4 => qpos += len,
-            // D, N — consume reference only.
-            2 | 3 => rpos += len,
-            // H, P — consume neither.
-            _ => {}
-        }
-        if qpos >= q_hi {
-            break;
-        }
-    }
-    (lo < hi).then_some((lo, hi))
-}
-
-/// Reference span of the `n` sequenced bases at the read's 5' end (sequencing
-/// order). For a forward record the 5' end is the low stored-position end; for a
-/// reverse record SEQ is stored reverse-complemented, so the 5' end is the high
-/// stored-position end. Returns `None` if `n == 0` or those bases include no
-/// aligned position.
-fn five_prime_ref_span(rec: &RawRecord, n: usize) -> Option<(usize, usize)> {
-    if n == 0 {
-        return None;
-    }
-    let seq_len = rec.l_seq() as usize;
-    let (q_lo, q_hi) =
-        if has(rec.flags(), FLAG_REVERSE) { (seq_len.saturating_sub(n), seq_len) } else { (0, n) };
-    ref_span_for_query_window(rec, q_lo, q_hi)
-}
-
-/// Reference span of the `n` sequenced bases at the read's 3' end — the opposite
-/// end from [`five_prime_ref_span`]. Used only for a lone (single-end or orphan)
-/// read, whose far template terminus can't be located, so both ends are trimmed.
-fn three_prime_ref_span(rec: &RawRecord, n: usize) -> Option<(usize, usize)> {
-    if n == 0 {
-        return None;
-    }
-    let seq_len = rec.l_seq() as usize;
-    let (q_lo, q_hi) =
-        if has(rec.flags(), FLAG_REVERSE) { (0, n) } else { (seq_len.saturating_sub(n), seq_len) };
-    ref_span_for_query_window(rec, q_lo, q_hi)
 }
 
 #[cfg(test)]
@@ -1307,37 +1355,5 @@ mod tests {
         // ref G at positions 1,3,5,7,9 (0-based); each has ref[i-1]=T → CpA.
         assert_eq!(counters.unconv[Context::CpA.index()], 5);
         assert_eq!(counters.total[Context::CpA.index()], 5);
-    }
-
-    #[test]
-    fn five_prime_span_forward_and_reverse() {
-        let q = "I".repeat(10);
-        let fwd = parse_sam_records(&[&sam_line(0, 1, "10M", "CACACACACA", &q)], 30);
-        assert_eq!(five_prime_ref_span(&fwd[0], 3), Some((0, 3)));
-        assert_eq!(three_prime_ref_span(&fwd[0], 3), Some((7, 10)));
-
-        // Reverse: SEQ is stored forward-genomic, so the 5' end is the HIGH end.
-        let rev = parse_sam_records(&[&sam_line(FLAG_REVERSE, 1, "10M", "CACACACACA", &q)], 30);
-        assert_eq!(five_prime_ref_span(&rev[0], 3), Some((7, 10)));
-        assert_eq!(three_prime_ref_span(&rev[0], 3), Some((0, 3)));
-    }
-
-    #[test]
-    fn five_prime_span_skips_leading_soft_clip() {
-        let q = "I".repeat(10);
-        let recs = parse_sam_records(&[&sam_line(0, 1, "3S7M", "GGGCACACAC", &q)], 30);
-        // First 3 sequenced bases are soft-clipped → no aligned position.
-        assert_eq!(five_prime_ref_span(&recs[0], 3), None);
-        // First 5 sequenced bases → 2 aligned (stored 3,4) → ref [0,2).
-        assert_eq!(five_prime_ref_span(&recs[0], 5), Some((0, 2)));
-    }
-
-    #[test]
-    fn ref_span_stretches_across_deletion() {
-        let q = "I".repeat(6);
-        // 2M3D4M at ref 0: query[0,4) covers stored 0,1 (ref0,1) and stored 2,3
-        // (ref5,6); the deletion stretches the returned span to [0,7).
-        let recs = parse_sam_records(&[&sam_line(0, 1, "2M3D4M", "CACGTA", &q)], 30);
-        assert_eq!(five_prime_ref_span(&recs[0], 4), Some((0, 7)));
     }
 }
