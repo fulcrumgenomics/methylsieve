@@ -235,13 +235,13 @@ fn parse_tag_spec(s: &str) -> Result<TagSpec, String> {
 #[derive(Parser, Debug, Clone)]
 #[command(name = "methylsieve", version = METHYLSIEVE_BUILD, about = SHORT_ABOUT, long_about = LONG_ABOUT)]
 pub struct Args {
-    /// Input SAM/BAM file [stdin]. Must be query-grouped (all records for one
-    /// QNAME adjacent, typically straight from the aligner).
+    /// Input SAM/BAM file (defaults to stdin). Must be query-grouped (all records
+    /// for one QNAME adjacent, typically straight from the aligner).
     #[arg(short = 'i', long = "input", help_heading = "Inputs / outputs")]
     pub(crate) input: Option<PathBuf>,
 
-    /// Output BAM file [stdout]. The path must end in `.bam` — output is always
-    /// BAM, never SAM. Use `-` for stdout (no extension check).
+    /// Output BAM file (defaults to stdout). The path must end in `.bam` — output
+    /// is always BAM, never SAM. Use `-` for stdout (no extension check).
     #[arg(short = 'o', long = "output", help_heading = "Inputs / outputs")]
     pub(crate) output: Option<PathBuf>,
 

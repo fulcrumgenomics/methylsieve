@@ -489,7 +489,7 @@ impl RecordProcessor {
     /// the M-bias sites — every called cytosine at its true cycle, no end-trim and
     /// no overlap dedup — are a superset of the decision's, so one walk feeds both
     /// and `classify_site` runs once per site instead of twice. The masking-off
-    /// decision path never reaches here; it keeps using [`tally_aligned`]
+    /// decision path never reaches here; it keeps using [`Self::tally_aligned`]
     /// untouched, so that codegen-sensitive hot loop is unaffected.
     fn tally_and_accumulate(
         &self,
@@ -833,7 +833,7 @@ impl TemplateTermini {
     /// The genomic terminus belonging to the *other* mate, if it intrudes into
     /// this record's reference span (so non-overlapping mates contribute no
     /// per-base skip). `None` for single-end/orphan reads (both ends already
-    /// handled by [`own_trim_for`]).
+    /// handled by [`Self::own_trim_for`]).
     #[inline(never)]
     fn mate_skip_for(&self, rec: &RawRecord) -> Option<(usize, usize)> {
         if self.single {
