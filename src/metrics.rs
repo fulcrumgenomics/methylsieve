@@ -48,6 +48,7 @@ pub(crate) fn write_all<F>(
     header: &Header,
     sample_override: Option<&str>,
     input_path: Option<&Path>,
+    contexts: &str,
     classify: F,
 ) -> Result<()>
 where
@@ -61,6 +62,15 @@ where
         write_matrix(w, stats, &sample, &classify)
     })?;
     write_file(&with_suffix(prefix, "mbias.tsv"), |w| write_mbias(w, mbias, &sample))?;
+    // PDF plots of the same data (M-bias curves + conversion-matrix hexbin).
+    crate::plots::write_mbias_pdf(&with_suffix(prefix, "mbias.pdf"), mbias, mask_plan, &sample)?;
+    crate::plots::write_matrix_pdf(
+        &with_suffix(prefix, "conversion-matrix.pdf"),
+        &stats.conversion_matrix,
+        &classify,
+        &sample,
+        contexts,
+    )?;
     Ok(())
 }
 

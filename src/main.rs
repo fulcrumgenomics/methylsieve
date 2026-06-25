@@ -16,6 +16,7 @@ mod io_threading;
 mod mask;
 mod mbias;
 mod metrics;
+mod plots;
 mod raw_reader;
 mod raw_writer;
 mod record;
@@ -137,6 +138,26 @@ impl ContextMask {
     #[must_use]
     pub(crate) fn contains(self, ctx: Context) -> bool {
         self.0[ctx.index()]
+    }
+
+    /// Short human label for the selected contexts: `"CpH"` for the CpA/CpC/CpT
+    /// set (the conversion default), otherwise the selected context names joined
+    /// with `+` (e.g. `"CpG"`, `"CpA+CpG"`). Used in plot titles/axes.
+    #[must_use]
+    pub(crate) fn label(self) -> String {
+        let is_cph = self.contains(Context::CpA)
+            && self.contains(Context::CpC)
+            && self.contains(Context::CpT)
+            && !self.contains(Context::CpG);
+        if is_cph {
+            return "CpH".to_string();
+        }
+        Context::ALL
+            .iter()
+            .filter(|&&c| self.contains(c))
+            .map(|c| c.label())
+            .collect::<Vec<_>>()
+            .join("+")
     }
 }
 
@@ -726,9 +747,10 @@ fn run(args: Args) -> Result<()> {
             &header,
             args.sample.as_deref(),
             args.input.as_deref(),
+            &args.contexts.label(),
             |unconv, monitored| processor.classify(unconv, monitored),
         )
-        .context("writing metric TSVs")?;
+        .context("writing metric TSVs and plots")?;
     }
 
     out.finish().context("finishing main output")?;
