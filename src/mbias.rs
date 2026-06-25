@@ -3,17 +3,18 @@
 //! M-bias is the methylation rate as a function of sequencing cycle (distance
 //! from a read's 5' start). End-repair fill-in in bisulfite / EM-seq libraries
 //! skews the first cycles — especially read 2 — so we measure the per-cycle CpG
-//! methylation rate, find where it first reaches the plateau, and mask the
-//! biased 5' (and, for single-end reads, 3') cycles.
+//! methylation rate and detect how many leading (and, for single-end reads,
+//! trailing) cycles to mask. Applying that mask is the job of [`crate::mask`];
+//! this module only accumulates the curves and derives the lengths.
 //!
 //! Counts are bucketed by `(read role, read end, context, cycle)`. Each site is
 //! classified with methylsieve's own reference-based call (the same one the
 //! tally uses), so a learned mask stays consistent with what the tally excludes.
 //!
-//! The accumulator is fed only at *matched* monitored sites — never on the
-//! per-base reference scan — and only when M-bias output or masking is enabled,
-//! so the default fast path pays nothing (see the `SiteSink` plumbing in
-//! `classify`/`sieve`).
+//! The accumulator is reached as an `Option<&mut MbiasAccumulator>` threaded
+//! through `process_block` and fed from the fused reference walk (`fused_walk`)
+//! in [`crate::sieve`]. It is present only when M-bias output or masking is
+//! enabled, so the default fast path pays nothing.
 
 use crate::reference::Context;
 

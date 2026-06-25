@@ -25,10 +25,14 @@ cargo ci-test   # nextest (or `cargo test`)
 `mark-nonconverted-reads` on synthetic data. It needs `pysam` and `samtools`:
 
 ```bash
-python3 -m venv venv && venv/bin/pip install pysam
+python3 -m venv neb-venv && neb-venv/bin/pip install pysam
 cargo build --release
-venv/bin/python dev/neb_concordance.py
+neb-venv/bin/python dev/neb_concordance.py \
+  --methylsieve target/release/methylsieve \
+  --neb ../mark-nonconverted-reads/mark-nonconverted-reads.py
 ```
+
+See the script's module docstring for the expected divergences it characterizes.
 
 ## Style & testing
 

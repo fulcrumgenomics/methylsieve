@@ -689,11 +689,10 @@ fn ref_length_from_cigar(ops: &[u32]) -> i32 {
     len
 }
 
-/// BAM `reg2bin` — same indexing scheme htslib uses. Pulled verbatim
-/// from the SAMv1 spec.
 /// Compute the BAM bin number for a 0-based half-open interval `[beg, end)`,
-/// per SAMv1 spec section 5.1.1 (the R-tree binning scheme). Returns 0 when
-/// the interval spans the largest bin (effectively "no bin").
+/// per SAMv1 spec §5.1.1 (the same R-tree binning scheme htslib uses). Returns 0
+/// (the root bin) when no finer level's shifted `[beg, end)` endpoints coincide —
+/// e.g. an out-of-range or unmapped interval.
 ///
 /// Bin offsets are `1 + 8 + 64 + 512 + 4096 = (8^k - 1) / 7` for the five
 /// non-root levels; we just inline the constants since they're standardized.

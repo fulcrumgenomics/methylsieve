@@ -444,8 +444,7 @@ mod tests {
     }
 
     /// Non-overlapping FR pair: the mates share no reference positions, so NO
-    /// propagation occurs — only each read's own 5' is masked. (This is the case
-    /// the old strand-proxy overhang logic wrongly masked in full.)
+    /// propagation occurs — only each read's own 5' is masked.
     #[test]
     fn non_overlapping_pair_does_not_propagate() {
         let r1 = line("p", FLAG_PAIRED | FLAG_FIRST_SEGMENT, 1, "10M", "CACACACACA");

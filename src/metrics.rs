@@ -417,8 +417,8 @@ mod tests {
         let text = render(&summary_rows(&stats, None, "S1"));
         let mut lines = text.lines();
         let hdr = lines.next().unwrap();
-        // The per-read fold is gone — no `read` column, one row per scope.
-        assert!(!hdr.split('\t').any(|c| c == "read"), "read column removed");
+        // Summary is one decision-basis row per scope; there is no `read` column.
+        assert!(!hdr.split('\t').any(|c| c == "read"), "no per-read column");
         let row: Vec<&str> = lines.next().unwrap().split('\t').collect();
         assert_eq!(row[col(hdr, "scope")], "genome");
         assert_eq!(row[col(hdr, "n_templates")], "100");

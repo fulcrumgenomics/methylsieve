@@ -12,25 +12,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first `--mbias-buffer-templates` templates (default 500,000) to learn the
   per-cycle CpG methylation curve for read 1 / read 2 / single-end reads, freezes
   5' (and, for single-end, 3') mask lengths, then sets the biased bases'
-  qualities to `--mbias-mask-quality` (default 2) on every primary mapped record.
-  Mask length is the first 5' cycle whose smoothed methylation reaches
-  `--mbias-plateau-fraction` of the plateau (default 0.90), minus one, capped at
-  `--mbias-max-mask` (default 30). Beyond the own-5' mask: single-end reads mask
-  the 3' end too; orphans (mate unmapped) mirror the mate role's length onto the
-  3' end; proper pairs mask any 3' bases extending past the mate's post-mask 5'
-  end. Masking only lowers base qualities — no clip, no coordinate/CIGAR/tag/mate
-  rewrite — so it is effective for base-quality-aware callers and is not
-  idempotent. Masking off is performance-neutral with the prior release.
-- **Metric TSVs** under `--metrics-prefix PREFIX`, computed in a single streaming
-  pass: `PREFIX.mbias.tsv` (per-read-cycle methylation with Agresti–Coull CIs),
-  `PREFIX.mbias_bounds.tsv` (suggested mask lengths), and the conversion summary
-  folded over a per-read (`R1`/`R2`/`SE`) dimension.
+  qualities to `--mbias-mask-quality` (default 2) on every record carrying SEQ
+  and qualities except secondary alignments (primary, supplementary, and unmapped
+  records are all masked). Mask length is the first 5' cycle whose smoothed
+  methylation reaches `--mbias-plateau-fraction` of the plateau (default 0.90),
+  minus one, capped at `--mbias-max-mask` (default 30). Beyond the own-5' mask:
+  single-end reads mask the 3' end too; reads whose mate is unmapped or absent
+  mirror the mate role's 5' length onto their 3' end; proper pairs mask any 3'
+  bases extending past the mate's post-mask 5' end. Masking only lowers base
+  qualities — no clip, no coordinate/CIGAR/tag/mate rewrite — so it is effective
+  for base-quality-aware callers and is not idempotent. Masking off is
+  performance-neutral with the prior release.
+- **Metric files** under `--metrics-prefix PREFIX`, computed in a single
+  streaming pass: `PREFIX.summary.tsv` (one decision-basis per-context conversion
+  row per scope — the genome, then each `--control-contig` — with the applied
+  mask lengths as `r1_mask_5p` / `r2_mask_5p` / `se_mask_5p` / `se_mask_3p`
+  columns), `PREFIX.conversion-matrix.tsv` (the per-template decision histogram),
+  and `PREFIX.mbias.tsv` (per-read-cycle methylation with Agresti–Coull CIs),
+  plus PDF plots `PREFIX.mbias.pdf` and `PREFIX.conversion-matrix.pdf`.
 
 ### Changed
 - **Breaking:** `--stats` and `--conversion-matrix` are replaced by a single
-  `--metrics-prefix PREFIX`, which writes `PREFIX.summary.tsv` (the former
-  `--stats`, now with a `read` column) and `PREFIX.conversion_matrix.tsv`. All
-  metric rates are emitted as fractions in `[0, 1]`.
+  `--metrics-prefix PREFIX`, which writes `PREFIX.summary.tsv` (one per-context
+  conversion row per scope, with the applied mask-length columns),
+  `PREFIX.conversion-matrix.tsv`, and `PREFIX.mbias.tsv`. All metric rates are
+  emitted as fractions in `[0, 1]`.
+- `--mbias-mask` supersedes `--ignore-template-ends`: when masking is enabled the
+  manual end-trim is forced to 0 (both target the same fragment-end bias), with a
+  warning logged if a non-zero value was set explicitly.
 
 ## [0.1.0] - 2026-06-13
 

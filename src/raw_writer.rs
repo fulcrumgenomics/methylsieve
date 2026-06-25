@@ -32,12 +32,11 @@ use noodles_sam::io::Writer as SamWriter;
 
 use crate::io_threading::ThreadedWriter;
 
-/// BGZF magic bytes "BAM\1" — first 4 bytes of every BAM file.
+/// BAM magic bytes "BAM\1" — first 4 bytes of every BAM file.
 const BAM_MAGIC: &[u8; 4] = b"BAM\x01";
 
-/// Output sinks we open. Files go through a buffered writer; stdout uses
-/// the line-buffered default (BGZF writes are large enough that extra
-/// buffering doesn't help much).
+/// Output sinks we open. Neither adds an extra buffering layer — BGZF blocks
+/// are already large enough that an intermediate buffer wouldn't help.
 enum Sink {
     File(std::fs::File),
     Stdout(io::Stdout),

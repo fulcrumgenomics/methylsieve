@@ -1,4 +1,4 @@
-//! Dedicated IO threads with a 16 MB byte ring buffer in each direction.
+//! Dedicated IO threads with a caller-sized byte ring buffer in each direction.
 //!
 //! Production methylsieve pipelines look like
 //!     aligner | methylsieve | sorter
@@ -9,7 +9,9 @@
 //! stalls the others.
 //!
 //! [`ThreadedReader`] and [`ThreadedWriter`] put a dedicated thread on
-//! each IO end with a 16 MB user-space ring buffer in between. The worker
+//! each IO end with a user-space ring buffer in between, sized by the caller
+//! (`ring_bytes`, with a small floor; the binary defaults to 16 MB read /
+//! 64 MB write via `--read-buffer-mb` / `--write-buffer-mb`). The worker
 //! reads/writes through the ring, never blocking on the kernel pipe.
 //!
 //! Design choices:

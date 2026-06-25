@@ -63,7 +63,8 @@ pub(crate) fn read_role(flags: u16) -> ReadRole {
 }
 
 /// Whether a record is a primary mapped alignment: mapped, not secondary, not
-/// supplementary. The masking target and the M-bias accumulation population.
+/// supplementary. This is the M-bias accumulation population (masking targets a
+/// broader set — see `maskable` in [`crate::mask`]).
 #[inline]
 pub(crate) fn is_primary_mapped(flags: u16) -> bool {
     !has(flags, FLAG_UNMAPPED | FLAG_SECONDARY | FLAG_SUPPLEMENTARY)

@@ -53,6 +53,7 @@ row per simulated dataset:
 | `coverage` | holodeck `-c` |
 | `conversion_rate` | holodeck `--methylation-conversion-rate` |
 | `failure_rate` | holodeck `--methylation-failure-rate` (the key axis) |
+| `min_error_rate` / `max_error_rate` | holodeck `--min-error-rate` / `--max-error-rate` (per-base sequencing-error ramp; default 0.001 / 0.01) |
 | `seed` | holodeck `--seed` (per row, for independence) |
 
 Key `config.yaml` knobs: `reference_url` (default UCSC hg38 chr21), `region_bed`
@@ -64,7 +65,7 @@ e.g. `./run.sh -- --config replicates=1`.
 
 | tool | invocation | "called unconverted" signal |
 |---|---|---|
-| **methylsieve** | `methylsieve -i golden.bam -o out.bam -r ref.fa --mode adaptive` | `XX:Z:UC` tag + `0x200` QC-fail on every record of the template |
+| **methylsieve** | `methylsieve -i golden.bam -o out.bam -r ref.fa --mode adaptive --no-check-crc` | `XX:Z:UC` tag + `0x200` QC-fail on every record of the template |
 | **NEB** | `mark-nonconverted-reads.py --bam golden.bam --reference ref.fa --flag_reads` | `XX:Z:UC` tag (+`0x200`) per read |
 | **biscuit** | `biscuit bsconv -m <thr-1> -v ref.fa golden.bam` | membership: the `-v` output *is* the unconverted reads |
 | **bismark** *(optional)* | `filter_non_conversion --paired golden.bam` | membership in `*_removed_seqs.bam` |

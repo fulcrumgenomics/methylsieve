@@ -119,9 +119,10 @@ impl RecordProcessor {
                         return None;
                     }
                     if trimming {
-                        // Keep legacy R1-takes-all so a 5' template-end trim still
-                        // occupies the single skip slot (split and trimming aren't
-                        // combined).
+                        // Split-dedup and end-trimming are mutually exclusive per
+                        // record (one interior-skip slot), so when trimming, assign
+                        // the whole overlap to R2 and leave that slot free for the
+                        // 5' template-end trim.
                         return (i == i2).then_some((os, oe));
                     }
                     let mid = os + (oe - os) / 2;
@@ -618,8 +619,9 @@ impl RecordProcessor {
     /// Classify a template from its `(unconverted, monitored)` site counts over
     /// the threshold contexts: returns whether it is unconverted and which arm
     /// of the decision logic applied. Pure in `(unconv, monitored)` given the
-    /// configured mode/thresholds, so `--conversion-matrix` can replay it per
-    /// cell without re-tallying; `decide` is this `.0`.
+    /// configured mode/thresholds, so the `conversion-matrix.tsv` output (under
+    /// `--metrics-prefix`) can replay it per cell without re-tallying; `decide` is
+    /// this `.0`.
     ///
     /// `min_sites` is a **floor**: the proportion test is unestimable below it
     /// and abstains. A template with no monitored sites is never unconverted.
@@ -716,7 +718,8 @@ pub(crate) enum DecisionMode {
 }
 
 /// Which arm of [`RecordProcessor::classify`] produced a template's verdict —
-/// surfaced per cell by `--conversion-matrix`.
+/// surfaced per cell in the `decided_by` column of `conversion-matrix.tsv`
+/// (under `--metrics-prefix`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DecidedBy {
     /// Too few sites to render a verdict: zero monitored sites, or below the
@@ -775,8 +778,9 @@ pub(crate) struct ProcessorOptions {
     pub(crate) remove_unconverted: bool,
     /// Scope per BAM tid: `None` → genome, `Some(i)` → `controls[i]`.
     pub(crate) scope_of_tid: Vec<Option<usize>>,
-    /// Accumulate the per-`(checked, unconverted)` decision histogram for
-    /// `--conversion-matrix`. Off by default to avoid per-template map cost.
+    /// Accumulate the per-`(checked, unconverted)` decision histogram for the
+    /// `conversion-matrix.tsv` output (under `--metrics-prefix`). Off by default
+    /// to avoid per-template map cost.
     pub(crate) record_matrix: bool,
 }
 
@@ -890,7 +894,8 @@ pub(crate) struct Stats {
     pub(crate) total_templates: u64,
     /// Genome decision histogram keyed by `(checked_sites, unconverted_sites)`
     /// over the threshold contexts → template count. Populated only when
-    /// `record_matrix` is set (drives the `--conversion-matrix` output).
+    /// `record_matrix` is set (drives the `conversion-matrix.tsv` output under
+    /// `--metrics-prefix`).
     pub(crate) conversion_matrix: BTreeMap<(u64, u64), u64>,
 }
 

@@ -190,7 +190,7 @@ pub(crate) fn parse_contexts(s: &str) -> Result<ContextMask, String> {
 }
 
 /// A parsed aux-tag specification (`--tag`). Only string (`Z`) tags are
-/// supported in v1.
+/// supported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TagSpec {
     /// The two-byte aux tag (e.g. `XX`).
@@ -277,7 +277,7 @@ pub struct Args {
     /// Contexts (comma-separated CpA,CpC,CpT,CpG) counted toward the
     /// unconverted-decision threshold. The default is CpH (CpA,CpC,CpT); CpG is
     /// excluded because genuine methylation lives there. All four contexts are
-    /// always reported in `--stats` regardless of this subset.
+    /// reported in the `--metrics-prefix` summary regardless of this subset.
     #[arg(long = "contexts", default_value = "CpA,CpC,CpT", value_parser = parse_contexts,
           help_heading = "Decision")]
     pub(crate) contexts: ContextMask,
@@ -329,6 +329,9 @@ pub struct Args {
     /// unknown, so both ends of the read are trimmed instead. Counted over the
     /// stored SEQ in sequencing order, so 5'-end soft-clips count toward N;
     /// hard-clipped bases are absent from SEQ and do not. Default 0 (off).
+    /// Superseded by `--mbias-mask`: when masking is enabled this trim is forced
+    /// to 0 (both target the same fragment-end bias) and a warning is logged if a
+    /// non-zero value was set explicitly.
     #[arg(long = "ignore-template-ends", default_value_t = 0, help_heading = "Decision")]
     pub(crate) ignore_template_ends: u32,
 
@@ -399,12 +402,14 @@ pub struct Args {
     #[arg(long = "mbias-mask-quality", default_value_t = 2, help_heading = "M-bias masking")]
     pub(crate) mbias_mask_quality: u8,
 
-    /// Write metric TSVs under this path prefix: `PREFIX.summary.tsv` (per-context
-    /// conversion, folded over read 1 / read 2 / single-end, with applied 5'/3'
-    /// mask lengths on the per-read rows), `PREFIX.mbias.tsv` (per-read-cycle
+    /// Write metric files under this path prefix: `PREFIX.summary.tsv` (one
+    /// per-context conversion row per scope — the genome, then each control contig
+    /// — with the applied 5'/3' mask lengths as `r1_mask_5p`/`r2_mask_5p`/
+    /// `se_mask_5p`/`se_mask_3p` columns), `PREFIX.mbias.tsv` (per-read-cycle
     /// methylation), and `PREFIX.conversion-matrix.tsv` (the per-template decision
-    /// histogram). Computing these is a single streaming pass; the output BAM is
-    /// unchanged.
+    /// histogram), plus PDF plots `PREFIX.mbias.pdf` (M-bias curves) and
+    /// `PREFIX.conversion-matrix.pdf` (the decision hexbin). Computing these is a
+    /// single streaming pass; the output BAM is unchanged.
     #[arg(long = "metrics-prefix", help_heading = "Stats & misc")]
     pub(crate) metrics_prefix: Option<PathBuf>,
 
@@ -457,7 +462,9 @@ const LONG_ABOUT: &str = "Tag or filter incompletely-converted reads in directio
 EM-seq data.\n\
 Makes one per-template decision using all of a QNAME's primary and supplementary records, \
 propagates it to every record, and emits a per-context / per-spike-in conversion-rate TSV. \
-Input must be query-grouped; output is always BAM.";
+Input must be query-grouped and should be adapter-trimmed first: untrimmed adapter \
+read-through on short inserts can be force-aligned and read as spurious unconverted CpH. \
+Output is always BAM.";
 
 impl Args {
     /// Resolved CRC-verify setting: explicit flags win; otherwise on for file

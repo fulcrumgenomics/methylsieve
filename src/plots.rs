@@ -175,7 +175,7 @@ pub(crate) fn write_matrix_pdf(
 
     let (mut xs, mut ys, mut zs) = (Vec::new(), Vec::new(), Vec::new());
     // Lowest converted-count still called "converted" per observed count → the
-    // decision boundary (a position masked in one mate is masked in the other...).
+    // decision boundary drawn over the hexbin.
     let mut boundary: BTreeMap<u64, u64> = BTreeMap::new();
     for (&(checked, unconv), &n) in matrix {
         let converted = checked - unconv;
