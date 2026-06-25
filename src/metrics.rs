@@ -1,4 +1,9 @@
-//! Metric TSVs written under `--metrics-prefix PREFIX`:
+//! Metric TSVs written under `--metrics-prefix PREFIX`.
+//!
+//! Each file is one serde row struct serialized with [`fgoxide::io::DelimFile`]
+//! (the same pattern as riker): column names and order come from the struct's
+//! fields, and rates are rendered as fixed 6-decimal fractions (never
+//! percentages) via the `ser_*` helpers.
 //!
 //! - `PREFIX.summary.tsv` — one per-context conversion row per scope (genome
 //!   first, then each `--control-contig`). Every row is decision-basis:
@@ -9,16 +14,15 @@
 //!   Per-read conversion broken out by cycle lives in `mbias.tsv`, not here.
 //! - `PREFIX.conversion-matrix.tsv` — per-`(checked, converted)` decision cell.
 //! - `PREFIX.mbias.tsv` — per-read-cycle methylation by `(read, end, context)`.
-//!
-//! All rates are fractions in `[0, 1]` (never percentages).
 
 use std::collections::BTreeSet;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Result, anyhow};
+use fgoxide::io::DelimFile;
 use noodles_sam::Header;
 use noodles_sam::header::record::value::map::read_group::tag as rg_tag;
+use serde::Serialize;
 
 use crate::METHYLSIEVE_BUILD;
 use crate::mask::MaskPlan;
@@ -35,8 +39,8 @@ fn with_suffix(prefix: &Path, suffix: &str) -> PathBuf {
 }
 
 /// Write every metric file under `prefix`. `mbias` holds the per-cycle counts
-/// accumulated during the run; `classify(unconv, monitored)` replays the
-/// per-cell decision verdict for the conversion matrix.
+/// accumulated during the run; `classify(unconv, checked)` replays the per-cell
+/// decision verdict for the conversion matrix.
 #[allow(clippy::too_many_arguments)] // a single wiring call site; a params struct would not aid clarity
 pub(crate) fn write_all<F>(
     prefix: &Path,
@@ -53,13 +57,14 @@ where
     F: Fn(u64, u64) -> (bool, DecidedBy),
 {
     let sample = resolve_sample(header, sample_override, input_path);
-    write_file(&with_suffix(prefix, "summary.tsv"), |w| {
-        write_summary(w, stats, mask_plan, &sample)
-    })?;
-    write_file(&with_suffix(prefix, "conversion-matrix.tsv"), |w| {
-        write_matrix(w, stats, &sample, &classify)
-    })?;
-    write_file(&with_suffix(prefix, "mbias.tsv"), |w| write_mbias(w, mbias, &sample))?;
+    let df = DelimFile::default();
+    write_tsv(&df, &with_suffix(prefix, "summary.tsv"), summary_rows(stats, mask_plan, &sample))?;
+    write_tsv(
+        &df,
+        &with_suffix(prefix, "conversion-matrix.tsv"),
+        matrix_rows(stats, &sample, &classify),
+    )?;
+    write_tsv(&df, &with_suffix(prefix, "mbias.tsv"), mbias_rows(mbias, &sample))?;
     // PDF plots of the same data (M-bias curves + conversion-matrix hexbin).
     crate::plots::write_mbias_pdf(&with_suffix(prefix, "mbias.pdf"), mbias, mask_plan, &sample)?;
     crate::plots::write_matrix_pdf(
@@ -72,34 +77,83 @@ where
     Ok(())
 }
 
-/// Create `path` and run `render` against it, with path context on error.
-fn write_file<F>(path: &Path, render: F) -> Result<()>
-where
-    F: FnOnce(&mut dyn Write) -> std::io::Result<()>,
-{
-    let mut f =
-        std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
-    render(&mut f).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
+/// Write `rows` as a tab-separated file at `path`, with path context on error.
+fn write_tsv<T: Serialize>(df: &DelimFile, path: &Path, rows: Vec<T>) -> Result<()> {
+    df.write_tsv(path, rows.iter()).map_err(|e| anyhow!("writing {}: {e}", path.display()))
+}
+
+// ── serde rate formatting ─────────────────────────────────────────────────────
+
+/// Serialize an `f64` as a fixed 6-decimal fraction (the metric convention).
+fn ser_f64_6dp<S: serde::Serializer>(v: &f64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&format!("{v:.6}"))
+}
+
+/// Serialize `Option<f64>` as a 6-decimal fraction, or the empty string for
+/// `None` — used where a rate is undefined because no sites were observed.
+fn ser_opt_f64_6dp<S: serde::Serializer>(v: &Option<f64>, s: S) -> Result<S::Ok, S::Error> {
+    match v {
+        Some(x) => s.serialize_str(&format!("{x:.6}")),
+        None => s.serialize_str(""),
+    }
+}
+
+/// Conversion rate `1 - unconv/total`, or `None` when no sites were observed.
+fn conv_rate(unconv: u64, total: u64) -> Option<f64> {
+    (total > 0).then(|| 1.0 - unconv as f64 / total as f64)
+}
+
+/// Combined CpH `(unconv, total)` across CpA/CpC/CpT.
+fn cph_counts(c: &PerContextCounters) -> (u64, u64) {
+    [Context::CpA, Context::CpC, Context::CpT]
+        .iter()
+        .fold((0, 0), |(u, t), &ctx| (u + c.unconv_for(ctx), t + c.total_for(ctx)))
 }
 
 // ── summary.tsv ───────────────────────────────────────────────────────────────
 
-/// One summary row — one per scope, all decision-basis.
-struct Row<'a> {
-    sample: &'a str,
-    scope: &'a str,
+/// One summary row — one per scope, all decision-basis. Column names/order are
+/// the serde field names (CpX fields renamed to preserve the context casing).
+#[derive(Serialize)]
+struct SummaryRow {
+    sample: String,
+    methylsieve_version: &'static str,
+    scope: String,
+    r1_mask_5p: Option<usize>,
+    r2_mask_5p: Option<usize>,
+    se_mask_5p: Option<usize>,
+    se_mask_3p: Option<usize>,
     n_templates: u64,
     n_mapped: u64,
     n_evaluated: u64,
     n_unconverted: u64,
-    /// Chimeric-to-control count — only the genome scope (control diagnostic);
-    /// `None` for control scopes.
-    chimeric_to_control: Option<u64>,
-    counters: PerContextCounters,
-    /// Applied per-read mask lengths from the frozen plan (a run-level property
-    /// repeated on every scope row), blank when masking was not run.
-    masks: MaskCols,
+    #[serde(serialize_with = "ser_opt_f64_6dp")]
+    frac_unconverted: Option<f64>,
+    chimeric_to_control_templates: Option<u64>,
+    #[serde(rename = "CpA_obs")]
+    cpa_obs: u64,
+    #[serde(rename = "CpA_conv_rate", serialize_with = "ser_opt_f64_6dp")]
+    cpa_conv_rate: Option<f64>,
+    #[serde(rename = "CpC_obs")]
+    cpc_obs: u64,
+    #[serde(rename = "CpC_conv_rate", serialize_with = "ser_opt_f64_6dp")]
+    cpc_conv_rate: Option<f64>,
+    #[serde(rename = "CpT_obs")]
+    cpt_obs: u64,
+    #[serde(rename = "CpT_conv_rate", serialize_with = "ser_opt_f64_6dp")]
+    cpt_conv_rate: Option<f64>,
+    #[serde(rename = "CpH_obs")]
+    cph_obs: u64,
+    #[serde(rename = "CpH_conv_rate", serialize_with = "ser_opt_f64_6dp")]
+    cph_conv_rate: Option<f64>,
+    #[serde(rename = "CpG_obs")]
+    cpg_obs: u64,
+    #[serde(rename = "CpG_conv_rate", serialize_with = "ser_opt_f64_6dp")]
+    cpg_conv_rate: Option<f64>,
+    // CpG methylation rate = unconverted/total CpG = 1 - CpG conv rate, stated
+    // directly because it is the headline biological readout.
+    #[serde(rename = "CpG_meth_rate", serialize_with = "ser_opt_f64_6dp")]
+    cpg_meth_rate: Option<f64>,
 }
 
 /// The four applied mask lengths (sequencing cycles). R1/R2 are 5'-only — their
@@ -128,164 +182,116 @@ impl MaskCols {
     }
 }
 
-type ColumnFn = fn(&Row) -> String;
-
-/// Optional `u64` → string, blank when `None`.
-fn opt(v: Option<u64>) -> String {
-    v.map(|n| n.to_string()).unwrap_or_default()
-}
-
-/// Optional `usize` → string, blank when `None`.
-fn opt_usize(v: Option<usize>) -> String {
-    v.map(|n| n.to_string()).unwrap_or_default()
-}
-
-/// Conversion rate `1 - unconv/total` from explicit counts, blank when no sites.
-fn conv_rate(unconv: u64, total: u64) -> String {
-    if total == 0 { String::new() } else { format!("{:.6}", 1.0 - unconv as f64 / total as f64) }
-}
-
-/// Combined CpH `(unconv, total)` across CpA/CpC/CpT.
-fn cph_counts(c: &PerContextCounters) -> (u64, u64) {
-    [Context::CpA, Context::CpC, Context::CpT]
-        .iter()
-        .fold((0, 0), |(u, t), &ctx| (u + c.unconv_for(ctx), t + c.total_for(ctx)))
-}
-
-const COLUMNS: &[(&str, ColumnFn)] = &[
-    ("sample", |r| r.sample.to_string()),
-    ("methylsieve_version", |_| METHYLSIEVE_BUILD.to_string()),
-    ("scope", |r| r.scope.to_string()),
-    ("r1_mask_5p", |r| opt_usize(r.masks.r1_5p)),
-    ("r2_mask_5p", |r| opt_usize(r.masks.r2_5p)),
-    ("se_mask_5p", |r| opt_usize(r.masks.se_5p)),
-    ("se_mask_3p", |r| opt_usize(r.masks.se_3p)),
-    ("n_templates", |r| r.n_templates.to_string()),
-    ("n_mapped", |r| r.n_mapped.to_string()),
-    ("n_evaluated", |r| r.n_evaluated.to_string()),
-    ("n_unconverted", |r| r.n_unconverted.to_string()),
-    ("frac_unconverted", |r| {
-        if r.n_evaluated > 0 {
-            format!("{:.6}", r.n_unconverted as f64 / r.n_evaluated as f64)
-        } else {
-            String::new()
-        }
-    }),
-    ("chimeric_to_control_templates", |r| opt(r.chimeric_to_control)),
-    ("CpA_obs", |r| r.counters.total_for(Context::CpA).to_string()),
-    ("CpA_conv_rate", |r| {
-        conv_rate(r.counters.unconv_for(Context::CpA), r.counters.total_for(Context::CpA))
-    }),
-    ("CpC_obs", |r| r.counters.total_for(Context::CpC).to_string()),
-    ("CpC_conv_rate", |r| {
-        conv_rate(r.counters.unconv_for(Context::CpC), r.counters.total_for(Context::CpC))
-    }),
-    ("CpT_obs", |r| r.counters.total_for(Context::CpT).to_string()),
-    ("CpT_conv_rate", |r| {
-        conv_rate(r.counters.unconv_for(Context::CpT), r.counters.total_for(Context::CpT))
-    }),
-    ("CpH_obs", |r| cph_counts(&r.counters).1.to_string()),
-    ("CpH_conv_rate", |r| {
-        let (u, t) = cph_counts(&r.counters);
-        conv_rate(u, t)
-    }),
-    ("CpG_obs", |r| r.counters.total_for(Context::CpG).to_string()),
-    ("CpG_conv_rate", |r| {
-        conv_rate(r.counters.unconv_for(Context::CpG), r.counters.total_for(Context::CpG))
-    }),
-    // CpG methylation rate = unconverted/total CpG = 1 - CpG conv rate, stated
-    // directly because it is the headline biological readout.
-    ("CpG_meth_rate", |r| {
-        let total = r.counters.total_for(Context::CpG);
-        if total == 0 {
-            String::new()
-        } else {
-            format!("{:.6}", r.counters.unconv_for(Context::CpG) as f64 / total as f64)
-        }
-    }),
-];
-
 /// One scope row (decision basis). `chimeric` is the genome-only control
 /// diagnostic (`None` for control scopes); `masks` is the run-level mask plan,
 /// repeated on every row.
-fn scope_row<'a>(
-    sample: &'a str,
-    scope: &'a ScopeStats,
+fn summary_row(
+    sample: &str,
+    scope: &ScopeStats,
     chimeric: Option<u64>,
     masks: MaskCols,
-) -> Row<'a> {
-    Row {
-        sample,
-        scope: &scope.name,
+) -> SummaryRow {
+    let c = &scope.counters;
+    let (cph_u, cph_t) = cph_counts(c);
+    let (cpg_u, cpg_t) = (c.unconv_for(Context::CpG), c.total_for(Context::CpG));
+    SummaryRow {
+        sample: sample.to_string(),
+        methylsieve_version: METHYLSIEVE_BUILD,
+        scope: scope.name.clone(),
+        r1_mask_5p: masks.r1_5p,
+        r2_mask_5p: masks.r2_5p,
+        se_mask_5p: masks.se_5p,
+        se_mask_3p: masks.se_3p,
         n_templates: scope.n_templates,
         n_mapped: scope.n_mapped,
         n_evaluated: scope.n_evaluated,
         n_unconverted: scope.n_unconverted,
-        chimeric_to_control: chimeric,
-        counters: scope.counters,
-        masks,
+        frac_unconverted: (scope.n_evaluated > 0)
+            .then(|| scope.n_unconverted as f64 / scope.n_evaluated as f64),
+        chimeric_to_control_templates: chimeric,
+        cpa_obs: c.total_for(Context::CpA),
+        cpa_conv_rate: conv_rate(c.unconv_for(Context::CpA), c.total_for(Context::CpA)),
+        cpc_obs: c.total_for(Context::CpC),
+        cpc_conv_rate: conv_rate(c.unconv_for(Context::CpC), c.total_for(Context::CpC)),
+        cpt_obs: c.total_for(Context::CpT),
+        cpt_conv_rate: conv_rate(c.unconv_for(Context::CpT), c.total_for(Context::CpT)),
+        cph_obs: cph_t,
+        cph_conv_rate: conv_rate(cph_u, cph_t),
+        cpg_obs: cpg_t,
+        cpg_conv_rate: conv_rate(cpg_u, cpg_t),
+        cpg_meth_rate: (cpg_t > 0).then(|| cpg_u as f64 / cpg_t as f64),
     }
 }
 
-/// Render the summary: a header row, then one decision-basis row per scope
-/// (genome first, then each control contig). The applied mask plan rides along
-/// as run-level columns on every row.
-fn write_summary(
-    w: &mut dyn Write,
-    stats: &Stats,
-    mask_plan: Option<&MaskPlan>,
-    sample: &str,
-) -> std::io::Result<()> {
-    let header: String = COLUMNS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join("\t");
-    writeln!(w, "{header}")?;
-
+/// Build the summary rows: the genome scope first, then each control contig.
+/// The applied mask plan rides along as run-level columns on every row.
+fn summary_rows(stats: &Stats, mask_plan: Option<&MaskPlan>, sample: &str) -> Vec<SummaryRow> {
     let masks = MaskCols::from_plan(mask_plan);
-    let render = |w: &mut dyn Write, row: &Row| -> std::io::Result<()> {
-        let line: String = COLUMNS.iter().map(|(_, f)| f(row)).collect::<Vec<_>>().join("\t");
-        writeln!(w, "{line}")
-    };
-
-    render(w, &scope_row(sample, &stats.genome, Some(stats.chimeric_to_control_templates), masks))?;
-    for control in &stats.controls {
-        render(w, &scope_row(sample, control, None, masks))?;
-    }
-    Ok(())
+    let mut rows =
+        vec![summary_row(sample, &stats.genome, Some(stats.chimeric_to_control_templates), masks)];
+    rows.extend(stats.controls.iter().map(|c| summary_row(sample, c, None, masks)));
+    rows
 }
 
 // ── conversion-matrix.tsv ─────────────────────────────────────────────────────
 
-fn write_matrix<F>(
-    w: &mut dyn Write,
-    stats: &Stats,
-    sample: &str,
-    classify: &F,
-) -> std::io::Result<()>
+/// One conversion-matrix cell: a `(checked, converted)` count of templates with
+/// the verdict the decision engine would assign that cell.
+#[derive(Serialize)]
+struct MatrixRow {
+    sample: String,
+    checked_sites: u64,
+    converted_sites: u64,
+    #[serde(serialize_with = "ser_opt_f64_6dp")]
+    conversion_rate: Option<f64>,
+    n_templates: u64,
+    decision: &'static str,
+    decided_by: &'static str,
+}
+
+fn matrix_rows<F>(stats: &Stats, sample: &str, classify: &F) -> Vec<MatrixRow>
 where
     F: Fn(u64, u64) -> (bool, DecidedBy),
 {
-    writeln!(
-        w,
-        "sample\tchecked_sites\tconverted_sites\tconversion_rate\tn_templates\tdecision\tdecided_by"
-    )?;
-    for (&(checked, unconv), &n_templates) in &stats.conversion_matrix {
-        let (unconverted, by) = classify(unconv, checked);
-        let converted = checked - unconv;
-        let conv_rate = if checked > 0 {
-            format!("{:.6}", converted as f64 / checked as f64)
-        } else {
-            String::new()
-        };
-        let decision = if unconverted { "unconverted" } else { "converted" };
-        writeln!(
-            w,
-            "{sample}\t{checked}\t{converted}\t{conv_rate}\t{n_templates}\t{decision}\t{}",
-            by.as_str()
-        )?;
-    }
-    Ok(())
+    stats
+        .conversion_matrix
+        .iter()
+        .map(|(&(checked, unconv), &n_templates)| {
+            let (unconverted, by) = classify(unconv, checked);
+            let converted = checked - unconv;
+            MatrixRow {
+                sample: sample.to_string(),
+                checked_sites: checked,
+                converted_sites: converted,
+                conversion_rate: (checked > 0).then(|| converted as f64 / checked as f64),
+                n_templates,
+                decision: if unconverted { "unconverted" } else { "converted" },
+                decided_by: by.as_str(),
+            }
+        })
+        .collect()
 }
 
 // ── mbias.tsv ─────────────────────────────────────────────────────────────────
+
+/// One per-read-cycle methylation point. `ci_lo`/`ci_hi` are a 95%
+/// Agresti–Coull interval on `frac_methylation`.
+#[derive(Serialize)]
+struct MbiasRow {
+    sample: String,
+    read: &'static str,
+    end: &'static str,
+    context: &'static str,
+    cycle: usize,
+    n_methylated: u64,
+    n_total: u64,
+    #[serde(serialize_with = "ser_f64_6dp")]
+    frac_methylation: f64,
+    #[serde(serialize_with = "ser_f64_6dp")]
+    ci_lo: f64,
+    #[serde(serialize_with = "ser_f64_6dp")]
+    ci_hi: f64,
+}
 
 /// Whether `(role, end)` is a curve we report: paired/orphan reads only have a
 /// meaningful 5' M-bias here (their 3' end is the mate's domain); single-end
@@ -294,13 +300,8 @@ fn reported(role: ReadRole, end: ReadEnd) -> bool {
     end == ReadEnd::FivePrime || role == ReadRole::Se
 }
 
-/// Per-read-cycle methylation curve: one row per `(read, end, context, cycle)`
-/// with coverage. `ci_lo`/`ci_hi` are a 95% Agresti–Coull interval.
-fn write_mbias(w: &mut dyn Write, mbias: &MbiasAccumulator, sample: &str) -> std::io::Result<()> {
-    writeln!(
-        w,
-        "sample\tread\tend\tcontext\tcycle\tn_methylated\tn_total\tfrac_methylation\tci_lo\tci_hi"
-    )?;
+fn mbias_rows(mbias: &MbiasAccumulator, sample: &str) -> Vec<MbiasRow> {
+    let mut rows = Vec::new();
     for &role in &ReadRole::ALL {
         for &end in &ReadEnd::ALL {
             if !reported(role, end) || !mbias.has_data(role, end) {
@@ -310,21 +311,23 @@ fn write_mbias(w: &mut dyn Write, mbias: &MbiasAccumulator, sample: &str) -> std
                 for (cycle, cc) in mbias.cycles(role, end, ctx).iter().enumerate() {
                     let Some(frac) = cc.frac() else { continue };
                     let (lo, hi) = agresti_coull(cc.meth(), cc.total());
-                    writeln!(
-                        w,
-                        "{sample}\t{}\t{}\t{}\t{}\t{}\t{}\t{frac:.6}\t{lo:.6}\t{hi:.6}",
-                        role.label(),
-                        end.label(),
-                        ctx.label(),
-                        cycle + 1,
-                        cc.meth(),
-                        cc.total(),
-                    )?;
+                    rows.push(MbiasRow {
+                        sample: sample.to_string(),
+                        read: role.label(),
+                        end: end.label(),
+                        context: ctx.label(),
+                        cycle: cycle + 1,
+                        n_methylated: cc.meth(),
+                        n_total: cc.total(),
+                        frac_methylation: frac,
+                        ci_lo: lo,
+                        ci_hi: hi,
+                    });
                 }
             }
         }
     }
-    Ok(())
+    rows
 }
 
 /// 95% Agresti–Coull confidence interval for a binomial fraction `x/n`.
@@ -393,15 +396,17 @@ mod tests {
         s
     }
 
-    fn render_summary(stats: &Stats, mask_plan: Option<&MaskPlan>) -> String {
-        let mut buf = Vec::new();
-        write_summary(&mut buf, stats, mask_plan, "S1").unwrap();
-        String::from_utf8(buf).unwrap()
+    /// Serialize rows through the real TSV writer and return the file text, so
+    /// tests assert on actual headers, ordering, and number formatting.
+    fn render<T: Serialize>(rows: &[T]) -> String {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        DelimFile::default().write_tsv(tmp.path(), rows.iter()).unwrap();
+        std::fs::read_to_string(tmp.path()).unwrap()
     }
 
-    /// Column index of a header name in the summary schema.
-    fn col(name: &str) -> usize {
-        COLUMNS.iter().position(|(n, _)| *n == name).unwrap_or_else(|| panic!("no column {name}"))
+    /// Column index of a header name in a rendered TSV's header line.
+    fn col(header: &str, name: &str) -> usize {
+        header.split('\t').position(|c| c == name).unwrap_or_else(|| panic!("no column {name}"))
     }
 
     #[test]
@@ -409,22 +414,21 @@ mod tests {
         let mut counters = PerContextCounters::default();
         counters.add_counts(Context::CpA, 1, 1000); // conv rate 0.999
         let stats = genome_with(counters, 100, 3);
-        let text = render_summary(&stats, None);
+        let text = render(&summary_rows(&stats, None, "S1"));
         let mut lines = text.lines();
-        let hdr: Vec<&str> = lines.next().unwrap().split('\t').collect();
+        let hdr = lines.next().unwrap();
         // The per-read fold is gone — no `read` column, one row per scope.
-        assert!(!hdr.contains(&"read"), "read column removed");
+        assert!(!hdr.split('\t').any(|c| c == "read"), "read column removed");
         let row: Vec<&str> = lines.next().unwrap().split('\t').collect();
-        assert_eq!(hdr.len(), row.len());
-        assert_eq!(row[col("scope")], "genome");
-        assert_eq!(row[col("n_templates")], "100");
-        assert_eq!(row[col("n_unconverted")], "3");
-        assert_eq!(row[col("frac_unconverted")], "0.030000");
-        assert_eq!(row[col("CpA_obs")], "1000");
-        assert_eq!(row[col("CpA_conv_rate")], "0.999000");
+        assert_eq!(row[col(hdr, "scope")], "genome");
+        assert_eq!(row[col(hdr, "n_templates")], "100");
+        assert_eq!(row[col(hdr, "n_unconverted")], "3");
+        assert_eq!(row[col(hdr, "frac_unconverted")], "0.030000");
+        assert_eq!(row[col(hdr, "CpA_obs")], "1000");
+        assert_eq!(row[col(hdr, "CpA_conv_rate")], "0.999000");
         // No mask plan → all four mask columns blank.
-        assert_eq!(row[col("r1_mask_5p")], "");
-        assert_eq!(row[col("se_mask_3p")], "");
+        assert_eq!(row[col(hdr, "r1_mask_5p")], "");
+        assert_eq!(row[col(hdr, "se_mask_3p")], "");
         // Header + the single genome row only (no controls configured).
         assert_eq!(text.lines().count(), 2);
     }
@@ -434,14 +438,15 @@ mod tests {
         let mut stats = Stats::new(&["chrCtrl".to_string()]);
         stats.genome.n_templates = 10;
         let plan = MaskPlan::explicit(2, 22, 2);
-        let text = render_summary(&stats, Some(&plan));
+        let text = render(&summary_rows(&stats, Some(&plan), "S1"));
+        let hdr = text.lines().next().unwrap().to_string();
         for row in text.lines().skip(1) {
             let cols: Vec<&str> = row.split('\t').collect();
-            assert_eq!(cols[col("r1_mask_5p")], "2");
-            assert_eq!(cols[col("r2_mask_5p")], "22");
+            assert_eq!(cols[col(&hdr, "r1_mask_5p")], "2");
+            assert_eq!(cols[col(&hdr, "r2_mask_5p")], "22");
             // SE lengths default to 0 in an explicit (paired) plan.
-            assert_eq!(cols[col("se_mask_5p")], "0");
-            assert_eq!(cols[col("se_mask_3p")], "0");
+            assert_eq!(cols[col(&hdr, "se_mask_5p")], "0");
+            assert_eq!(cols[col(&hdr, "se_mask_3p")], "0");
         }
         // Header + genome + one control row.
         assert_eq!(text.lines().count(), 3);
@@ -453,14 +458,13 @@ mod tests {
         for i in 0..100u64 {
             mbias.record(ReadRole::R2, ReadEnd::FivePrime, Context::CpG, 0, i < 30);
         }
-        let mut buf = Vec::new();
-        write_mbias(&mut buf, &mbias, "S1").unwrap();
-        let text = String::from_utf8(buf).unwrap();
+        let text = render(&mbias_rows(&mbias, "S1"));
+        let hdr = text.lines().next().unwrap();
         let row = text.lines().find(|l| l.contains("\tR2\t5p\tCpG\t1\t")).unwrap();
         let cols: Vec<&str> = row.split('\t').collect();
-        assert_eq!(cols[5], "30");
-        assert_eq!(cols[6], "100");
-        assert_eq!(cols[7], "0.300000");
+        assert_eq!(cols[col(hdr, "n_methylated")], "30");
+        assert_eq!(cols[col(hdr, "n_total")], "100");
+        assert_eq!(cols[col(hdr, "frac_methylation")], "0.300000");
     }
 
     #[test]
@@ -478,10 +482,12 @@ mod tests {
                 (unconv >= 3, DecidedBy::Count)
             }
         };
-        let mut buf = Vec::new();
-        write_matrix(&mut buf, &stats, "S1", &classify).unwrap();
-        let lines: Vec<String> =
-            String::from_utf8(buf).unwrap().lines().map(str::to_string).collect();
+        let text = render(&matrix_rows(&stats, "S1", &classify));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            "sample\tchecked_sites\tconverted_sites\tconversion_rate\tn_templates\tdecision\tdecided_by"
+        );
         // converted_sites = checked - unconverted; conversion_rate = converted/checked.
         assert_eq!(lines[1], "S1\t0\t0\t\t5\tconverted\ttoo_few_sites");
         assert_eq!(lines[2], "S1\t10\t7\t0.700000\t7\tunconverted\tcount");

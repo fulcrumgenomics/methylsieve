@@ -24,6 +24,9 @@ anyhow = "1"
 bgzf = "0.3.0"
 clap = { version = "4", features = ["derive", "wrap_help"] }
 env_logger = "0.11"
+# Serde-struct TSV reading/writing for the --metrics-prefix output (matches the
+# pattern used in riker): one row struct per file, headers/fields from serde.
+fgoxide = "0.6"
 fgumi-raw-bam = "0.2.0"
 # Plotting for --metrics-prefix output (M-bias curves, conversion-matrix hexbin).
 # The `pdf` feature pulls resvg/svg2pdf to render PDF.
@@ -37,6 +40,7 @@ noodles-core = "0.20"
 noodles-fasta = "0.62"
 noodles-sam = "0.85"
 ringbuf = "0.5"
+serde = { version = "1", features = ["derive"] }
 wide = "1.4"
 
 [dev-dependencies]
