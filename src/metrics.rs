@@ -2,15 +2,15 @@
 //!
 //! - `PREFIX.summary.tsv` — per-context conversion summary, **folded** over a
 //!   `read` dimension: one `all` row per scope (genome first, then each
-//!   `--control-contig`) carrying the per-template decision counts and run
-//!   diagnostics, followed by `R1`/`R2`/`SE` rows (genome only) with per-read
-//!   conversion broken out. The `all` row is decision-basis (overlap-deduped,
-//!   end-trimmed, includes supplementary evidence); the per-read rows are
-//!   M-bias-basis (every primary call, base-quality-gated, no dedup), so they
-//!   intentionally need not sum to `all`.
-//! - `PREFIX.conversion_matrix.tsv` — per-`(checked, unconverted)` decision cell.
+//!   `--control-contig`) carrying the per-template decision counts, followed by
+//!   `R1`/`R2`/`SE` rows (genome only) with per-read conversion broken out. The
+//!   `all` row is decision-basis (overlap-deduped, end-trimmed, includes
+//!   supplementary evidence); the per-read rows are M-bias-basis (every primary
+//!   call, base-quality-gated, no dedup), so they intentionally need not sum to
+//!   `all`. The per-read rows also carry the applied 5'/3' mask lengths (blank
+//!   when masking was not run).
+//! - `PREFIX.conversion-matrix.tsv` — per-`(checked, converted)` decision cell.
 //! - `PREFIX.mbias.tsv` — per-read-cycle methylation by `(read, end, context)`.
-//! - `PREFIX.mbias_bounds.tsv` — suggested 5'/3' mask lengths + plateau per read.
 //!
 //! All rates are fractions in `[0, 1]` (never percentages).
 
@@ -23,7 +23,8 @@ use noodles_sam::Header;
 use noodles_sam::header::record::value::map::read_group::tag as rg_tag;
 
 use crate::METHYLSIEVE_BUILD;
-use crate::mbias::{DetectParams, MbiasAccumulator, ReadEnd, ReadRole, detect_mask_length};
+use crate::mask::MaskPlan;
+use crate::mbias::{MbiasAccumulator, ReadEnd, ReadRole};
 use crate::reference::Context;
 use crate::sieve::{DecidedBy, PerContextCounters, ScopeStats, Stats};
 
@@ -38,27 +39,28 @@ fn with_suffix(prefix: &Path, suffix: &str) -> PathBuf {
 /// Write every metric file under `prefix`. `mbias` holds the per-cycle counts
 /// accumulated during the run; `classify(unconv, monitored)` replays the
 /// per-cell decision verdict for the conversion matrix.
+#[allow(clippy::too_many_arguments)] // a single wiring call site; a params struct would not aid clarity
 pub(crate) fn write_all<F>(
     prefix: &Path,
     stats: &Stats,
     mbias: &MbiasAccumulator,
-    detect: DetectParams,
+    mask_plan: Option<&MaskPlan>,
     header: &Header,
     sample_override: Option<&str>,
+    input_path: Option<&Path>,
     classify: F,
 ) -> Result<()>
 where
     F: Fn(u64, u64) -> (bool, DecidedBy),
 {
-    let sample = resolve_sample(header, sample_override);
-    write_file(&with_suffix(prefix, "summary.tsv"), |w| write_summary(w, stats, mbias, &sample))?;
-    write_file(&with_suffix(prefix, "conversion_matrix.tsv"), |w| {
+    let sample = resolve_sample(header, sample_override, input_path);
+    write_file(&with_suffix(prefix, "summary.tsv"), |w| {
+        write_summary(w, stats, mbias, mask_plan, &sample)
+    })?;
+    write_file(&with_suffix(prefix, "conversion-matrix.tsv"), |w| {
         write_matrix(w, stats, &sample, &classify)
     })?;
     write_file(&with_suffix(prefix, "mbias.tsv"), |w| write_mbias(w, mbias, &sample))?;
-    write_file(&with_suffix(prefix, "mbias_bounds.tsv"), |w| {
-        write_mbias_bounds(w, mbias, detect, &sample)
-    })?;
     Ok(())
 }
 
@@ -75,27 +77,25 @@ where
 
 // ── summary.tsv ───────────────────────────────────────────────────────────────
 
-/// Whole-run diagnostic counters, rendered only on the genome `all` row.
-#[derive(Debug, Clone, Copy)]
-struct Diagnostics {
-    chimeric_to_control_templates: u64,
-    unmapped_templates: u64,
-    zero_site_templates: u64,
-    below_min_sites_templates: u64,
-}
-
-/// One summary row. Decision-level counts are `None` for per-read rows (those
-/// quantities are per-template, not per-read).
+/// One summary row. Template-level counts are `None` where they don't apply
+/// (e.g. `n_unconverted` on a per-read row — the decision is per-template);
+/// `n_templates`/`n_mapped`/`n_evaluated` are populated on every row.
 struct Row<'a> {
     sample: &'a str,
     scope: &'a str,
     read: &'a str,
-    n_templates: Option<u64>,
-    n_evaluated: Option<u64>,
+    n_templates: u64,
+    n_mapped: u64,
+    n_evaluated: u64,
+    /// Template decision counts — only the `all` rows (per-template, not per-read).
     n_unconverted: Option<u64>,
-    n_removed: Option<u64>,
+    /// Chimeric-to-control count — only the genome `all` row (control diagnostic).
+    chimeric_to_control: Option<u64>,
     counters: PerContextCounters,
-    diagnostics: Option<Diagnostics>,
+    /// Applied 5'/3' mask lengths (sequencing cycles) — only per-read rows when
+    /// masking was run.
+    mask_5p: Option<usize>,
+    mask_3p: Option<usize>,
 }
 
 type ColumnFn = fn(&Row) -> String;
@@ -105,14 +105,21 @@ fn opt(v: Option<u64>) -> String {
     v.map(|n| n.to_string()).unwrap_or_default()
 }
 
-/// `1 - unconv/total` for `ctx`, blank when no sites.
-fn conv_rate(c: &PerContextCounters, ctx: Context) -> String {
-    let total = c.total_for(ctx);
-    if total == 0 {
-        String::new()
-    } else {
-        format!("{:.6}", 1.0 - c.unconv_for(ctx) as f64 / total as f64)
-    }
+/// Optional `usize` → string, blank when `None`.
+fn opt_usize(v: Option<usize>) -> String {
+    v.map(|n| n.to_string()).unwrap_or_default()
+}
+
+/// Conversion rate `1 - unconv/total` from explicit counts, blank when no sites.
+fn conv_rate(unconv: u64, total: u64) -> String {
+    if total == 0 { String::new() } else { format!("{:.6}", 1.0 - unconv as f64 / total as f64) }
+}
+
+/// Combined CpH `(unconv, total)` across CpA/CpC/CpT.
+fn cph_counts(c: &PerContextCounters) -> (u64, u64) {
+    [Context::CpA, Context::CpC, Context::CpT]
+        .iter()
+        .fold((0, 0), |(u, t), &ctx| (u + c.unconv_for(ctx), t + c.total_for(ctx)))
 }
 
 const COLUMNS: &[(&str, ColumnFn)] = &[
@@ -120,50 +127,65 @@ const COLUMNS: &[(&str, ColumnFn)] = &[
     ("methylsieve_version", |_| METHYLSIEVE_BUILD.to_string()),
     ("scope", |r| r.scope.to_string()),
     ("read", |r| r.read.to_string()),
-    ("n_templates", |r| opt(r.n_templates)),
-    ("n_evaluated", |r| opt(r.n_evaluated)),
+    ("mask_5p", |r| opt_usize(r.mask_5p)),
+    ("mask_3p", |r| opt_usize(r.mask_3p)),
+    ("n_templates", |r| r.n_templates.to_string()),
+    ("n_mapped", |r| r.n_mapped.to_string()),
+    ("n_evaluated", |r| r.n_evaluated.to_string()),
     ("n_unconverted", |r| opt(r.n_unconverted)),
-    ("n_removed", |r| opt(r.n_removed)),
-    ("frac_unconverted", |r| match (r.n_unconverted, r.n_evaluated) {
-        (Some(u), Some(e)) if e > 0 => format!("{:.6}", u as f64 / e as f64),
+    ("frac_unconverted", |r| match r.n_unconverted {
+        Some(u) if r.n_evaluated > 0 => format!("{:.6}", u as f64 / r.n_evaluated as f64),
         _ => String::new(),
     }),
-    ("CA_unconv", |r| r.counters.unconv_for(Context::CpA).to_string()),
-    ("CA_total", |r| r.counters.total_for(Context::CpA).to_string()),
-    ("CC_unconv", |r| r.counters.unconv_for(Context::CpC).to_string()),
-    ("CC_total", |r| r.counters.total_for(Context::CpC).to_string()),
-    ("CT_unconv", |r| r.counters.unconv_for(Context::CpT).to_string()),
-    ("CT_total", |r| r.counters.total_for(Context::CpT).to_string()),
-    ("CG_unconv", |r| r.counters.unconv_for(Context::CpG).to_string()),
-    ("CG_total", |r| r.counters.total_for(Context::CpG).to_string()),
-    ("conv_rate_CpA", |r| conv_rate(&r.counters, Context::CpA)),
-    ("conv_rate_CpC", |r| conv_rate(&r.counters, Context::CpC)),
-    ("conv_rate_CpT", |r| conv_rate(&r.counters, Context::CpT)),
-    ("conv_rate_CpG", |r| conv_rate(&r.counters, Context::CpG)),
-    ("chimeric_to_control_templates", |r| {
-        opt(r.diagnostics.map(|d| d.chimeric_to_control_templates))
+    ("chimeric_to_control_templates", |r| opt(r.chimeric_to_control)),
+    ("CpA_obs", |r| r.counters.total_for(Context::CpA).to_string()),
+    ("CpA_conv_rate", |r| {
+        conv_rate(r.counters.unconv_for(Context::CpA), r.counters.total_for(Context::CpA))
     }),
-    ("unmapped_templates", |r| opt(r.diagnostics.map(|d| d.unmapped_templates))),
-    ("zero_site_templates", |r| opt(r.diagnostics.map(|d| d.zero_site_templates))),
-    ("below_min_sites_templates", |r| opt(r.diagnostics.map(|d| d.below_min_sites_templates))),
+    ("CpC_obs", |r| r.counters.total_for(Context::CpC).to_string()),
+    ("CpC_conv_rate", |r| {
+        conv_rate(r.counters.unconv_for(Context::CpC), r.counters.total_for(Context::CpC))
+    }),
+    ("CpT_obs", |r| r.counters.total_for(Context::CpT).to_string()),
+    ("CpT_conv_rate", |r| {
+        conv_rate(r.counters.unconv_for(Context::CpT), r.counters.total_for(Context::CpT))
+    }),
+    ("CpH_obs", |r| cph_counts(&r.counters).1.to_string()),
+    ("CpH_conv_rate", |r| {
+        let (u, t) = cph_counts(&r.counters);
+        conv_rate(u, t)
+    }),
+    ("CpG_obs", |r| r.counters.total_for(Context::CpG).to_string()),
+    ("CpG_conv_rate", |r| {
+        conv_rate(r.counters.unconv_for(Context::CpG), r.counters.total_for(Context::CpG))
+    }),
+    // CpG methylation rate = unconverted/total CpG = 1 - CpG conv rate, stated
+    // directly because it is the headline biological readout.
+    ("CpG_meth_rate", |r| {
+        let total = r.counters.total_for(Context::CpG);
+        if total == 0 {
+            String::new()
+        } else {
+            format!("{:.6}", r.counters.unconv_for(Context::CpG) as f64 / total as f64)
+        }
+    }),
 ];
 
-/// The `all` row for a scope (decision basis).
-fn all_row<'a>(
-    sample: &'a str,
-    scope: &'a ScopeStats,
-    diagnostics: Option<Diagnostics>,
-) -> Row<'a> {
+/// The `all` row for a scope (decision basis). `chimeric` is the genome-only
+/// control diagnostic (`None` for control scopes).
+fn all_row<'a>(sample: &'a str, scope: &'a ScopeStats, chimeric: Option<u64>) -> Row<'a> {
     Row {
         sample,
         scope: &scope.name,
         read: "all",
-        n_templates: Some(scope.n_templates),
-        n_evaluated: Some(scope.n_evaluated),
+        n_templates: scope.n_templates,
+        n_mapped: scope.n_mapped,
+        n_evaluated: scope.n_evaluated,
         n_unconverted: Some(scope.n_unconverted),
-        n_removed: Some(scope.n_removed),
+        chimeric_to_control: chimeric,
         counters: scope.counters,
-        diagnostics,
+        mask_5p: None,
+        mask_3p: None,
     }
 }
 
@@ -182,21 +204,28 @@ fn role_counters(mbias: &MbiasAccumulator, role: ReadRole) -> PerContextCounters
     c
 }
 
+/// Applied 5'/3' mask lengths for a role, from the frozen plan (`None` when
+/// masking was not run). Paired reads have no learned 3' mask (their 3' is the
+/// mate's domain), so `mask_3p` is reported for single-end reads only.
+fn role_mask(plan: Option<&MaskPlan>, role: ReadRole) -> (Option<usize>, Option<usize>) {
+    match plan {
+        None => (None, None),
+        Some(p) => match role {
+            ReadRole::R1 | ReadRole::R2 => (Some(p.role_5p(role)), None),
+            ReadRole::Se => (Some(p.role_5p(ReadRole::Se)), Some(p.k_se_3p())),
+        },
+    }
+}
+
 /// Render the folded summary: a header row, then per scope an `all` row; the
 /// genome scope additionally gets `R1`/`R2`/`SE` rows from the M-bias counts.
 fn write_summary(
     w: &mut dyn Write,
     stats: &Stats,
     mbias: &MbiasAccumulator,
+    mask_plan: Option<&MaskPlan>,
     sample: &str,
 ) -> std::io::Result<()> {
-    let diagnostics = Diagnostics {
-        chimeric_to_control_templates: stats.chimeric_to_control_templates,
-        unmapped_templates: stats.unmapped_templates,
-        zero_site_templates: stats.zero_site_templates,
-        below_min_sites_templates: stats.below_min_sites_templates,
-    };
-
     let header: String = COLUMNS.iter().map(|(n, _)| *n).collect::<Vec<_>>().join("\t");
     writeln!(w, "{header}")?;
 
@@ -205,22 +234,28 @@ fn write_summary(
         writeln!(w, "{line}")
     };
 
-    render(w, &all_row(sample, &stats.genome, Some(diagnostics)))?;
-    // Per-read rows (genome only): M-bias basis. Emitted when the role has data.
+    render(w, &all_row(sample, &stats.genome, Some(stats.chimeric_to_control_templates)))?;
+    // Per-read rows (genome only): M-bias-basis counters, but template
+    // denominators (`n_*`) and mask lengths from the decision-side per-role
+    // counts. Emitted when the role has data.
     for &role in &ReadRole::ALL {
         if mbias.has_data(role, ReadEnd::FivePrime) {
+            let i = role.index();
+            let (mask_5p, mask_3p) = role_mask(mask_plan, role);
             render(
                 w,
                 &Row {
                     sample,
                     scope: &stats.genome.name,
                     read: role.label(),
-                    n_templates: None,
-                    n_evaluated: None,
+                    n_templates: stats.genome.n_templates,
+                    n_mapped: stats.genome.mapped_by_role[i],
+                    n_evaluated: stats.genome.evaluated_by_role[i],
                     n_unconverted: None,
-                    n_removed: None,
+                    chimeric_to_control: None,
                     counters: role_counters(mbias, role),
-                    diagnostics: None,
+                    mask_5p,
+                    mask_3p,
                 },
             )?;
         }
@@ -231,7 +266,7 @@ fn write_summary(
     Ok(())
 }
 
-// ── conversion_matrix.tsv ─────────────────────────────────────────────────────
+// ── conversion-matrix.tsv ─────────────────────────────────────────────────────
 
 fn write_matrix<F>(
     w: &mut dyn Write,
@@ -244,26 +279,27 @@ where
 {
     writeln!(
         w,
-        "sample\tchecked_sites\tunconverted_sites\tconversion_rate\tn_templates\tdecision\tdecided_by"
+        "sample\tchecked_sites\tconverted_sites\tconversion_rate\tn_templates\tdecision\tdecided_by"
     )?;
     for (&(checked, unconv), &n_templates) in &stats.conversion_matrix {
         let (unconverted, by) = classify(unconv, checked);
+        let converted = checked - unconv;
         let conv_rate = if checked > 0 {
-            format!("{:.6}", 1.0 - unconv as f64 / checked as f64)
+            format!("{:.6}", converted as f64 / checked as f64)
         } else {
             String::new()
         };
         let decision = if unconverted { "unconverted" } else { "converted" };
         writeln!(
             w,
-            "{sample}\t{checked}\t{unconv}\t{conv_rate}\t{n_templates}\t{decision}\t{}",
+            "{sample}\t{checked}\t{converted}\t{conv_rate}\t{n_templates}\t{decision}\t{}",
             by.as_str()
         )?;
     }
     Ok(())
 }
 
-// ── mbias.tsv / mbias_bounds.tsv ──────────────────────────────────────────────
+// ── mbias.tsv ─────────────────────────────────────────────────────────────────
 
 /// Whether `(role, end)` is a curve we report: paired/orphan reads only have a
 /// meaningful 5' M-bias here (their 3' end is the mate's domain); single-end
@@ -305,32 +341,6 @@ fn write_mbias(w: &mut dyn Write, mbias: &MbiasAccumulator, sample: &str) -> std
     Ok(())
 }
 
-/// Suggested mask lengths (from the CpG curve) per read/end.
-fn write_mbias_bounds(
-    w: &mut dyn Write,
-    mbias: &MbiasAccumulator,
-    detect: DetectParams,
-    sample: &str,
-) -> std::io::Result<()> {
-    writeln!(w, "sample\tread\tend\tsuggested_mask\tplateau_fraction")?;
-    for &role in &ReadRole::ALL {
-        for &end in &ReadEnd::ALL {
-            if !reported(role, end) || !mbias.has_data(role, end) {
-                continue;
-            }
-            let k = detect_mask_length(mbias, role, end, detect);
-            writeln!(
-                w,
-                "{sample}\t{}\t{}\t{k}\t{:.3}",
-                role.label(),
-                end.label(),
-                detect.plateau_fraction,
-            )?;
-        }
-    }
-    Ok(())
-}
-
 /// 95% Agresti–Coull confidence interval for a binomial fraction `x/n`.
 fn agresti_coull(x: u64, n: u64) -> (f64, f64) {
     if n == 0 {
@@ -345,8 +355,14 @@ fn agresti_coull(x: u64, n: u64) -> (f64, f64) {
 
 // ── sample resolution ─────────────────────────────────────────────────────────
 
-/// Resolve `sample`: explicit override wins, else comma-join unique `@RG SM:`.
-fn resolve_sample(header: &Header, sample_override: Option<&str>) -> String {
+/// Resolve the `sample` value, in precedence order: explicit `--sample` →
+/// comma-joined unique `@RG SM:` → the input file's stem (only when reading a
+/// regular file, not stdin/a pipe) → `"unknown"`.
+fn resolve_sample(
+    header: &Header,
+    sample_override: Option<&str>,
+    input_path: Option<&Path>,
+) -> String {
     if let Some(s) = sample_override {
         return s.to_string();
     }
@@ -359,7 +375,20 @@ fn resolve_sample(header: &Header, sample_override: Option<&str>) -> String {
             }
         }
     }
-    samples.into_iter().collect::<Vec<_>>().join(",")
+    if !samples.is_empty() {
+        return samples.into_iter().collect::<Vec<_>>().join(",");
+    }
+    // Fall back to the input file stem, but only for a real regular file —
+    // stdin/pipes/devices have no meaningful name.
+    if let Some(stem) = input_path
+        .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))
+        .and_then(Path::file_stem)
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+    {
+        return stem.to_string();
+    }
+    "unknown".to_string()
 }
 
 #[cfg(test)]
@@ -379,7 +408,7 @@ mod tests {
 
     fn render_summary(stats: &Stats, mbias: &MbiasAccumulator) -> String {
         let mut buf = Vec::new();
-        write_summary(&mut buf, stats, mbias, "S1").unwrap();
+        write_summary(&mut buf, stats, mbias, None, "S1").unwrap();
         String::from_utf8(buf).unwrap()
     }
 
@@ -397,11 +426,18 @@ mod tests {
         assert_eq!(row[3], "all");
     }
 
+    /// Column index of a header name in the summary schema.
+    fn col(name: &str) -> usize {
+        COLUMNS.iter().position(|(n, _)| *n == name).unwrap_or_else(|| panic!("no column {name}"))
+    }
+
     #[test]
     fn per_read_rows_come_from_mbias() {
         let mut counters = PerContextCounters::default();
         counters.add_counts(Context::CpA, 1, 1000); // 1 unconverted of 1000
-        let stats = genome_with(counters, 100, 1);
+        let mut stats = genome_with(counters, 100, 1);
+        stats.genome.mapped_by_role[ReadRole::R1.index()] = 80;
+        stats.genome.evaluated_by_role[ReadRole::R1.index()] = 70;
         let mut mbias = MbiasAccumulator::new();
         // R1: 2 unconverted of 10 CpA at cycle 0 → conv rate 0.8.
         for i in 0..10 {
@@ -410,10 +446,13 @@ mod tests {
         let text = render_summary(&stats, &mbias);
         let r1 = text.lines().find(|l| l.contains("\tR1\t")).expect("R1 row present");
         let cols: Vec<&str> = r1.split('\t').collect();
-        assert_eq!(cols[9], "2", "CA_unconv");
-        assert_eq!(cols[10], "10", "CA_total");
-        assert_eq!(cols[4], "", "n_templates blank on per-read row");
-        assert_eq!(cols[17], "0.800000", "conv_rate_CpA");
+        assert_eq!(cols[col("CpA_obs")], "10");
+        assert_eq!(cols[col("CpA_conv_rate")], "0.800000");
+        assert_eq!(cols[col("n_templates")], "100", "n_templates filled down");
+        assert_eq!(cols[col("n_mapped")], "80", "per-role mapped count");
+        assert_eq!(cols[col("n_evaluated")], "70", "per-role evaluated count");
+        assert_eq!(cols[col("n_unconverted")], "", "n_unconverted blank on per-read row");
+        assert_eq!(cols[col("mask_5p")], "", "no mask plan → blank");
     }
 
     #[test]
@@ -448,7 +487,7 @@ mod tests {
         stats.conversion_matrix.insert((10, 3), 7);
         let classify = |unconv: u64, checked: u64| -> (bool, DecidedBy) {
             if checked == 0 {
-                (false, DecidedBy::ZeroSites)
+                (false, DecidedBy::TooFewSites)
             } else if checked >= 40 {
                 (unconv as f64 / checked as f64 > 0.05, DecidedBy::Proportion)
             } else {
@@ -459,8 +498,9 @@ mod tests {
         write_matrix(&mut buf, &stats, "S1", &classify).unwrap();
         let lines: Vec<String> =
             String::from_utf8(buf).unwrap().lines().map(str::to_string).collect();
-        assert_eq!(lines[1], "S1\t0\t0\t\t5\tconverted\tzero_sites");
-        assert_eq!(lines[2], "S1\t10\t3\t0.700000\t7\tunconverted\tcount");
-        assert_eq!(lines[3], "S1\t50\t5\t0.900000\t2\tunconverted\tproportion");
+        // converted_sites = checked - unconverted; conversion_rate = converted/checked.
+        assert_eq!(lines[1], "S1\t0\t0\t\t5\tconverted\ttoo_few_sites");
+        assert_eq!(lines[2], "S1\t10\t7\t0.700000\t7\tunconverted\tcount");
+        assert_eq!(lines[3], "S1\t50\t45\t0.900000\t2\tunconverted\tproportion");
     }
 }

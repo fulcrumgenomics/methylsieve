@@ -25,17 +25,19 @@ fn per_context_counts_and_conv_rates() {
 
     let g = genome_stats(&env.stats);
     assert_eq!(g["sample"], "sampleX", "sample resolved from @RG SM:");
-    assert_eq!(g["CA_total"], "3");
-    assert_eq!(g["CA_unconv"], "3");
-    assert_eq!(g["CG_total"], "2");
-    assert_eq!(g["CG_unconv"], "2");
-    // Fully unconverted → conversion rate 0 for contexts with sites.
-    assert_eq!(g["conv_rate_CpA"], "0.000000");
-    assert_eq!(g["conv_rate_CpG"], "0.000000");
+    assert_eq!(g["CpA_obs"], "3");
+    assert_eq!(ctx_unconv(&g, "CpA"), 3);
+    assert_eq!(g["CpG_obs"], "2");
+    assert_eq!(ctx_unconv(&g, "CpG"), 2);
+    // Fully unconverted → conversion rate 0 for contexts with sites, and CpG
+    // methylation rate 1.
+    assert_eq!(g["CpA_conv_rate"], "0.000000");
+    assert_eq!(g["CpG_conv_rate"], "0.000000");
+    assert_eq!(g["CpG_meth_rate"], "1.000000");
     // No CpC or CpT sites → empty conversion-rate cells.
-    assert_eq!(g["CC_total"], "0");
-    assert_eq!(g["conv_rate_CpC"], "");
-    assert_eq!(g["conv_rate_CpT"], "");
+    assert_eq!(g["CpC_obs"], "0");
+    assert_eq!(g["CpC_conv_rate"], "");
+    assert_eq!(g["CpT_conv_rate"], "");
 }
 
 #[test]
@@ -67,8 +69,13 @@ fn metrics_prefix_writes_all_files() {
         run_methylsieve(&sam, &reference, &env, &["--metrics-prefix", &env.metrics_prefix_arg()]);
     assert!(r.status_ok, "stderr: {}", r.stderr);
     let pfx = env.metrics_prefix.to_str().unwrap();
-    for suffix in ["summary.tsv", "mbias.tsv", "mbias_bounds.tsv", "conversion_matrix.tsv"] {
+    for suffix in ["summary.tsv", "mbias.tsv", "conversion-matrix.tsv"] {
         let p = std::path::PathBuf::from(format!("{pfx}.{suffix}"));
         assert!(p.exists(), "expected metrics file {}", p.display());
     }
+    // The separate mbias-bounds file was folded into the summary.
+    assert!(
+        !std::path::PathBuf::from(format!("{pfx}.mbias_bounds.tsv")).exists(),
+        "mbias_bounds.tsv should no longer be written"
+    );
 }

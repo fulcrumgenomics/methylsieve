@@ -36,7 +36,7 @@ pub(crate) enum ReadRole {
 impl ReadRole {
     /// Dense index 0..3 for array storage.
     #[inline]
-    fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         match self {
             ReadRole::R1 => 0,
             ReadRole::R2 => 1,

@@ -379,16 +379,17 @@ pub struct Args {
     pub(crate) mbias_mask_quality: u8,
 
     /// Write metric TSVs under this path prefix: `PREFIX.summary.tsv` (per-context
-    /// conversion, folded over read 1 / read 2 / single-end), `PREFIX.mbias.tsv`
-    /// (per-read-cycle methylation), `PREFIX.mbias_bounds.tsv` (suggested 5'/3'
-    /// mask lengths), and `PREFIX.conversion_matrix.tsv` (the per-template
-    /// decision histogram). Computing these is a single streaming pass; the
-    /// output BAM is unchanged.
+    /// conversion, folded over read 1 / read 2 / single-end, with applied 5'/3'
+    /// mask lengths on the per-read rows), `PREFIX.mbias.tsv` (per-read-cycle
+    /// methylation), and `PREFIX.conversion-matrix.tsv` (the per-template decision
+    /// histogram). Computing these is a single streaming pass; the output BAM is
+    /// unchanged.
     #[arg(long = "metrics-prefix", help_heading = "Stats & misc")]
     pub(crate) metrics_prefix: Option<PathBuf>,
 
-    /// Sample name for the `sample` column of the metric TSVs. If omitted, the
-    /// unique `@RG SM:` values from the header are comma-joined.
+    /// Sample name for the `sample` column of the metric TSVs. If omitted: the
+    /// unique `@RG SM:` values from the header, else the input file stem, else
+    /// `unknown`.
     #[arg(long = "sample", help_heading = "Stats & misc")]
     pub(crate) sample: Option<String>,
 
@@ -681,7 +682,10 @@ fn run(args: Args) -> Result<()> {
     // methylsieve requires query-grouped input: records are read in maximal
     // runs sharing a QNAME ("blocks") and each block is processed as a unit.
     let mut pool: Vec<RawRecord> = Vec::with_capacity(8);
-    if args.mbias_mask {
+    // The mask plan actually applied to the data (frozen from the learn-phase
+    // subset). `None` when masking is off — the summary then reports no mask
+    // lengths rather than a misleading full-file recomputation.
+    let applied_plan = if args.mbias_mask {
         run_masking(
             &mut reader,
             &mut pool,
@@ -696,7 +700,7 @@ fn run(args: Args) -> Result<()> {
                 want_metrics: args.metrics_prefix.is_some(),
                 quiet: args.quiet,
             },
-        )?;
+        )?
     } else {
         for_each_block(&mut reader, &mut pool, |block| {
             if processor.process_block(block, &mut stats, mbias_acc.as_mut())? == Disposition::Keep
@@ -706,7 +710,8 @@ fn run(args: Args) -> Result<()> {
             Ok(())
         })
         .context("processing record block")?;
-    }
+        None
+    };
 
     print_run_stats(&stats, &args);
     warn_proportion_blind_spot(&stats, &args);
@@ -717,9 +722,10 @@ fn run(args: Args) -> Result<()> {
             prefix,
             &stats,
             mbias,
-            detect,
+            applied_plan.as_ref(),
             &header,
             args.sample.as_deref(),
+            args.input.as_deref(),
             |unconv, monitored| processor.classify(unconv, monitored),
         )
         .context("writing metric TSVs")?;
@@ -845,7 +851,7 @@ fn run_masking(
     mbias: &mut MbiasAccumulator,
     out: &mut RawBamWriter,
     cfg: MaskingRun,
-) -> Result<()> {
+) -> Result<Option<MaskPlan>> {
     let mut arena = TemplateArena::with_target(cfg.buffer_templates);
     let mut plan: Option<MaskPlan> = None;
 
@@ -899,7 +905,7 @@ fn run_masking(
             arena.template_count()
         );
     }
-    Ok(())
+    Ok(plan)
 }
 
 /// Drain the arena, masking each buffered template with `plan` and writing it.

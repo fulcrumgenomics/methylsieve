@@ -80,12 +80,17 @@ impl MaskPlan {
     }
 
     /// The 5' mask length for a role.
-    fn role_5p(&self, role: ReadRole) -> usize {
+    pub(crate) fn role_5p(&self, role: ReadRole) -> usize {
         match role {
             ReadRole::R1 => self.k_r1_5p,
             ReadRole::R2 => self.k_r2_5p,
             ReadRole::Se => self.k_se_5p,
         }
+    }
+
+    /// The single-end 3' mask length.
+    pub(crate) fn k_se_3p(&self) -> usize {
+        self.k_se_3p
     }
 
     /// One-line summary of the frozen lengths, for the run log.

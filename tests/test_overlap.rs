@@ -18,10 +18,10 @@ fn ot_r2() -> u16 {
     FLAG_PAIRED | FLAG_PROPER_PAIR | FLAG_LAST_SEGMENT | FLAG_REVERSE
 }
 fn ca_total(env: &TestEnv) -> u64 {
-    genome_stats(&env.stats)["CA_total"].parse().unwrap()
+    genome_ctx_obs(&env.stats, "CpA")
 }
 fn ca_unconv(env: &TestEnv) -> u64 {
-    genome_stats(&env.stats)["CA_unconv"].parse().unwrap()
+    genome_ctx_unconv(&env.stats, "CpA")
 }
 
 #[test]

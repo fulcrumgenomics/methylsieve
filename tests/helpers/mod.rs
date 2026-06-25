@@ -298,6 +298,32 @@ pub fn genome_stats(path: &Path) -> std::collections::HashMap<String, String> {
     read_stats_rows(path).into_iter().next().expect("genome row")
 }
 
+/// Observed (total monitored) count for a context, from the `<ctx>_obs` column.
+pub fn ctx_obs(row: &std::collections::HashMap<String, String>, ctx: &str) -> u64 {
+    row[&format!("{ctx}_obs")].parse().unwrap()
+}
+
+/// Unconverted count for a context, derived from `<ctx>_obs` and
+/// `<ctx>_conv_rate` (the summary reports the rate, not the raw count).
+pub fn ctx_unconv(row: &std::collections::HashMap<String, String>, ctx: &str) -> u64 {
+    let obs = ctx_obs(row, ctx);
+    if obs == 0 {
+        return 0;
+    }
+    let conv: f64 = row[&format!("{ctx}_conv_rate")].parse().unwrap();
+    obs - (obs as f64 * conv).round() as u64
+}
+
+/// `ctx_obs` against the genome row of a stats TSV.
+pub fn genome_ctx_obs(path: &Path, ctx: &str) -> u64 {
+    ctx_obs(&genome_stats(path), ctx)
+}
+
+/// `ctx_unconv` against the genome row of a stats TSV.
+pub fn genome_ctx_unconv(path: &Path, ctx: &str) -> u64 {
+    ctx_unconv(&genome_stats(path), ctx)
+}
+
 /// SAM FLAG bit constants for fixtures and assertions.
 pub const FLAG_PAIRED: u16 = 0x1;
 pub const FLAG_PROPER_PAIR: u16 = 0x2;

@@ -45,11 +45,12 @@ fn control_reads_are_separated_and_chimeric_is_counted() {
     assert_eq!(genome["chimeric_to_control_templates"], "1");
     let lambda = rows.iter().find(|r| r["scope"] == "lambda" && r["read"] == "all").unwrap();
     assert_eq!(lambda["n_templates"], "1");
-    assert_eq!(lambda["CA_total"], "5", "only the ctrl read tallies into lambda");
-    // CA_total counts every monitored CpA site (converted + unconverted). Each
+    assert_eq!(lambda["CpA_obs"], "5", "only the ctrl read tallies into lambda");
+    assert_eq!(lambda["CpA_conv_rate"], "0.000000", "ctrl read fully unconverted");
+    // CpA_obs counts every monitored CpA site (converted + unconverted). Each
     // 10 bp read covers all 5 ref-C positions, so the chimeric supplementary's
     // sites count toward the genome (not lambda): main(5) + chim primary(5) +
-    // chim supp(5) = 15, with 5 + 1 + 2 = 8 of them unconverted.
-    assert_eq!(genome["CA_total"], "15");
-    assert_eq!(genome["CA_unconv"], "8");
+    // chim supp(5) = 15, with 5 + 1 + 2 = 8 of them unconverted → conv 7/15.
+    assert_eq!(genome["CpA_obs"], "15");
+    assert_eq!(genome["CpA_conv_rate"], "0.466667");
 }

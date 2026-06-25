@@ -32,8 +32,8 @@ fn all_encodings_agree_on_acgt_reference() {
         assert_eq!(row, base, "{enc} stats differ from bytes on an ACGT reference");
     }
     // Sanity: the input actually produced monitored sites.
-    let ca: u64 = base["CA_total"].parse().unwrap();
-    let cg: u64 = base["CG_total"].parse().unwrap();
+    let ca = ctx_obs(base, "CpA");
+    let cg = ctx_obs(base, "CpG");
     assert!(ca + cg > 0, "expected some monitored sites");
 }
 

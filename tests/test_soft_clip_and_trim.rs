@@ -11,10 +11,10 @@ const TOP: &str = "CACACACACA"; // 5 CpA C's at 0,2,4,6,8
 const BOT: &str = "TGTGTGTGTG"; // 5 CpA-equivalent G's at 1,3,5,7,9
 
 fn ca_unconv(env: &TestEnv) -> u64 {
-    genome_stats(&env.stats)["CA_unconv"].parse().unwrap()
+    genome_ctx_unconv(&env.stats, "CpA")
 }
 fn ca_total(env: &TestEnv) -> u64 {
-    genome_stats(&env.stats)["CA_total"].parse().unwrap()
+    genome_ctx_obs(&env.stats, "CpA")
 }
 
 #[test]

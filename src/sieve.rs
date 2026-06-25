@@ -98,7 +98,13 @@ impl RecordProcessor {
         let termini =
             if trimming { self.template_termini(block) } else { TemplateTermini::default() };
         let mut counters = PerContextCounters::default();
+        // Which roles (R1/R2/SE) have a mapped primary in this template — the
+        // per-read denominators reported in the summary.
+        let mut roles_mapped = [false; 3];
         for (i, rec) in block.iter().enumerate() {
+            if is_primary_mapped(rec.flags()) {
+                roles_mapped[read_role(rec.flags()).index()] = true;
+            }
             if self.is_evidence_record(rec) {
                 // Per-record trim: own 5' (or both ends for SE/orphan) via the read
                 // window, plus one interior genomic skip. The overlap dedup region
@@ -176,6 +182,7 @@ impl RecordProcessor {
                 if monitored > 0 {
                     scope.n_evaluated += 1;
                 }
+                scope.record_mapping(roles_mapped, monitored > 0);
                 scope.counters.add(&counters);
                 self.stamp(block, Action::PassThrough, counts);
                 Ok(Disposition::Keep)
@@ -183,6 +190,7 @@ impl RecordProcessor {
             None => {
                 // Main (genome) template.
                 stats.genome.n_templates += 1;
+                stats.genome.record_mapping(roles_mapped, monitored > 0);
                 stats.genome.counters.add(&counters);
                 if self.opts.record_matrix {
                     // Histogram cell keyed by (checked, unconverted) over the
@@ -623,7 +631,7 @@ impl RecordProcessor {
     /// and abstains. A template with no monitored sites is never unconverted.
     pub(crate) fn classify(&self, unconv: u64, monitored: u64) -> (bool, DecidedBy) {
         if monitored == 0 {
-            return (false, DecidedBy::ZeroSites);
+            return (false, DecidedBy::TooFewSites);
         }
         let count_hit = unconv >= u64::from(self.opts.max_unconverted_count);
         // The proportion is only estimable at/above the site floor; below it the
@@ -631,15 +639,9 @@ impl RecordProcessor {
         let at_floor = monitored >= u64::from(self.opts.min_sites);
         let frac_hit =
             at_floor && (unconv as f64) / (monitored as f64) > self.opts.max_unconverted_fraction;
-        match self.opts.mode {
+        let (unconverted, by) = match self.opts.mode {
             DecisionMode::Count => (count_hit, DecidedBy::Count),
-            DecisionMode::Proportion => {
-                if at_floor {
-                    (frac_hit, DecidedBy::Proportion)
-                } else {
-                    (false, DecidedBy::MinSitesFloor)
-                }
-            }
+            DecisionMode::Proportion => (at_floor && frac_hit, DecidedBy::Proportion),
             DecisionMode::Either => (count_hit || frac_hit, DecidedBy::Either),
             // Trust the rate at/above the floor (an absolute count over-penalizes
             // long reads); fall back to the count below it, where the rate can't
@@ -651,7 +653,15 @@ impl RecordProcessor {
                     (count_hit, DecidedBy::Count)
                 }
             }
+        };
+        // Insufficient evidence to classify: nothing flagged it and the proportion
+        // test couldn't apply (below the site floor, including zero sites). The
+        // verdict stands (converted), but the *reason* is "too few sites" rather
+        // than a test that actually rendered a call.
+        if !unconverted && !at_floor {
+            return (false, DecidedBy::TooFewSites);
         }
+        (unconverted, by)
     }
 
     /// Stamp every record of the template with the conversion tag / QC-fail flag
@@ -715,16 +725,15 @@ pub(crate) enum DecisionMode {
 /// surfaced per cell by `--conversion-matrix`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DecidedBy {
-    /// No monitored sites in the threshold contexts → converted by default.
-    ZeroSites,
+    /// Too few sites to render a verdict: zero monitored sites, or below the
+    /// `min_sites` floor with nothing flagging it — the template passes through
+    /// converted, but on insufficient evidence to classify either way.
+    TooFewSites,
     /// The count test was the operative arm (count mode, or the sub-floor
     /// fallback in adaptive mode).
     Count,
     /// The proportion test was the operative arm (at/above `min_sites`).
     Proportion,
-    /// Proportion mode below the `min_sites` floor: the test abstains and the
-    /// template passes through converted.
-    MinSitesFloor,
     /// Either mode: the count and proportion tests OR'd together.
     Either,
 }
@@ -732,10 +741,9 @@ pub(crate) enum DecidedBy {
 impl DecidedBy {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            DecidedBy::ZeroSites => "zero_sites",
+            DecidedBy::TooFewSites => "too_few_sites",
             DecidedBy::Count => "count",
             DecidedBy::Proportion => "proportion",
-            DecidedBy::MinSitesFloor => "min_sites_floor",
             DecidedBy::Either => "either",
         }
     }
@@ -916,12 +924,20 @@ pub(crate) struct ScopeStats {
     pub(crate) name: String,
     /// Templates routed to this scope (mapped, unmapped, and zero-site alike).
     pub(crate) n_templates: u64,
+    /// Templates with at least one mapped primary alignment.
+    pub(crate) n_mapped: u64,
     /// Templates that produced at least one monitored site (in any context).
     pub(crate) n_evaluated: u64,
     /// Templates decided unconverted (always 0 for control scopes).
     pub(crate) n_unconverted: u64,
     /// Unconverted templates dropped under `--remove-unconverted`.
     pub(crate) n_removed: u64,
+    /// Templates with a mapped primary of each role (R1/R2/SE by
+    /// [`ReadRole::index`]) — the per-read denominators for the summary rows.
+    pub(crate) mapped_by_role: [u64; 3],
+    /// Evaluated templates (monitored sites > 0) with a mapped primary of each
+    /// role — the per-read evaluated counts.
+    pub(crate) evaluated_by_role: [u64; 3],
     /// Aggregated per-context tallies across the scope.
     pub(crate) counters: PerContextCounters,
 }
@@ -931,10 +947,28 @@ impl ScopeStats {
         Self {
             name,
             n_templates: 0,
+            n_mapped: 0,
             n_evaluated: 0,
             n_unconverted: 0,
             n_removed: 0,
+            mapped_by_role: [0; 3],
+            evaluated_by_role: [0; 3],
             counters: PerContextCounters::default(),
+        }
+    }
+
+    /// Record one mapped template's per-role presence: `roles` flags which of
+    /// R1/R2/SE had a mapped primary, `evaluated` whether the template yielded any
+    /// monitored site. Bumps `n_mapped` plus the per-role denominators.
+    fn record_mapping(&mut self, roles: [bool; 3], evaluated: bool) {
+        self.n_mapped += 1;
+        for (r, &present) in roles.iter().enumerate() {
+            if present {
+                self.mapped_by_role[r] += 1;
+                if evaluated {
+                    self.evaluated_by_role[r] += 1;
+                }
+            }
         }
     }
 }
@@ -1289,28 +1323,33 @@ mod tests {
 
     #[test]
     fn classify_reports_decided_by_and_matches_decide() {
-        // Zero monitored sites → converted, regardless of mode.
+        // Zero sites, or below the floor with nothing flagging it → too few sites
+        // to classify, regardless of mode.
         let d = decider(DecisionMode::Adaptive, 3, 0.05, 40);
-        assert_eq!(d.classify(0, 0), (false, DecidedBy::ZeroSites));
+        assert_eq!(d.classify(0, 0), (false, DecidedBy::TooFewSites));
+        assert_eq!(d.classify(1, 10), (false, DecidedBy::TooFewSites), "below floor, not flagged");
 
-        // Count mode always reports the count arm.
+        // Count mode reports the count arm when it can render a verdict — a flag
+        // (any site count) or a non-flag with enough sites.
         let c = decider(DecisionMode::Count, 3, 0.05, 40);
-        assert_eq!(c.classify(3, 10), (true, DecidedBy::Count));
-        assert_eq!(c.classify(2, 10), (false, DecidedBy::Count));
+        assert_eq!(c.classify(3, 10), (true, DecidedBy::Count), "count flags regardless of floor");
+        assert_eq!(c.classify(2, 50), (false, DecidedBy::Count), "at floor, count says converted");
+        assert_eq!(c.classify(2, 10), (false, DecidedBy::TooFewSites), "below floor, not flagged");
 
-        // Proportion mode abstains below the floor, applies the rate at/above it.
+        // Proportion mode: the rate at/above the floor; below it there is too little.
         let p = decider(DecisionMode::Proportion, 3, 0.05, 40);
-        assert_eq!(p.classify(5, 10), (false, DecidedBy::MinSitesFloor));
+        assert_eq!(p.classify(5, 10), (false, DecidedBy::TooFewSites));
         assert_eq!(p.classify(5, 50), (true, DecidedBy::Proportion));
 
-        // Adaptive: count arm below the floor, proportion arm at/above it.
+        // Adaptive: the count arm can still flag below the floor; otherwise the
+        // proportion arm at/above it.
         assert_eq!(d.classify(3, 10), (true, DecidedBy::Count));
         assert_eq!(d.classify(1, 50), (false, DecidedBy::Proportion));
 
-        // Either OR's the two tests under one label.
+        // Either OR's the two; below the floor a non-flag is still too few sites.
         let e = decider(DecisionMode::Either, 3, 0.05, 40);
         assert_eq!(e.classify(3, 10), (true, DecidedBy::Either));
-        assert_eq!(e.classify(2, 10), (false, DecidedBy::Either));
+        assert_eq!(e.classify(2, 10), (false, DecidedBy::TooFewSites));
 
         // classify(.0) can never drift from decide() over the same counts.
         for &(u, t) in &[(0, 0), (3, 10), (2, 10), (5, 50), (1, 50), (40, 100)] {

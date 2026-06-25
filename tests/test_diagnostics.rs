@@ -27,7 +27,8 @@ fn unmapped_template_passes_through_untouched() {
         assert_eq!(u16::from(rec.flags()) & FLAG_QC_FAIL, 0);
     }
     let g = genome_stats(&env.stats);
-    assert_eq!(g["unmapped_templates"], "1");
+    assert_eq!(g["n_templates"], "1");
+    assert_eq!(g["n_mapped"], "0", "the lone template has no mapped primary");
     assert_eq!(g["n_evaluated"], "0");
 }
 
@@ -43,8 +44,8 @@ fn zero_site_template_is_counted_and_not_tagged() {
     let recs = run_ok(&sam, &reference, &env, &["--metrics-prefix", &stats]);
     assert!(!has_tag(&recs[0], [b'X', b'X']));
     let g = genome_stats(&env.stats);
-    assert_eq!(g["zero_site_templates"], "1");
-    assert_eq!(g["n_evaluated"], "0");
+    assert_eq!(g["n_mapped"], "1", "the read is mapped, just has no monitored sites");
+    assert_eq!(g["n_evaluated"], "0", "no monitored sites → not evaluated");
 }
 
 #[test]
@@ -101,6 +102,6 @@ fn deletion_skips_reference_cytosines() {
     );
     run_ok(&sam, &reference, &env, &["--metrics-prefix", &stats]);
     let g = genome_stats(&env.stats);
-    assert_eq!(g["CA_total"], "4", "deleted C@4 must not be tallied");
-    assert_eq!(g["CA_unconv"], "4");
+    assert_eq!(g["CpA_obs"], "4", "deleted C@4 must not be tallied");
+    assert_eq!(ctx_unconv(&g, "CpA"), 4);
 }
