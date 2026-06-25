@@ -136,22 +136,21 @@ impl CycleCounts {
 /// dominant cost of the `--metrics-prefix` M-bias walk, so removing that
 /// indirection matters. `stride` starts at zero and grows (rarely — typically
 /// once, on the first record, to cover the read length) to fit the largest cycle
-/// seen; `lens[slot]` tracks each slot's highest recorded cycle so reports see
-/// exactly the cycles that were observed.
+/// seen. Each slot's logical length (highest observed cycle + 1) is derived on
+/// demand at report time rather than tracked per site, keeping the per-site
+/// `record` path free of bookkeeping beyond the count bump.
 pub(crate) struct MbiasAccumulator {
     /// Flat `N_CELLS × stride` buffer, `slot`-major.
     data: Vec<CycleCounts>,
     /// Cycles allocated per slot. All slots share one stride for O(1) indexing.
     stride: usize,
-    /// Highest recorded cycle + 1, per slot (the logical length of each slice).
-    lens: [usize; N_CELLS],
 }
 
 impl MbiasAccumulator {
     /// An empty accumulator.
     #[must_use]
     pub(crate) fn new() -> Self {
-        Self { data: Vec::new(), stride: 0, lens: [0; N_CELLS] }
+        Self { data: Vec::new(), stride: 0 }
     }
 
     /// Dense slot for a `(role, end, context)` triple.
@@ -162,17 +161,19 @@ impl MbiasAccumulator {
 
     /// Grow the shared stride to fit `min_stride` cycles, re-laying every slot's
     /// existing counts at the new (larger) stride. Geometric growth keeps this
-    /// amortized O(1): for fixed-length reads it runs once.
+    /// amortized O(1): for fixed-length reads it runs once. Also the cold home of
+    /// the [`MAX_CYCLE`] guard — a cycle past the cap is dropped here instead of
+    /// being tested on every `record`.
     #[cold]
     fn grow_stride(&mut self, min_stride: usize) {
         let new_stride = min_stride.next_power_of_two().max(64);
         let mut new_data = vec![CycleCounts::default(); N_CELLS * new_stride];
-        for slot in 0..N_CELLS {
-            let used = self.lens[slot];
-            if used > 0 {
+        if self.stride > 0 {
+            for slot in 0..N_CELLS {
                 let src = slot * self.stride;
                 let dst = slot * new_stride;
-                new_data[dst..dst + used].copy_from_slice(&self.data[src..src + used]);
+                new_data[dst..dst + self.stride]
+                    .copy_from_slice(&self.data[src..src + self.stride]);
             }
         }
         self.data = new_data;
@@ -189,34 +190,36 @@ impl MbiasAccumulator {
         cycle: usize,
         unconverted: bool,
     ) {
-        if cycle > MAX_CYCLE {
-            return;
-        }
         if cycle >= self.stride {
+            if cycle > MAX_CYCLE {
+                return;
+            }
             self.grow_stride(cycle + 1);
         }
-        let slot = Self::slot(role, end, ctx);
-        let cell = &mut self.data[slot * self.stride + cycle];
+        let cell = &mut self.data[Self::slot(role, end, ctx) * self.stride + cycle];
         cell.total += 1;
         cell.meth += u64::from(unconverted);
-        if cycle >= self.lens[slot] {
-            self.lens[slot] = cycle + 1;
-        }
     }
 
-    /// Per-cycle counts for a `(role, end, context)`, oldest→newest cycle.
+    /// Per-cycle counts for a `(role, end, context)`, oldest→newest cycle. The
+    /// slice ends at the highest cycle that saw a call — derived here rather than
+    /// tracked per site — and is empty when the slot recorded nothing.
     #[must_use]
     pub(crate) fn cycles(&self, role: ReadRole, end: ReadEnd, ctx: Context) -> &[CycleCounts] {
-        let slot = Self::slot(role, end, ctx);
-        let start = slot * self.stride;
-        &self.data[start..start + self.lens[slot]]
+        if self.stride == 0 {
+            return &[];
+        }
+        let start = Self::slot(role, end, ctx) * self.stride;
+        let row = &self.data[start..start + self.stride];
+        let used = row.iter().rposition(|c| c.total() > 0).map_or(0, |i| i + 1);
+        &row[..used]
     }
 
     /// Whether any site was recorded for this `(role, end)` in any context — used
     /// to skip emitting empty rows / deciding masks for absent read classes.
     #[must_use]
     pub(crate) fn has_data(&self, role: ReadRole, end: ReadEnd) -> bool {
-        Context::ALL.iter().any(|&c| self.lens[Self::slot(role, end, c)] > 0)
+        Context::ALL.iter().any(|&c| !self.cycles(role, end, c).is_empty())
     }
 }
 
