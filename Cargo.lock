@@ -992,6 +992,7 @@ dependencies = [
  "noodles-util",
  "ringbuf",
  "serde",
+ "smallvec",
  "tempfile",
  "wide",
 ]

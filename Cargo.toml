@@ -41,6 +41,9 @@ noodles-fasta = "0.62"
 noodles-sam = "0.85"
 ringbuf = "0.5"
 serde = { version = "1", features = ["derive"] }
+# Per-record mask/trim interval sets live inline (typically ≤2) to keep the
+# masking tally path allocation-free; already in the tree transitively.
+smallvec = "1"
 wide = "1.4"
 
 [dev-dependencies]

@@ -3,9 +3,15 @@
 //! Once mask lengths are frozen from the M-bias curves, each maskable record has
 //! its biased qualities set to a low value (`--mbias-mask-quality`, default 2) so
 //! downstream base-quality-aware callers ignore them. Nothing else about the
-//! record changes — no clip, no POS/CIGAR/tag/mate rewrite — and masked bases
-//! fall below methylsieve's own `--min-base-quality` gate, so they drop out of
-//! its tallies for free.
+//! record changes — no clip, no POS/CIGAR/tag/mate rewrite.
+//!
+//! The mask is computed as a set of stored-position windows
+//! ([`compute_mask_windows`]) and applied two ways from that one geometry: the Q2
+//! write ([`apply_windows`]) for downstream callers, and — when masking would
+//! drop a base below `--min-base-quality` — an exclusion from methylsieve's own
+//! per-template tally and unconverted decision (see `RecordSkips` in
+//! [`crate::sieve`]). Sharing one geometry keeps the reported metrics and the
+//! call describing exactly the bases the masked output presents.
 //!
 //! **Which records are masked.** Every record that has SEQ and real base
 //! qualities and is **not** a secondary alignment — i.e. primary, supplementary,
@@ -13,9 +19,9 @@
 //! is frequently absent or a hard-clipped duplicate of the primary, and
 //! base-quality-aware methylation callers ignore secondaries, so masking them is
 //! pure risk for no downstream benefit. (M-bias *measurement* — the mask lengths
-//! themselves — is still learned from primary mapped records only.) Masking runs
-//! *after* the per-template unconverted decision, so it never affects that call;
-//! it is purely an output transform for downstream callers.
+//! themselves — is learned from primary mapped records only, **before** masking,
+//! so the curve is a pre-mask view of the data; only the tally and decision act
+//! on the masked result.)
 //!
 //! What gets masked, per maskable record:
 //! - **Own 5':** the first `K` sequencing cycles (low stored positions for a
@@ -40,6 +46,7 @@
 //!   mate that doesn't actually cover the masked position.
 
 use fgumi_raw_bam::RawRecord;
+use smallvec::SmallVec;
 
 use crate::mbias::{
     DetectParams, MbiasAccumulator, ReadEnd, ReadRole, cpg_plateau, detect_mask_length,
@@ -48,6 +55,11 @@ use crate::record::{
     FLAG_FIRST_SEGMENT, FLAG_LAST_SEGMENT, FLAG_MATE_UNMAPPED, FLAG_PAIRED, FLAG_REVERSE,
     FLAG_SECONDARY, FLAG_UNMAPPED, has, read_role, ref_span_for_query_window,
 };
+
+/// Stored-position mask windows for a single record. Inline-allocated: a record
+/// almost always has at most its own 5' window plus one propagated overhang, so
+/// the common case never touches the heap.
+pub(crate) type MaskWindows = SmallVec<[(usize, usize); 2]>;
 
 /// Frozen 5'/3' mask lengths (in sequencing cycles) per read role, plus the
 /// quality value masked positions are set to.
@@ -146,7 +158,24 @@ impl MaskPlan {
 /// windows (5', plus SE 3' or the mate-5' mirror); (2) propagate masked reference
 /// positions between the two mate sides by coverage, matched on contig; (3) write
 /// the mask quality over all collected windows.
+#[cfg(test)]
 pub(crate) fn mask_template(plan: &MaskPlan, recs: &mut [RawRecord]) {
+    let windows = compute_mask_windows(plan, recs);
+    apply_windows(recs, &windows, plan.mask_quality);
+}
+
+/// Compute the stored-position mask windows for every record of one template,
+/// without mutating anything (phases 1–2 of masking: each record's own windows,
+/// then cross-mate reference-coverage propagation). `windows[i]` is the
+/// set of half-open stored-position intervals to mask in `recs[i]`, empty for a
+/// record that masks nothing (including secondaries).
+///
+/// Separated from the Q2 write ([`apply_windows`]) so the **same** geometry drives
+/// both the masked output *and* the decision tally's exclusion — the reported
+/// metrics then describe exactly the bases a downstream caller sees. The windows
+/// can be interior (a propagated overhang), not just end trims, so callers must
+/// treat them as a general interval set, never collapse them to a 5'/3' length.
+pub(crate) fn compute_mask_windows(plan: &MaskPlan, recs: &[RawRecord]) -> Vec<MaskWindows> {
     let n = recs.len();
 
     // Does a mapped (non-secondary) record exist for each segment? A paired read
@@ -163,7 +192,7 @@ pub(crate) fn mask_template(plan: &MaskPlan, recs: &mut [RawRecord]) {
     }
 
     // Phase 1 — each maskable record's own mask windows (stored positions).
-    let mut windows: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+    let mut windows: Vec<MaskWindows> = vec![MaskWindows::new(); n];
     for i in 0..n {
         if !maskable(&recs[i]) {
             continue;
@@ -240,16 +269,22 @@ pub(crate) fn mask_template(plan: &MaskPlan, recs: &mut [RawRecord]) {
         }
     }
 
-    // Phase 3 — write the mask quality over every collected window.
-    for i in 0..n {
-        if windows[i].is_empty() {
+    windows
+}
+
+/// Write `mask_quality` over the precomputed mask windows (phase 3 of masking).
+/// `windows[i]` applies to `recs[i]`; an empty entry leaves that record
+/// untouched. Each interval is clamped to the stored quality length.
+pub(crate) fn apply_windows(recs: &mut [RawRecord], windows: &[MaskWindows], mask_quality: u8) {
+    for (i, w) in windows.iter().enumerate() {
+        if w.is_empty() {
             continue;
         }
         let q = recs[i].quality_scores_mut();
-        for &(lo, hi) in &windows[i] {
+        for &(lo, hi) in w {
             let hi = hi.min(q.len());
             for b in &mut q[lo.min(hi)..hi] {
-                *b = plan.mask_quality;
+                *b = mask_quality;
             }
         }
     }

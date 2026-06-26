@@ -41,7 +41,7 @@ use noodles_sam::header::record::value::map::Program;
 use noodles_sam::header::record::value::map::program::tag as program_tag;
 
 use crate::buffer::TemplateArena;
-use crate::mask::MaskPlan;
+use crate::mask::{MaskPlan, MaskWindows, apply_windows, compute_mask_windows};
 use crate::mbias::{DetectParams, MbiasAccumulator};
 use crate::raw_reader::RawBamReader;
 use crate::raw_writer::RawBamWriter;
@@ -743,13 +743,16 @@ fn run(args: Args) -> Result<()> {
                 detect,
                 buffer_templates: args.mbias_buffer_templates,
                 mask_quality: args.mbias_mask_quality,
+                min_base_quality: args.min_base_quality,
                 want_metrics: args.metrics_prefix.is_some(),
                 quiet: args.quiet,
             },
         )?
     } else {
         for_each_block(&mut reader, &mut pool, |block| {
-            if processor.process_block(block, &mut stats, mbias_acc.as_mut())? == Disposition::Keep
+            // No masking: no stored exclusions, so pass an empty window set.
+            if processor.process_block(block, &mut stats, mbias_acc.as_mut(), &[])?
+                == Disposition::Keep
             {
                 write_block(block, &mut out)?;
             }
@@ -876,6 +879,10 @@ struct MaskingRun {
     buffer_templates: usize,
     /// Quality value masked bases are set to.
     mask_quality: u8,
+    /// The decision's base-quality gate. A mask window is excluded from the tally
+    /// only when `mask_quality < min_base_quality` — i.e. when masking actually
+    /// drops the base below the gate a downstream caller would apply.
+    min_base_quality: u8,
     /// Keep accumulating M-bias after the plan freezes. Only needed to write the
     /// whole-file curves under `--metrics-prefix`; when false, the post-freeze
     /// stream skips the (now-useless) second M-bias walk entirely.
@@ -884,12 +891,40 @@ struct MaskingRun {
     quiet: bool,
 }
 
-/// Two-phase M-bias masking run. **Learn:** buffer complete templates (after the
-/// usual tally/decision/stamping) into the arena while accumulating M-bias,
-/// until the template target is hit. **Drain + stream:** freeze the mask lengths
-/// from the learned curves, mask and emit the buffered templates in order, then
-/// continue streaming the remainder of the file applying the same frozen masks.
-/// If the file ends before the target, the whole file was buffered — drain it.
+/// Mask one template and tally/decide/stamp it on the **resulting** data, so the
+/// reported metrics and the unconverted call both describe what a downstream
+/// caller will see. The mask geometry (`compute_mask_windows`) drives both the
+/// tally exclusion and the Q2 write, so the two never disagree; the exclusion is
+/// applied only when `mask_quality < min_base_quality` (otherwise a post-mask
+/// tally would still count those bases). M-bias is *not* accumulated here — the
+/// curve is a pre-mask measurement taken before this point. Returns whether the
+/// template should be emitted; the Q2 write is skipped for dropped templates.
+fn mask_and_process(
+    processor: &RecordProcessor,
+    stats: &mut Stats,
+    mbias: Option<&mut MbiasAccumulator>,
+    plan: &MaskPlan,
+    mask_quality: u8,
+    min_base_quality: u8,
+    block: &mut [RawRecord],
+) -> Result<Disposition> {
+    let windows = compute_mask_windows(plan, block);
+    let tally_windows: &[MaskWindows] =
+        if mask_quality < min_base_quality { &windows } else { &[] };
+    let disp = processor.process_block(block, stats, mbias, tally_windows)?;
+    if disp == Disposition::Keep {
+        apply_windows(block, &windows, mask_quality);
+    }
+    Ok(disp)
+}
+
+/// Two-phase M-bias masking run. **Learn:** buffer complete templates into the
+/// arena while accumulating the per-cycle M-bias curve (pre-mask), *deferring*
+/// the tally/decision/stamp so they can later run on the masked data. **Drain +
+/// stream:** freeze the mask lengths, then for every template — buffered first,
+/// then the streamed remainder — mask it, tally/decide/stamp on the masked
+/// result, and emit. If the file ends before the target, the whole file was
+/// buffered — drain it.
 fn run_masking(
     reader: &mut Reader,
     pool: &mut Vec<RawRecord>,
@@ -903,31 +938,51 @@ fn run_masking(
     let mut plan: Option<MaskPlan> = None;
 
     for_each_block(reader, pool, |block| {
-        // Feed the M-bias accumulator during the learn phase (`plan` is `None`),
-        // and afterward only when the whole-file curves are needed for metrics —
-        // otherwise the frozen plan never changes, so the second walk is wasted.
-        let feed = if plan.is_none() || cfg.want_metrics { Some(&mut *mbias) } else { None };
-        if processor.process_block(block, stats, feed)? == Disposition::Drop {
-            return Ok(());
-        }
         match &plan {
-            // Stream phase: mask with the frozen plan and emit immediately.
+            // Stream phase: tally/decide/stamp on the masked geometry, then emit.
+            // M-bias keeps accumulating (pre-mask) only when the whole-file curves
+            // are needed for metrics; otherwise the frozen plan never changes.
             Some(p) => {
-                mask::mask_template(p, block);
-                write_block(block, out)
+                let feed = cfg.want_metrics.then_some(&mut *mbias);
+                let disp = mask_and_process(
+                    processor,
+                    stats,
+                    feed,
+                    p,
+                    cfg.mask_quality,
+                    cfg.min_base_quality,
+                    block,
+                )?;
+                if disp == Disposition::Keep {
+                    write_block(block, out)?;
+                }
+                Ok(())
             }
-            // Learn phase: buffer; once full, freeze, drain (masked), and switch.
+            // Learn phase: accumulate M-bias (pre-mask) only and buffer the raw
+            // template; the tally/decision is deferred to the drain pass below so
+            // it sees the masked data. Once the buffer fills, freeze and drain.
             None => {
+                processor.accumulate_mbias(block, mbias);
                 let buffered = arena.push_template(block);
                 if buffered && !arena.is_full() {
                     return Ok(());
                 }
                 let frozen = MaskPlan::learn(mbias, cfg.detect, cfg.mask_quality);
-                drain_masked(&arena, &frozen, out)?;
+                drain_masked(&arena, processor, stats, &frozen, &cfg, out)?;
                 if !buffered {
-                    // This block didn't fit the (now-full) arena → mask + emit it.
-                    mask::mask_template(&frozen, block);
-                    write_block(block, out)?;
+                    // This block didn't fit the (now-full) arena → process + emit it.
+                    let disp = mask_and_process(
+                        processor,
+                        stats,
+                        None,
+                        &frozen,
+                        cfg.mask_quality,
+                        cfg.min_base_quality,
+                        block,
+                    )?;
+                    if disp == Disposition::Keep {
+                        write_block(block, out)?;
+                    }
                 }
                 plan = Some(frozen);
                 Ok(())
@@ -940,7 +995,7 @@ fn run_masking(
     // input is buffered and undrained — freeze on what we have and emit it.
     if plan.is_none() {
         let frozen = MaskPlan::learn(mbias, cfg.detect, cfg.mask_quality);
-        drain_masked(&arena, &frozen, out)?;
+        drain_masked(&arena, processor, stats, &frozen, &cfg, out)?;
         plan = Some(frozen);
     }
     if let Some(p) = &plan
@@ -955,11 +1010,31 @@ fn run_masking(
     Ok(plan)
 }
 
-/// Drain the arena, masking each buffered template with `plan` and writing it.
-fn drain_masked(arena: &TemplateArena, plan: &MaskPlan, out: &mut RawBamWriter) -> Result<()> {
+/// Drain the buffered learn-phase templates: mask each, tally/decide/stamp it on
+/// the masked result (M-bias already captured during learn, so none here), and
+/// write it. Preserves arrival order.
+fn drain_masked(
+    arena: &TemplateArena,
+    processor: &RecordProcessor,
+    stats: &mut Stats,
+    plan: &MaskPlan,
+    cfg: &MaskingRun,
+    out: &mut RawBamWriter,
+) -> Result<()> {
     arena.drain(|recs| {
-        mask::mask_template(plan, recs);
-        write_block(recs, out)
+        let disp = mask_and_process(
+            processor,
+            stats,
+            None,
+            plan,
+            cfg.mask_quality,
+            cfg.min_base_quality,
+            recs,
+        )?;
+        if disp == Disposition::Keep {
+            write_block(recs, out)?;
+        }
+        Ok(())
     })
 }
 

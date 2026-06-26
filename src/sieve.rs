@@ -26,7 +26,9 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 use fgumi_raw_bam::RawRecord;
+use smallvec::SmallVec;
 
+use crate::mask::MaskWindows;
 use crate::mbias::{MbiasAccumulator, ReadEnd, ReadRole};
 use crate::record::{
     FLAG_FIRST_SEGMENT, FLAG_LAST_SEGMENT, FLAG_PAIRED, FLAG_QC_FAIL, FLAG_REVERSE, FLAG_SECONDARY,
@@ -71,6 +73,7 @@ impl RecordProcessor {
         block: &mut [RawRecord],
         stats: &mut Stats,
         mut mbias: Option<&mut MbiasAccumulator>,
+        mask_windows: &[MaskWindows],
     ) -> Result<Disposition> {
         stats.total_templates += 1;
 
@@ -97,20 +100,35 @@ impl RecordProcessor {
         let trimming = self.opts.ignore_template_ends > 0;
         let termini =
             if trimming { self.template_termini(block) } else { TemplateTermini::default() };
+        // Per-record mask windows (stored positions) when masking is active; empty
+        // otherwise. The caller has already gated on `mask_quality < min_base_quality`
+        // (passing no windows when masking wouldn't lower a base below the gate), so
+        // the tally excludes exactly the bases a downstream caller would drop.
+        let masking = !mask_windows.is_empty();
         let mut counters = PerContextCounters::default();
         for (i, rec) in block.iter().enumerate() {
             if self.is_evidence_record(rec) {
-                // Per-record trim: own 5' (or both ends for SE/orphan) via the read
-                // window, plus one interior genomic skip. The overlap dedup region
-                // takes precedence; an intruding mate terminus is used only when
-                // there is no overlap (it is otherwise contained within it). The
-                // terminus machinery is bypassed entirely when not trimming.
-                let (trim_lo, trim_hi, mate_terminus) = if trimming {
+                let seq_len = rec.l_seq() as usize;
+                // Stored-position exclusions for this record: own template-end trims
+                // (`--ignore-template-ends`) as intervals, plus its M-bias mask
+                // windows. The two never coexist (masking forces the trim to 0), but
+                // the unified set carries either. `tally_span` sorts/merges them.
+                let mut stored: SmallVec<[(usize, usize); 4]> = SmallVec::new();
+                let mate_terminus = if trimming {
                     let (lo, hi) = termini.own_trim_for(rec, self.opts.ignore_template_ends);
-                    (lo, hi, termini.mate_skip_for(rec))
+                    if lo > 0 {
+                        stored.push((0, lo));
+                    }
+                    if hi > 0 {
+                        stored.push((seq_len.saturating_sub(hi), seq_len));
+                    }
+                    termini.mate_skip_for(rec)
                 } else {
-                    (0, 0, None)
+                    None
                 };
+                if masking {
+                    stored.extend_from_slice(&mask_windows[i]);
+                }
                 // Overlap handling: split the overlap at its midpoint and let each
                 // mate keep the half nearer its own 5' end (where its base quality
                 // is higher), so neither read's calls dominate the whole overlap.
@@ -132,7 +150,7 @@ impl RecordProcessor {
                     // partition the overlap with no double count.
                     Some(if has(rec.flags(), FLAG_REVERSE) { (os, mid) } else { (mid, oe) })
                 });
-                let trim = RecordTrim { trim_lo, trim_hi, skip: overlap_iv.or(mate_terminus) };
+                let skips = RecordSkips { stored: &stored, genomic: overlap_iv.or(mate_terminus) };
                 // When M-bias is being collected, a primary mapped record's
                 // decision tally and M-bias accumulation share a single reference
                 // scan: the M-bias sites (every called cytosine, no trim/dedup) are
@@ -141,9 +159,9 @@ impl RecordProcessor {
                 // decision walk, leaving the masking-off hot path untouched.
                 match mbias.as_deref_mut() {
                     Some(acc) if is_primary_mapped(rec.flags()) => {
-                        self.tally_and_accumulate(rec, trim, &mut counters, acc);
+                        self.tally_and_accumulate(rec, skips, &mut counters, acc);
                     }
-                    _ => self.tally_record(rec, trim, &mut counters),
+                    _ => self.tally_record(rec, skips, &mut counters),
                 }
             }
         }
@@ -385,22 +403,22 @@ impl RecordProcessor {
     /// Walk one record's aligned positions and add its monitored cytosines to
     /// `counters`, dispatching once on the reference encoding so the inner walk
     /// is monomorphized per [`RefCodes`] layout.
-    fn tally_record(&self, rec: &RawRecord, trim: RecordTrim, counters: &mut PerContextCounters) {
+    fn tally_record(&self, rec: &RawRecord, skips: RecordSkips, counters: &mut PerContextCounters) {
         let tid = rec.ref_id();
         match self.reference.encoding() {
             RefEncoding::Bytes => {
                 if let Some(c) = self.reference.byte_codes(tid) {
-                    self.tally_aligned(rec, c, trim, counters);
+                    self.tally_aligned(rec, c, skips, counters);
                 }
             }
             RefEncoding::Nibble => {
                 if let Some(c) = self.reference.nibble_codes(tid) {
-                    self.tally_aligned(rec, c, trim, counters);
+                    self.tally_aligned(rec, c, skips, counters);
                 }
             }
             RefEncoding::TwoBit => {
                 if let Some(c) = self.reference.twobit_codes(tid) {
-                    self.tally_aligned(rec, c, trim, counters);
+                    self.tally_aligned(rec, c, skips, counters);
                 }
             }
         }
@@ -414,7 +432,7 @@ impl RecordProcessor {
         &self,
         rec: &RawRecord,
         refc: R,
-        trim: RecordTrim,
+        skips: RecordSkips,
         counters: &mut PerContextCounters,
     ) {
         let seq_len = rec.l_seq() as usize;
@@ -428,16 +446,10 @@ impl RecordProcessor {
         let f = rec.flags();
         let monitor_c = monitor_c_of(f);
 
-        // Template-end trim window over *stored* read positions [keep_lo, keep_hi).
-        // `trim.trim_lo`/`trim.trim_hi` are already resolved (by the caller) for
-        // this record's strand and role: a paired read trims only its own 5' end,
-        // a single-end/orphan read trims both ends. Stored soft-clips occupy the
-        // read-position extremes, so they naturally count toward the budget. The
-        // interior genomic skip (`trim.skip`) carries the mate's terminus or the
-        // PE-overlap dedup region, which fall in this read's interior.
-        let keep_lo = trim.trim_lo;
-        let keep_hi = seq_len.saturating_sub(trim.trim_hi);
-
+        // `skips.stored` holds the stored-position exclusions (trims ∪ mask
+        // windows), already resolved for this record's strand/role and sorted;
+        // `skips.genomic` carries the mate terminus or PE-overlap dedup region.
+        // Both are applied in `tally_span` over the per-base `k` offset.
         let min_bq = self.opts.min_base_quality;
         // The monitored reference base is fixed for the whole record by strand.
         let monitored_base = if monitor_c { BASE_C } else { BASE_G };
@@ -452,11 +464,10 @@ impl RecordProcessor {
             monitor_c,
             monitored_base,
             min_bq,
-            keep_lo,
-            keep_hi,
             seq_len,
             ref_len,
-            skip: trim.skip,
+            stored_skips: skips.stored,
+            skip: skips.genomic,
         };
         for op in rec.cigar_ops_iter() {
             let len = (op >> 4) as usize;
@@ -494,7 +505,7 @@ impl RecordProcessor {
     fn tally_and_accumulate(
         &self,
         rec: &RawRecord,
-        trim: RecordTrim,
+        skips: RecordSkips,
         counters: &mut PerContextCounters,
         acc: &mut MbiasAccumulator,
     ) {
@@ -502,17 +513,17 @@ impl RecordProcessor {
         match self.reference.encoding() {
             RefEncoding::Bytes => {
                 if let Some(c) = self.reference.byte_codes(tid) {
-                    self.fused_walk(rec, c, trim, counters, acc);
+                    self.fused_walk(rec, c, skips, counters, acc);
                 }
             }
             RefEncoding::Nibble => {
                 if let Some(c) = self.reference.nibble_codes(tid) {
-                    self.fused_walk(rec, c, trim, counters, acc);
+                    self.fused_walk(rec, c, skips, counters, acc);
                 }
             }
             RefEncoding::TwoBit => {
                 if let Some(c) = self.reference.twobit_codes(tid) {
-                    self.fused_walk(rec, c, trim, counters, acc);
+                    self.fused_walk(rec, c, skips, counters, acc);
                 }
             }
         }
@@ -526,16 +537,18 @@ impl RecordProcessor {
     /// store SEQ forward-genomic, so their 5' end is the high stored position;
     /// single-end reads also record from the 3' end). It additionally bumps the
     /// decision counters for the subset of sites the decision walk would have
-    /// counted: stored read position inside the trim window `[keep_lo, keep_hi)`
-    /// and genomic position outside the interior skip — exactly the range
-    /// [`tally_span`] carves out, evaluated per site here (cheap, since the site
-    /// is already classified). `classify_site` and the per-base reference probe
-    /// thus run once instead of once per walk.
+    /// counted: stored read position outside every `skips.stored` interval and
+    /// genomic position outside the `skips.genomic` dedup region — the same
+    /// exclusions [`tally_span`] applies, evaluated per site here (cheap, since the
+    /// site is already classified). M-bias records every site regardless of the
+    /// exclusions, so the learned curve stays a pre-mask measurement even when the
+    /// tally drops the masked bases. `classify_site` and the per-base reference
+    /// probe thus run once instead of once per walk.
     fn fused_walk<R: RefCodes + Copy>(
         &self,
         rec: &RawRecord,
         refc: R,
-        trim: RecordTrim,
+        skips: RecordSkips,
         counters: &mut PerContextCounters,
         acc: &mut MbiasAccumulator,
     ) {
@@ -553,13 +566,15 @@ impl RecordProcessor {
         let reverse = has(f, FLAG_REVERSE);
         let min_bq = self.opts.min_base_quality;
 
-        // Decision-counter gate, mirroring `tally_span` exactly: a site counts
-        // toward the decision iff its stored read position is in `[keep_lo,
-        // keep_hi)` and its genomic position is outside the interior skip. M-bias
-        // records every site regardless. An absent skip is an empty interval.
-        let keep_lo = trim.trim_lo;
-        let keep_hi = seq_len.saturating_sub(trim.trim_hi);
-        let (skip_s, skip_e) = trim.skip.unwrap_or((usize::MAX, usize::MAX));
+        // Decision-counter gate, mirroring `tally_span`: a site counts iff its
+        // genomic position is outside the dedup skip and its stored position is
+        // outside every exclusion interval (trims ∪ mask windows). M-bias records
+        // every classified site regardless of the exclusions, so the learned curve
+        // stays a pre-mask measurement. `has_stored` is hoisted so the common
+        // no-trim/no-mask path skips the interval scan with a single bool test.
+        let (skip_s, skip_e) = skips.genomic.unwrap_or((usize::MAX, usize::MAX));
+        let stored = skips.stored;
+        let has_stored = !stored.is_empty();
 
         let mut read_pos = 0usize;
         let mut ref_pos = pos as usize;
@@ -585,16 +600,105 @@ impl RecordProcessor {
                             let cycle_5p = if reverse { seq_len - 1 - rp } else { rp };
                             acc.record(role, ReadEnd::FivePrime, ctx, cycle_5p, unconverted);
                             if is_se {
-                                acc.record(
-                                    role,
-                                    ReadEnd::ThreePrime,
-                                    ctx,
-                                    seq_len - 1 - cycle_5p,
-                                    unconverted,
-                                );
+                                let c3 = seq_len - 1 - cycle_5p;
+                                acc.record(role, ReadEnd::ThreePrime, ctx, c3, unconverted);
                             }
-                            if rp >= keep_lo && rp < keep_hi && !(gp >= skip_s && gp < skip_e) {
+                            let excluded = (gp >= skip_s && gp < skip_e)
+                                || (has_stored && stored.iter().any(|&(a, b)| rp >= a && rp < b));
+                            if !excluded {
                                 counters.record(ctx, unconverted);
+                            }
+                        }
+                    }
+                    read_pos += len;
+                    ref_pos += len;
+                }
+                1 | 4 => read_pos += len,
+                2 | 3 => ref_pos += len,
+                _ => {}
+            }
+        }
+    }
+
+    /// Accumulate per-cycle M-bias for one template's primary mapped records,
+    /// **without** tallying the decision. Used in the masking learn phase, where
+    /// the curve must be measured pre-mask but the unconverted decision is
+    /// deferred to the drain pass (post-mask). Mirrors the M-bias half of
+    /// [`Self::fused_walk`] — every classified cytosine at its true cycle, no
+    /// trim, no dedup — so the learned curve is identical to the metrics path's.
+    pub(crate) fn accumulate_mbias(&self, block: &[RawRecord], acc: &mut MbiasAccumulator) {
+        for rec in block {
+            if self.is_evidence_record(rec) && is_primary_mapped(rec.flags()) {
+                self.accumulate_mbias_record(rec, acc);
+            }
+        }
+    }
+
+    /// Dispatch [`Self::accumulate_mbias`] for one record on the reference encoding.
+    fn accumulate_mbias_record(&self, rec: &RawRecord, acc: &mut MbiasAccumulator) {
+        let tid = rec.ref_id();
+        match self.reference.encoding() {
+            RefEncoding::Bytes => {
+                if let Some(c) = self.reference.byte_codes(tid) {
+                    self.mbias_walk(rec, c, acc);
+                }
+            }
+            RefEncoding::Nibble => {
+                if let Some(c) = self.reference.nibble_codes(tid) {
+                    self.mbias_walk(rec, c, acc);
+                }
+            }
+            RefEncoding::TwoBit => {
+                if let Some(c) = self.reference.twobit_codes(tid) {
+                    self.mbias_walk(rec, c, acc);
+                }
+            }
+        }
+    }
+
+    /// M-bias-only scan of one primary mapped record (no decision tally). The
+    /// counting twin is [`Self::fused_walk`]; both record the same sites at their
+    /// true 5' cycle (and the 3' end for single-end reads). This learn-phase scan
+    /// is cold (only the buffered prefix), so the few lines are inlined to match
+    /// `fused_walk` rather than abstracted behind a shared helper.
+    fn mbias_walk<R: RefCodes + Copy>(&self, rec: &RawRecord, refc: R, acc: &mut MbiasAccumulator) {
+        let seq_len = rec.l_seq() as usize;
+        let pos = rec.pos();
+        if seq_len == 0 || pos < 0 {
+            return;
+        }
+        let ref_len = refc.len();
+        let f = rec.flags();
+        let monitor_c = monitor_c_of(f);
+        let monitored_base = if monitor_c { BASE_C } else { BASE_G };
+        let role = read_role(f);
+        let is_se = role == ReadRole::Se;
+        let reverse = has(f, FLAG_REVERSE);
+        let min_bq = self.opts.min_base_quality;
+
+        let mut read_pos = 0usize;
+        let mut ref_pos = pos as usize;
+        for op in rec.cigar_ops_iter() {
+            let len = (op >> 4) as usize;
+            match op & 0xf {
+                0 | 7 | 8 => {
+                    let k1 = len
+                        .min(seq_len.saturating_sub(read_pos))
+                        .min(ref_len.saturating_sub(ref_pos));
+                    for k in 0..k1 {
+                        let gp = ref_pos + k;
+                        if !refc.monitors(gp, monitored_base) {
+                            continue;
+                        }
+                        let rp = read_pos + k;
+                        if let Some((ctx, unconverted)) =
+                            classify_site(rec, refc, rp, gp, monitor_c, min_bq, ref_len)
+                        {
+                            let cycle_5p = if reverse { seq_len - 1 - rp } else { rp };
+                            acc.record(role, ReadEnd::FivePrime, ctx, cycle_5p, unconverted);
+                            if is_se {
+                                let c3 = seq_len - 1 - cycle_5p;
+                                acc.record(role, ReadEnd::ThreePrime, ctx, c3, unconverted);
                             }
                         }
                     }
@@ -857,17 +961,24 @@ impl TemplateTermini {
     }
 }
 
-/// Per-record trimming resolved at the template level and handed to the tally.
-#[derive(Debug, Clone, Copy, Default)]
-struct RecordTrim {
-    /// Stored read bases to drop from the low-position end.
-    trim_lo: usize,
-    /// Stored read bases to drop from the high-position end.
-    trim_hi: usize,
-    /// Single genomic interval to skip in this record's interior: the PE-overlap
-    /// dedup region, or the mate's intruding template terminus (the overlap
-    /// subsumes the terminus when both apply).
-    skip: Option<(usize, usize)>,
+/// One record's tally exclusions: the bases that don't count toward the
+/// unconverted decision. A single generalized "ignore these" set fed by two
+/// inputs that share the per-base `k` offset along an M-span:
+///
+/// - `stored`: half-open **stored read-position** intervals — the
+///   `--ignore-template-ends` 5'/3' trims *and* the M-bias mask windows, unified.
+///   Sorted and merged, so the common case is empty (no trim, no mask) and the
+///   hot path skips the machinery entirely. May be interior (a propagated mask
+///   overhang), so it is a true interval set, never a 5'/3' length pair.
+/// - `genomic`: a single **reference-position** interval — the PE-overlap dedup
+///   region or an intruding mate terminus (the overlap subsumes the terminus when
+///   both apply). Kept genomic rather than converted to stored: it is naturally a
+///   reference span and converting it would cost a CIGAR walk on the hot
+///   overlap-heavy path.
+#[derive(Clone, Copy, Default)]
+struct RecordSkips<'a> {
+    stored: &'a [(usize, usize)],
+    genomic: Option<(usize, usize)>,
 }
 
 // ── Stats ───────────────────────────────────────────────────────────────────
@@ -1028,28 +1139,25 @@ impl PerContextCounters {
 
 /// Fixed-per-record parameters threaded into the span kernels.
 #[derive(Debug, Clone, Copy)]
-struct SpanParams {
+struct SpanParams<'a> {
     /// Whether this record monitors reference C (top) or G (bottom).
     pub(crate) monitor_c: bool,
     /// The monitored 4-bit reference base code (C=2 or G=4).
     pub(crate) monitored_base: u8,
     /// Minimum base quality to tally a site.
     pub(crate) min_bq: u8,
-    /// Inclusive lower bound of the kept read-position window (the record's own
-    /// 5'-end template trim folds into this; see [`RecordProcessor::tally_aligned`]).
-    pub(crate) keep_lo: usize,
-    /// Exclusive upper bound of the kept read-position window.
-    pub(crate) keep_hi: usize,
     /// Stored SEQ length (read positions are valid in `0..seq_len`).
     pub(crate) seq_len: usize,
     /// Contig length (reference positions are valid in `0..ref_len`).
     pub(crate) ref_len: usize,
-    /// A single reference half-open interval `[start, end)` to skip even when it
-    /// falls inside the kept window: the PE-overlap dedup region, or the mate's
-    /// template terminus that intrudes into this read. One interval suffices
-    /// because an intruding mate terminus is always contained in the overlap
-    /// region when both apply — see [`RecordProcessor::process_block`]. `None` in
-    /// the common case (one cheap discriminant check on the per-base hot path).
+    /// Stored read-position intervals to exclude (trims ∪ mask windows), sorted
+    /// and merged. Empty in the hot path (no trim, no masking).
+    pub(crate) stored_skips: &'a [(usize, usize)],
+    /// A single reference half-open interval `[start, end)` to skip: the PE-overlap
+    /// dedup region, or the mate's template terminus that intrudes into this read.
+    /// One interval suffices because an intruding mate terminus is always contained
+    /// in the overlap region when both apply — see [`RecordProcessor::process_block`].
+    /// `None` in the common case (one cheap discriminant check on the per-base hot path).
     pub(crate) skip: Option<(usize, usize)>,
 }
 
@@ -1162,24 +1270,72 @@ fn tally_span<R: RefCodes + Copy>(
     p: &SpanParams,
     counters: &mut PerContextCounters,
 ) {
-    // Hoist the read-position window and contig/SEQ bounds out of the per-base
-    // loop: across an M-span `rp = rp_start + k` and `gp = gp_start + k` move
-    // together, so the four per-base bounds checks collapse to a single `k` range.
-    let k0 = p.keep_lo.saturating_sub(rp_start);
-    let k1 = len
-        .min(p.keep_hi.saturating_sub(rp_start))
-        .min(p.seq_len.saturating_sub(rp_start))
-        .min(p.ref_len.saturating_sub(gp_start));
-    match p.skip {
-        None => tally_run(rec, refc, rp_start, gp_start, k0, k1, p, counters),
-        Some((s, e)) => {
-            // Skip applies where `gp ∈ [s, e)`, i.e. `k ∈ [s-gp_start, e-gp_start)`,
-            // clamped into `[k0, k1)`. A skip outside the span leaves one side empty.
-            let sk0 = s.saturating_sub(gp_start).clamp(k0, k1);
-            let sk1 = e.saturating_sub(gp_start).clamp(k0, k1);
-            tally_run(rec, refc, rp_start, gp_start, k0, sk0, p, counters);
-            tally_run(rec, refc, rp_start, gp_start, sk1, k1, p, counters);
+    // Hoist the contig/SEQ bounds out of the per-base loop: across an M-span
+    // `rp = rp_start + k` and `gp = gp_start + k` move together, so the per-base
+    // bounds checks collapse to a single valid `k` range `[0, k1)`.
+    let k1 = len.min(p.seq_len.saturating_sub(rp_start)).min(p.ref_len.saturating_sub(gp_start));
+
+    // Hot path: no stored exclusions (no trim, no masking). The genomic dedup
+    // skip is the only possible exclusion, handled exactly as before so this
+    // codegen-sensitive path is unchanged.
+    if p.stored_skips.is_empty() {
+        match p.skip {
+            None => tally_run(rec, refc, rp_start, gp_start, 0, k1, p, counters),
+            Some((s, e)) => {
+                // Skip applies where `gp ∈ [s, e)`, i.e. `k ∈ [s-gp_start, e-gp_start)`.
+                let sk0 = s.saturating_sub(gp_start).clamp(0, k1);
+                let sk1 = e.saturating_sub(gp_start).clamp(0, k1);
+                tally_run(rec, refc, rp_start, gp_start, 0, sk0, p, counters);
+                tally_run(rec, refc, rp_start, gp_start, sk1, k1, p, counters);
+            }
         }
+        return;
+    }
+
+    // General path (trim and/or masking active): gather every exclusion as a `k`
+    // range — stored intervals via `rp`, the genomic skip via `gp` — then tally
+    // the gaps between them. Both inputs collapse to the same `k` offset, so one
+    // mechanism covers trims, mask windows, and the dedup skip alike. The buffer
+    // is fixed-size: a record carries at most a handful of disjoint exclusions.
+    const MAX_EXCL: usize = 8;
+    let mut ex: [(usize, usize); MAX_EXCL] = [(0, 0); MAX_EXCL];
+    let mut n = 0;
+    for &(a, b) in p.stored_skips {
+        let lo = a.saturating_sub(rp_start).min(k1);
+        let hi = b.saturating_sub(rp_start).min(k1);
+        if lo < hi && n < MAX_EXCL {
+            ex[n] = (lo, hi);
+            n += 1;
+        }
+    }
+    if let Some((s, e)) = p.skip {
+        let lo = s.saturating_sub(gp_start).min(k1);
+        let hi = e.saturating_sub(gp_start).min(k1);
+        if lo < hi && n < MAX_EXCL {
+            ex[n] = (lo, hi);
+            n += 1;
+        }
+    }
+    ex[..n].sort_unstable();
+
+    // Walk the complement of the merged exclusions over `[0, k1)`.
+    let mut cur = 0;
+    let mut i = 0;
+    while i < n {
+        let (lo, mut hi) = ex[i];
+        if lo > cur {
+            tally_run(rec, refc, rp_start, gp_start, cur, lo, p, counters);
+        }
+        let mut j = i + 1;
+        while j < n && ex[j].0 <= hi {
+            hi = hi.max(ex[j].1);
+            j += 1;
+        }
+        cur = cur.max(hi);
+        i = j;
+    }
+    if cur < k1 {
+        tally_run(rec, refc, rp_start, gp_start, cur, k1, p, counters);
     }
 }
 
@@ -1370,7 +1526,7 @@ mod tests {
         let proc = RecordProcessor::new(reference, opts(cph_mask(), 3));
         let recs = parse_sam_records(&[&sam_line(0, 1, "10M", "CACACACACA", "IIIIIIIIII")], 10);
         let mut counters = PerContextCounters::default();
-        proc.tally_record(&recs[0], RecordTrim::default(), &mut counters);
+        proc.tally_record(&recs[0], RecordSkips::default(), &mut counters);
         assert_eq!(counters.unconv[Context::CpA.index()], 5);
         assert_eq!(counters.total[Context::CpA.index()], 5);
         assert!(proc.decide(&counters), "5 unconverted CpA ≥ 3 → unconverted");
@@ -1382,7 +1538,7 @@ mod tests {
         let proc = RecordProcessor::new(reference, opts(cph_mask(), 3));
         let recs = parse_sam_records(&[&sam_line(0, 1, "10M", "TATATATATA", "IIIIIIIIII")], 10);
         let mut counters = PerContextCounters::default();
-        proc.tally_record(&recs[0], RecordTrim::default(), &mut counters);
+        proc.tally_record(&recs[0], RecordSkips::default(), &mut counters);
         assert_eq!(counters.unconv[Context::CpA.index()], 0);
         assert_eq!(counters.total[Context::CpA.index()], 5);
         assert!(!proc.decide(&counters));
@@ -1400,9 +1556,51 @@ mod tests {
         let recs =
             parse_sam_records(&[&sam_line(FLAG_REVERSE, 1, "10M", "TGTGTGTGTG", "IIIIIIIIII")], 10);
         let mut counters = PerContextCounters::default();
-        proc.tally_record(&recs[0], RecordTrim::default(), &mut counters);
+        proc.tally_record(&recs[0], RecordSkips::default(), &mut counters);
         // ref G at positions 1,3,5,7,9 (0-based); each has ref[i-1]=T → CpA.
         assert_eq!(counters.unconv[Context::CpA.index()], 5);
         assert_eq!(counters.total[Context::CpA.index()], 5);
+    }
+
+    #[test]
+    fn mask_window_excludes_five_prime_sites_from_tally() {
+        // Same all-unconverted CpA read, but a stored mask window over the first
+        // five positions drops the CpA C's at stored 0/2/4, leaving 6/8 — so the
+        // post-mask tally counts 2, below the count threshold, and the template is
+        // no longer flagged. This is the geometry exclusion the masking path uses.
+        let reference = Reference::from_encoded_contigs(vec![enc("CACACACACA")]);
+        let proc = RecordProcessor::new(reference, opts(cph_mask(), 3));
+        let recs = parse_sam_records(&[&sam_line(0, 1, "10M", "CACACACACA", "IIIIIIIIII")], 10);
+        let skips = RecordSkips { stored: &[(0, 5)], genomic: None };
+        let mut counters = PerContextCounters::default();
+        proc.tally_record(&recs[0], skips, &mut counters);
+        assert_eq!(counters.unconv[Context::CpA.index()], 2, "3 of 5 CpA masked out of the tally");
+        assert_eq!(counters.total[Context::CpA.index()], 2);
+        assert!(!proc.decide(&counters), "2 < count threshold 3 once the masked 5' sites drop");
+    }
+
+    #[test]
+    fn fused_walk_masks_tally_but_records_all_mbias() {
+        // The fused (decision + M-bias) scan must apply the mask window to the
+        // decision tally yet still record *every* site into the M-bias curve, so
+        // the learned curve stays a pre-mask measurement. Same fixture + window.
+        let reference = Reference::from_encoded_contigs(vec![enc("CACACACACA")]);
+        let proc = RecordProcessor::new(reference, opts(cph_mask(), 3));
+        let recs = parse_sam_records(&[&sam_line(0, 1, "10M", "CACACACACA", "IIIIIIIIII")], 10);
+        let skips = RecordSkips { stored: &[(0, 5)], genomic: None };
+        let mut counters = PerContextCounters::default();
+        let mut acc = MbiasAccumulator::new();
+        proc.tally_and_accumulate(&recs[0], skips, &mut counters, &mut acc);
+
+        // Tally: masked 5' sites excluded, exactly as the non-fused path.
+        assert_eq!(counters.unconv[Context::CpA.index()], 2, "fused tally honors the mask window");
+
+        // M-bias: all five CpA observations recorded despite the mask window.
+        let recorded: u64 = acc
+            .cycles(ReadRole::Se, ReadEnd::FivePrime, Context::CpA)
+            .iter()
+            .map(|c| c.total())
+            .sum();
+        assert_eq!(recorded, 5, "M-bias records every site, ignoring the tally mask window");
     }
 }
