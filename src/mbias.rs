@@ -264,23 +264,10 @@ pub(crate) fn detect_mask_length(
     end: ReadEnd,
     p: DetectParams,
 ) -> usize {
-    let cycles = acc.cycles(role, end, Context::CpG);
-    if cycles.is_empty() {
+    let rates = cpg_rates(acc, role, end, p.min_cycle_cov);
+    if rates.is_empty() {
         return 0;
     }
-
-    // Per-cycle CpG methylation rate where coverage is adequate (else NaN).
-    let rates: Vec<f64> =
-        cycles
-            .iter()
-            .map(|cc| {
-                if cc.total >= p.min_cycle_cov {
-                    cc.meth as f64 / cc.total as f64
-                } else {
-                    f64::NAN
-                }
-            })
-            .collect();
 
     let Some(plateau) = estimate_plateau(&rates, p.max_mask) else {
         return 0;
@@ -295,7 +282,35 @@ pub(crate) fn detect_mask_length(
         }
     }
     // No cycle reached the plateau within the cap → mask up to the cap.
-    p.max_mask.min(cycles.len())
+    p.max_mask.min(rates.len())
+}
+
+/// Per-cycle CpG methylation rates for `(role, end)`: `meth / total` where
+/// coverage is adequate, `NaN` for cycles below `min_cycle_cov` (so sparse
+/// cycles don't drive the decision).
+fn cpg_rates(acc: &MbiasAccumulator, role: ReadRole, end: ReadEnd, min_cycle_cov: u64) -> Vec<f64> {
+    acc.cycles(role, end, Context::CpG)
+        .iter()
+        .map(
+            |cc| {
+                if cc.total >= min_cycle_cov { cc.meth as f64 / cc.total as f64 } else { f64::NAN }
+            },
+        )
+        .collect()
+}
+
+/// The estimated CpG methylation plateau for `(role, end)` — the same value
+/// [`detect_mask_length`] derives the mask threshold from. `None` when there is
+/// no usable signal. Exposed so plots can draw the `plateau_fraction × plateau`
+/// detection threshold.
+#[must_use]
+pub(crate) fn cpg_plateau(
+    acc: &MbiasAccumulator,
+    role: ReadRole,
+    end: ReadEnd,
+    p: DetectParams,
+) -> Option<f64> {
+    estimate_plateau(&cpg_rates(acc, role, end, p.min_cycle_cov), p.max_mask)
 }
 
 /// Median of finite per-cycle rates from cycle `max_mask` onward (the region

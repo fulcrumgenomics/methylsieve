@@ -41,7 +41,9 @@
 
 use fgumi_raw_bam::RawRecord;
 
-use crate::mbias::{DetectParams, MbiasAccumulator, ReadEnd, ReadRole, detect_mask_length};
+use crate::mbias::{
+    DetectParams, MbiasAccumulator, ReadEnd, ReadRole, cpg_plateau, detect_mask_length,
+};
 use crate::record::{
     FLAG_FIRST_SEGMENT, FLAG_LAST_SEGMENT, FLAG_MATE_UNMAPPED, FLAG_PAIRED, FLAG_REVERSE,
     FLAG_SECONDARY, FLAG_UNMAPPED, has, read_role, ref_span_for_query_window,
@@ -56,6 +58,12 @@ pub(crate) struct MaskPlan {
     k_se_5p: usize,
     k_se_3p: usize,
     mask_quality: u8,
+    /// CpG methylation plateau per role (by [`ReadRole::index`]) for the 5' end,
+    /// `None` where no plateau was estimable. Combined with `plateau_fraction`
+    /// this is the detection threshold the masks were cut at — exposed for plots.
+    plateau_5p: [Option<f64>; 3],
+    /// The `--mbias-plateau-fraction` the plan was learned with.
+    plateau_fraction: f64,
 }
 
 impl MaskPlan {
@@ -63,12 +71,18 @@ impl MaskPlan {
     #[must_use]
     pub(crate) fn learn(acc: &MbiasAccumulator, detect: DetectParams, mask_quality: u8) -> Self {
         let d = |role, end| detect_mask_length(acc, role, end, detect);
+        let mut plateau_5p = [None; 3];
+        for role in ReadRole::ALL {
+            plateau_5p[role.index()] = cpg_plateau(acc, role, ReadEnd::FivePrime, detect);
+        }
         Self {
             k_r1_5p: d(ReadRole::R1, ReadEnd::FivePrime),
             k_r2_5p: d(ReadRole::R2, ReadEnd::FivePrime),
             k_se_5p: d(ReadRole::Se, ReadEnd::FivePrime),
             k_se_3p: d(ReadRole::Se, ReadEnd::ThreePrime),
             mask_quality,
+            plateau_5p,
+            plateau_fraction: detect.plateau_fraction,
         }
     }
 
@@ -76,7 +90,15 @@ impl MaskPlan {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn explicit(k_r1_5p: usize, k_r2_5p: usize, mask_quality: u8) -> Self {
-        Self { k_r1_5p, k_r2_5p, k_se_5p: 0, k_se_3p: 0, mask_quality }
+        Self {
+            k_r1_5p,
+            k_r2_5p,
+            k_se_5p: 0,
+            k_se_3p: 0,
+            mask_quality,
+            plateau_5p: [None; 3],
+            plateau_fraction: DetectParams::default().plateau_fraction,
+        }
     }
 
     /// The 5' mask length for a role.
@@ -86,6 +108,18 @@ impl MaskPlan {
             ReadRole::R2 => self.k_r2_5p,
             ReadRole::Se => self.k_se_5p,
         }
+    }
+
+    /// The detection threshold (`plateau_fraction × CpG plateau`) for a role's 5'
+    /// end, or `None` when no plateau was estimable. Plots draw this as the cut
+    /// line so the `0.9 × plateau` level is visible against the M-bias curve.
+    pub(crate) fn threshold_5p(&self, role: ReadRole) -> Option<f64> {
+        self.plateau_5p[role.index()].map(|pl| pl * self.plateau_fraction)
+    }
+
+    /// The `--mbias-plateau-fraction` the plan was learned with (for plot labels).
+    pub(crate) fn plateau_fraction(&self) -> f64 {
+        self.plateau_fraction
     }
 
     /// The single-end 3' mask length.
