@@ -83,14 +83,17 @@ pub fn q40(len: usize) -> String {
 
 // ── Reference building ──────────────────────────────────────────────────────
 
-/// Builds a tiny single-line-per-contig FASTA and a matching `.fai` index.
+/// Builds a tiny single-line-per-contig FASTA and (by default) a matching
+/// `.fai` index. Call [`RefBuilder::without_fai`] to exercise the unindexed
+/// sequential load path.
 pub struct RefBuilder {
     contigs: Vec<(String, String)>,
+    write_fai: bool,
 }
 
 impl RefBuilder {
     pub fn new() -> Self {
-        Self { contigs: Vec::new() }
+        Self { contigs: Vec::new(), write_fai: true }
     }
 
     /// Add a contig with the given uppercase ACGT sequence.
@@ -99,7 +102,14 @@ impl RefBuilder {
         self
     }
 
-    /// Write `<path>` and `<path>.fai`. Each contig is a single unwrapped line.
+    /// Skip writing the `.fai`, so the loader takes the sequential fallback.
+    pub fn without_fai(mut self) -> Self {
+        self.write_fai = false;
+        self
+    }
+
+    /// Write `<path>` and (unless [`Self::without_fai`]) `<path>.fai`. Each
+    /// contig is a single unwrapped line.
     pub fn write_to(&self, path: &Path) {
         let mut fa = String::new();
         let mut fai = String::new();
@@ -122,8 +132,10 @@ impl RefBuilder {
             offset = seq_offset + seq.len() as u64 + 1; // + sequence + '\n'
         }
         fs::write(path, fa).expect("write fasta");
-        let fai_path = format!("{}.fai", path.display());
-        fs::write(&fai_path, fai).expect("write fai");
+        if self.write_fai {
+            let fai_path = format!("{}.fai", path.display());
+            fs::write(&fai_path, fai).expect("write fai");
+        }
     }
 }
 

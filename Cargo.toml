@@ -36,7 +36,6 @@ libdeflater = "1.25"
 log = "0.4"
 memchr = "2"
 mimalloc = { version = "0.1", default-features = false }
-noodles-core = "0.20"
 noodles-fasta = "0.62"
 noodles-sam = "0.85"
 ringbuf = "0.5"
@@ -58,3 +57,9 @@ tempfile = "3"
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+# Release codegen plus DWARF symbols, for samply/flamegraph attribution. Kept
+# separate so `release` stays lean/portable; build with `cargo build --profile profiling`.
+[profile.profiling]
+inherits = "release"
+debug = true

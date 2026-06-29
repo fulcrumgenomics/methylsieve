@@ -45,7 +45,7 @@ use crate::mask::{MaskPlan, MaskWindows, apply_windows, compute_mask_windows};
 use crate::mbias::{DetectParams, MbiasAccumulator};
 use crate::raw_reader::RawBamReader;
 use crate::raw_writer::RawBamWriter;
-use crate::reference::{Context, RefEncoding, Reference};
+use crate::reference::{Context, Reference};
 use crate::sam_reader::SamReader;
 use crate::sieve::{DecisionMode, Disposition, ProcessorOptions, RecordProcessor, Stats};
 
@@ -58,30 +58,6 @@ const METHYLSIEVE_BUILD: &str = env!("CARGO_PKG_VERSION");
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // ── Command-line interface ──────────────────────────────────────────────────
-
-/// CLI mirror of [`RefEncoding`] so the kebab-case spellings live with the CLI.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub(crate) enum RefEncodingCli {
-    /// 1 byte per base — fastest, ~3.1 GB for a human genome.
-    #[value(name = "bytes")]
-    Bytes,
-    /// 4-bit packed, 2 bases/byte — ~½ the memory.
-    #[value(name = "nibble")]
-    Nibble,
-    /// 2-bit packed, 4 bases/byte — ~¼ the memory; non-ACGT folded to A.
-    #[value(name = "twobit")]
-    TwoBit,
-}
-
-impl From<RefEncodingCli> for RefEncoding {
-    fn from(c: RefEncodingCli) -> Self {
-        match c {
-            RefEncodingCli::Bytes => RefEncoding::Bytes,
-            RefEncodingCli::Nibble => RefEncoding::Nibble,
-            RefEncodingCli::TwoBit => RefEncoding::TwoBit,
-        }
-    }
-}
 
 /// CLI mirror of [`DecisionMode`] so the kebab-case spellings and per-variant
 /// help live with the CLI.
@@ -259,20 +235,6 @@ pub struct Args {
     /// contig at any time.
     #[arg(short = 'r', long = "reference", help_heading = "Inputs / outputs")]
     pub(crate) reference: PathBuf,
-
-    /// In-memory reference encoding. `twobit` (2-bit, the default) holds the
-    /// genome in ~¼ the memory (~0.8 GB vs ~3.1 GB for a human genome); its
-    /// small CPU cost is hidden when methylsieve is input-rate-limited in a
-    /// pipe. It folds non-ACGT reference bases (N, IUPAC ambiguity) to A: this
-    /// never changes a conversion call (only genuine C/G positions are
-    /// monitored, and those are represented exactly) — it can only relabel the
-    /// CpH/CpG context of a monitored C/G immediately adjacent to a former-N
-    /// (assembly-gap edges; below measurement noise). Use `bytes` (1 byte/base,
-    /// fastest) for a single max-throughput stream that isn't rate-limited, or
-    /// `nibble` (4-bit, ~½ memory) for bit-identical context labeling.
-    #[arg(long = "ref-encoding", value_enum, default_value_t = RefEncodingCli::TwoBit,
-          help_heading = "Inputs / outputs")]
-    pub(crate) ref_encoding: RefEncodingCli,
 
     /// Contexts (comma-separated CpA,CpC,CpT,CpG) counted toward the
     /// unconverted-decision threshold. The default is CpH (CpA,CpC,CpT); CpG is
@@ -658,9 +620,9 @@ fn run(args: Args) -> Result<()> {
         );
     }
 
-    // Load the reference (every @SQ contig, 4-bit encoded) and resolve control
+    // Load the reference (every @SQ contig, 2-bit packed) and resolve control
     // contigs to a per-tid scope map. Both cross-check against the header.
-    let reference = Reference::load(&args.reference, &header, args.ref_encoding.into())
+    let reference = Reference::load(&args.reference, &header)
         .with_context(|| format!("loading reference {}", args.reference.display()))?;
     if !args.quiet {
         eprintln!("methylsieve: Loaded reference {}.", args.reference.display());
@@ -1274,7 +1236,6 @@ mod tests {
             output: None,
             compression_level: CompressionLevel::new(0).unwrap(),
             reference: PathBuf::from("ref.fa"),
-            ref_encoding: RefEncodingCli::Bytes,
             contexts: parse_contexts("CpA,CpC,CpT").unwrap(),
             mode: DecisionModeCli::Adaptive,
             max_unconverted_count: 3,

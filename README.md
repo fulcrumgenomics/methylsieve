@@ -362,12 +362,16 @@ control.
 
 ### Reference memory
 
-The genome is preloaded. `--ref-encoding` selects the layout: `twobit` (2-bit,
-default) uses ~¼ the memory (~0.8 GB for a human genome), `nibble` (4-bit) ~½, and
-`bytes` (1 byte/base) is fastest. `twobit` folds non-ACGT bases (N, IUPAC) to A,
-which never changes a conversion call and only relabels the context of a monitored
-C/G adjacent to a former N; `nibble` and `bytes` preserve context labeling
-exactly.
+The genome is preloaded once at startup, 2-bit packed (~0.8 GB for a human
+genome). Packing folds non-ACGT bases (N, IUPAC ambiguity) to A — this never
+changes a conversion call (only genuine C/G positions are monitored, and those
+are exact) and only relabels the context of a monitored C/G immediately adjacent
+to a former N (assembly-gap edges, below measurement noise).
+
+Loading is index-driven: with a `samtools faidx` `.fai` beside the FASTA, each
+contig is read by its byte span in one pass that strips newlines and packs in a
+single sweep. Without a `.fai` it falls back to a slower sequential read (and
+says so) — indexing is recommended for the fastest startup.
 
 ## Examples
 

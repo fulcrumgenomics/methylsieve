@@ -986,7 +986,6 @@ dependencies = [
  "memchr",
  "mimalloc",
  "noodles-bam",
- "noodles-core",
  "noodles-fasta",
  "noodles-sam",
  "noodles-util",

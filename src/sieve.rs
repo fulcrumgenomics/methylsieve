@@ -35,7 +35,7 @@ use crate::record::{
     FLAG_SUPPLEMENTARY, FLAG_UNMAPPED, five_prime_ref_span, has, is_primary_mapped, monitor_c_of,
     read_role, three_prime_ref_span,
 };
-use crate::reference::{BASE_A, BASE_C, BASE_G, BASE_T, Context, RefCodes, RefEncoding, Reference};
+use crate::reference::{BASE_A, BASE_C, BASE_G, BASE_T, Context, Reference, TwoBitCodes};
 use crate::{ContextMask, TagSpec};
 
 // ── Processor ───────────────────────────────────────────────────────────────
@@ -401,37 +401,21 @@ impl RecordProcessor {
     }
 
     /// Walk one record's aligned positions and add its monitored cytosines to
-    /// `counters`, dispatching once on the reference encoding so the inner walk
-    /// is monomorphized per [`RefCodes`] layout.
+    /// `counters`.
     fn tally_record(&self, rec: &RawRecord, skips: RecordSkips, counters: &mut PerContextCounters) {
-        let tid = rec.ref_id();
-        match self.reference.encoding() {
-            RefEncoding::Bytes => {
-                if let Some(c) = self.reference.byte_codes(tid) {
-                    self.tally_aligned(rec, c, skips, counters);
-                }
-            }
-            RefEncoding::Nibble => {
-                if let Some(c) = self.reference.nibble_codes(tid) {
-                    self.tally_aligned(rec, c, skips, counters);
-                }
-            }
-            RefEncoding::TwoBit => {
-                if let Some(c) = self.reference.twobit_codes(tid) {
-                    self.tally_aligned(rec, c, skips, counters);
-                }
-            }
+        if let Some(c) = self.reference.codes(rec.ref_id()) {
+            self.tally_aligned(rec, c, skips, counters);
         }
     }
 
-    /// Walk one record's aligned positions over a concrete reference encoding.
+    /// Walk one record's aligned positions over its reference contig.
     ///
     /// The inner per-aligned-base work (ref-base check → context → BQ →
     /// read-base compare → counter bump) is the hot path, run by [`tally_span`].
-    fn tally_aligned<R: RefCodes + Copy>(
+    fn tally_aligned(
         &self,
         rec: &RawRecord,
-        refc: R,
+        refc: TwoBitCodes<'_>,
         skips: RecordSkips,
         counters: &mut PerContextCounters,
     ) {
@@ -509,28 +493,13 @@ impl RecordProcessor {
         counters: &mut PerContextCounters,
         acc: &mut MbiasAccumulator,
     ) {
-        let tid = rec.ref_id();
-        match self.reference.encoding() {
-            RefEncoding::Bytes => {
-                if let Some(c) = self.reference.byte_codes(tid) {
-                    self.fused_walk(rec, c, skips, counters, acc);
-                }
-            }
-            RefEncoding::Nibble => {
-                if let Some(c) = self.reference.nibble_codes(tid) {
-                    self.fused_walk(rec, c, skips, counters, acc);
-                }
-            }
-            RefEncoding::TwoBit => {
-                if let Some(c) = self.reference.twobit_codes(tid) {
-                    self.fused_walk(rec, c, skips, counters, acc);
-                }
-            }
+        if let Some(c) = self.reference.codes(rec.ref_id()) {
+            self.fused_walk(rec, c, skips, counters, acc);
         }
     }
 
     /// Single-scan decision tally + M-bias accumulation for one primary mapped
-    /// record over a concrete reference encoding (monomorphized per [`RefCodes`]).
+    /// record over its reference contig.
     ///
     /// The scan visits the full aligned range — every called cytosine — and
     /// records each into the M-bias accumulator at its 5' cycle (reverse records
@@ -544,10 +513,10 @@ impl RecordProcessor {
     /// exclusions, so the learned curve stays a pre-mask measurement even when the
     /// tally drops the masked bases. `classify_site` and the per-base reference
     /// probe thus run once instead of once per walk.
-    fn fused_walk<R: RefCodes + Copy>(
+    fn fused_walk(
         &self,
         rec: &RawRecord,
-        refc: R,
+        refc: TwoBitCodes<'_>,
         skips: RecordSkips,
         counters: &mut PerContextCounters,
         acc: &mut MbiasAccumulator,
@@ -634,25 +603,10 @@ impl RecordProcessor {
         }
     }
 
-    /// Dispatch [`Self::accumulate_mbias`] for one record on the reference encoding.
+    /// Dispatch [`Self::accumulate_mbias`] for one record.
     fn accumulate_mbias_record(&self, rec: &RawRecord, acc: &mut MbiasAccumulator) {
-        let tid = rec.ref_id();
-        match self.reference.encoding() {
-            RefEncoding::Bytes => {
-                if let Some(c) = self.reference.byte_codes(tid) {
-                    self.mbias_walk(rec, c, acc);
-                }
-            }
-            RefEncoding::Nibble => {
-                if let Some(c) = self.reference.nibble_codes(tid) {
-                    self.mbias_walk(rec, c, acc);
-                }
-            }
-            RefEncoding::TwoBit => {
-                if let Some(c) = self.reference.twobit_codes(tid) {
-                    self.mbias_walk(rec, c, acc);
-                }
-            }
+        if let Some(c) = self.reference.codes(rec.ref_id()) {
+            self.mbias_walk(rec, c, acc);
         }
     }
 
@@ -661,7 +615,7 @@ impl RecordProcessor {
     /// true 5' cycle (and the 3' end for single-end reads). This learn-phase scan
     /// is cold (only the buffered prefix), so the few lines are inlined to match
     /// `fused_walk` rather than abstracted behind a shared helper.
-    fn mbias_walk<R: RefCodes + Copy>(&self, rec: &RawRecord, refc: R, acc: &mut MbiasAccumulator) {
+    fn mbias_walk(&self, rec: &RawRecord, refc: TwoBitCodes<'_>, acc: &mut MbiasAccumulator) {
         let seq_len = rec.l_seq() as usize;
         let pos = rec.pos();
         if seq_len == 0 || pos < 0 {
@@ -1170,9 +1124,9 @@ struct SpanParams<'a> {
 /// ([`RecordProcessor::fused_walk`]) so the two agree on context/edge/drop rules;
 /// `#[inline]` so it folds into the decision hot loop with no call overhead.
 #[inline]
-fn classify_site<R: RefCodes>(
+fn classify_site(
     rec: &RawRecord,
-    refc: R,
+    refc: TwoBitCodes<'_>,
     rp: usize,
     gp: usize,
     monitor_c: bool,
@@ -1206,9 +1160,9 @@ fn classify_site<R: RefCodes>(
 /// Classify a single already-matched monitored cytosine and record it into the
 /// decision counters. `refc[gp]` is assumed to equal the monitored base.
 #[inline]
-fn tally_site<R: RefCodes>(
+fn tally_site(
     rec: &RawRecord,
-    refc: R,
+    refc: TwoBitCodes<'_>,
     rp: usize,
     gp: usize,
     p: &SpanParams,
@@ -1227,9 +1181,9 @@ fn tally_site<R: RefCodes>(
 /// threaded as scalars (not a `Range`) so they stay in registers on the hot path.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn tally_run<R: RefCodes + Copy>(
+fn tally_run(
     rec: &RawRecord,
-    refc: R,
+    refc: TwoBitCodes<'_>,
     rp_start: usize,
     gp_start: usize,
     lo: usize,
@@ -1249,10 +1203,9 @@ fn tally_run<R: RefCodes + Copy>(
     }
 }
 
-/// Scalar reference-span tally generic over the reference encoding: walk `len`
-/// aligned positions from read position `rp_start` / reference position
-/// `gp_start`. Monomorphized per [`RefCodes`] impl, so each encoding gets its
-/// own branch-free-on-layout loop.
+/// Scalar reference-span tally: walk `len` aligned positions from read position
+/// `rp_start` / reference position `gp_start`, comparing against the 2-bit packed
+/// reference in its native space (no per-base decode).
 ///
 /// Any genomic skip (mate terminus / PE-overlap dedup) is carved out of the scan
 /// *range* rather than tested per base: the common no-skip case is a single tight
@@ -1261,9 +1214,9 @@ fn tally_run<R: RefCodes + Copy>(
 /// excluded middle. (Keeping the skip handling inline matters: any out-of-line
 /// helper here stops `tally_span` from fusing into the caller and regresses the
 /// hot path.)
-fn tally_span<R: RefCodes + Copy>(
+fn tally_span(
     rec: &RawRecord,
-    refc: R,
+    refc: TwoBitCodes<'_>,
     rp_start: usize,
     gp_start: usize,
     len: usize,

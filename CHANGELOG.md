@@ -40,6 +40,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `--mbias-mask` supersedes `--ignore-template-ends`: when masking is enabled the
   manual end-trim is forced to 0 (both target the same fragment-end bias), with a
   warning logged if a non-zero value was set explicitly.
+- Reference loading is now index-driven and single-pass: with a `.fai` beside the
+  FASTA, each contig is read by its byte span in one bulk read that strips
+  newlines (by the index line geometry) and packs to 2-bit in a single sweep,
+  building each packed byte from its four bases in a register, instead of the
+  previous read → encode → pack three-pass loop with a per-base read-modify-write.
+  An unindexed FASTA falls back to a sequential read (logged). On a human genome
+  this cuts startup user-CPU ~4.6× (≈8.5 s → ≈1.8 s) and peak load memory ~22%
+  (≈1.19 GB → ≈0.93 GB), and removes the direct `noodles-core` dependency.
+
+### Removed
+- **Breaking:** `--ref-encoding` and the `bytes` (1 byte/base) and `nibble`
+  (4-bit) reference layouts. methylsieve now always uses the 2-bit packing that
+  was the default, dropping the unused layout options and the code generic over
+  them. The 2-bit fold of non-ACGT bases to A is unchanged (see "Reference
+  memory" in the README).
 
 ## [0.1.0] - 2026-06-13
 
