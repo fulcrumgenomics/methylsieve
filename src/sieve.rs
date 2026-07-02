@@ -603,82 +603,26 @@ impl RecordProcessor {
     }
 
     /// Accumulate per-cycle M-bias for one template's primary mapped **genome**
-    /// records, **without** tallying the decision. Used in the masking learn phase,
-    /// where the curve must be measured pre-mask but the unconverted decision is
-    /// deferred to the drain pass (post-mask). Mirrors the M-bias half of
-    /// [`Self::fused_walk`] — every classified cytosine at its true cycle, no
-    /// trim, no dedup — so the learned curve is identical to the metrics path's.
-    /// Control-contig reads are excluded (see [`Self::is_genome_tid`]).
+    /// records, **without** committing the decision. Used in the masking learn
+    /// phase, where the curve is measured pre-mask but the unconverted decision is
+    /// deferred to the post-mask drain.
+    ///
+    /// Reuses the streaming [`Self::fused_walk`] (M-bias + decision tally) and
+    /// **discards its tally**: the M-bias half is byte-identical to the streaming
+    /// path's, so the learned curve matches exactly, and passing no exclusions
+    /// (`RecordSkips::default`) records every site as M-bias requires. The learn
+    /// phase is a one-time buffered-prefix cost, so the thrown-away tally work is
+    /// immaterial — and sharing one walk keeps the two from ever diverging on the
+    /// cycle mapping. Control-contig reads are excluded (see [`Self::is_genome_tid`]).
     pub(crate) fn accumulate_mbias(&self, block: &[RawRecord], acc: &mut MbiasAccumulator) {
+        let mut discard = PerContextCounters::default();
         for rec in block {
             if self.is_evidence_record(rec)
                 && is_primary_mapped(rec.flags())
                 && self.is_genome_tid(rec.ref_id())
+                && let Some(c) = self.reference.codes(rec.ref_id())
             {
-                self.accumulate_mbias_record(rec, acc);
-            }
-        }
-    }
-
-    /// Dispatch [`Self::accumulate_mbias`] for one record.
-    fn accumulate_mbias_record(&self, rec: &RawRecord, acc: &mut MbiasAccumulator) {
-        if let Some(c) = self.reference.codes(rec.ref_id()) {
-            self.mbias_walk(rec, c, acc);
-        }
-    }
-
-    /// M-bias-only scan of one primary mapped record (no decision tally). The
-    /// counting twin is [`Self::fused_walk`]; both record the same sites at their
-    /// true 5' cycle (and the 3' end for single-end reads). This learn-phase scan
-    /// is cold (only the buffered prefix), so the few lines are inlined to match
-    /// `fused_walk` rather than abstracted behind a shared helper.
-    fn mbias_walk(&self, rec: &RawRecord, refc: TwoBitCodes<'_>, acc: &mut MbiasAccumulator) {
-        let seq_len = rec.l_seq() as usize;
-        let pos = rec.pos();
-        if seq_len == 0 || pos < 0 {
-            return;
-        }
-        let ref_len = refc.len();
-        let f = rec.flags();
-        let monitor_c = monitor_c_of(f);
-        let monitored_base = if monitor_c { BASE_C } else { BASE_G };
-        let role = read_role(f);
-        let is_se = role == ReadRole::Se;
-        let reverse = has(f, FLAG_REVERSE);
-        let min_bq = self.opts.min_base_quality;
-
-        let mut read_pos = 0usize;
-        let mut ref_pos = pos as usize;
-        for op in rec.cigar_ops_iter() {
-            let len = (op >> 4) as usize;
-            match op & 0xf {
-                0 | 7 | 8 => {
-                    let k1 = len
-                        .min(seq_len.saturating_sub(read_pos))
-                        .min(ref_len.saturating_sub(ref_pos));
-                    for k in 0..k1 {
-                        let gp = ref_pos + k;
-                        if !refc.monitors(gp, monitored_base) {
-                            continue;
-                        }
-                        let rp = read_pos + k;
-                        if let Some((ctx, unconverted)) =
-                            classify_site(rec, refc, rp, gp, monitor_c, min_bq, ref_len)
-                        {
-                            let cycle_5p = if reverse { seq_len - 1 - rp } else { rp };
-                            acc.record(role, ReadEnd::FivePrime, ctx, cycle_5p, unconverted);
-                            if is_se {
-                                let c3 = seq_len - 1 - cycle_5p;
-                                acc.record(role, ReadEnd::ThreePrime, ctx, c3, unconverted);
-                            }
-                        }
-                    }
-                    read_pos += len;
-                    ref_pos += len;
-                }
-                1 | 4 => read_pos += len,
-                2 | 3 => ref_pos += len,
-                _ => {}
+                self.fused_walk(rec, c, RecordSkips::default(), &mut discard, acc);
             }
         }
     }
