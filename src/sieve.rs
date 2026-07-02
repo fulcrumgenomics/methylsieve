@@ -57,17 +57,15 @@ impl RecordProcessor {
         Self { reference, opts, has_controls }
     }
 
-    /// Process one QNAME block: classify, tally, decide, propagate, emit.
-    ///
-    /// # Errors
-    /// Returns an error if the block is not query-grouped (no primary present)
-    /// or the output write fails.
     /// Classify, tally, accumulate M-bias, decide, and **stamp** every record of
     /// the template with the conversion tag / flag (no write). Returns whether
     /// the template should be emitted ([`Disposition::Keep`]) or dropped
     /// (`--remove-unconverted`). The caller owns emission, so it can buffer the
     /// stamped records (M-bias learn phase), mask them, or write them straight
     /// through.
+    ///
+    /// # Errors
+    /// Returns an error if the block is not query-grouped (no primary present).
     pub(crate) fn process_block(
         &self,
         block: &mut [RawRecord],
@@ -157,8 +155,12 @@ impl RecordProcessor {
                 // a superset of the decision's, so one walk feeds both. Supplementary
                 // evidence — and every record when M-bias is off — takes the plain
                 // decision walk, leaving the masking-off hot path untouched.
+                // Control-contig reads are tallied (for the control summary) but
+                // excluded from M-bias, so spike-ins never skew the learned curve.
                 match mbias.as_deref_mut() {
-                    Some(acc) if is_primary_mapped(rec.flags()) => {
+                    Some(acc)
+                        if is_primary_mapped(rec.flags()) && self.is_genome_tid(rec.ref_id()) =>
+                    {
                         self.tally_and_accumulate(rec, skips, &mut counters, acc);
                     }
                     _ => self.tally_record(rec, skips, &mut counters),
@@ -589,15 +591,30 @@ impl RecordProcessor {
         }
     }
 
-    /// Accumulate per-cycle M-bias for one template's primary mapped records,
-    /// **without** tallying the decision. Used in the masking learn phase, where
-    /// the curve must be measured pre-mask but the unconverted decision is
+    /// Whether `tid` maps to the genome scope (not a `--control-contig`). M-bias
+    /// is learned and reported only from genome reads, so spike-in controls
+    /// (methylated pUC19 / unmethylated lambda) never skew the CpG curve, the
+    /// frozen mask lengths, or `mbias.tsv`. Short-circuits when no controls are
+    /// configured so the common case pays nothing.
+    #[inline]
+    fn is_genome_tid(&self, tid: i32) -> bool {
+        !self.has_controls
+            || (tid >= 0 && self.opts.scope_of_tid.get(tid as usize).copied().flatten().is_none())
+    }
+
+    /// Accumulate per-cycle M-bias for one template's primary mapped **genome**
+    /// records, **without** tallying the decision. Used in the masking learn phase,
+    /// where the curve must be measured pre-mask but the unconverted decision is
     /// deferred to the drain pass (post-mask). Mirrors the M-bias half of
     /// [`Self::fused_walk`] — every classified cytosine at its true cycle, no
     /// trim, no dedup — so the learned curve is identical to the metrics path's.
+    /// Control-contig reads are excluded (see [`Self::is_genome_tid`]).
     pub(crate) fn accumulate_mbias(&self, block: &[RawRecord], acc: &mut MbiasAccumulator) {
         for rec in block {
-            if self.is_evidence_record(rec) && is_primary_mapped(rec.flags()) {
+            if self.is_evidence_record(rec)
+                && is_primary_mapped(rec.flags())
+                && self.is_genome_tid(rec.ref_id())
+            {
                 self.accumulate_mbias_record(rec, acc);
             }
         }
@@ -691,6 +708,10 @@ impl RecordProcessor {
         // The proportion is only estimable at/above the site floor; below it the
         // proportion test abstains.
         let at_floor = monitored >= u64::from(self.opts.min_sites);
+        // The count test can only ever fire with at least `max_unconverted_count`
+        // monitored sites — you cannot reach N unconverted with fewer than N
+        // sites. Below that the count arm is not merely unhit, it is *unreachable*.
+        let count_reachable = monitored >= u64::from(self.opts.max_unconverted_count);
         let frac_hit =
             at_floor && (unconv as f64) / (monitored as f64) > self.opts.max_unconverted_fraction;
         let (unconverted, by) = match self.opts.mode {
@@ -708,11 +729,20 @@ impl RecordProcessor {
                 }
             }
         };
-        // Insufficient evidence to classify: nothing flagged it and the proportion
-        // test couldn't apply (below the site floor, including zero sites). The
-        // verdict stands (converted), but the *reason* is "too few sites" rather
-        // than a test that actually rendered a call.
-        if !unconverted && !at_floor {
+        // A not-flagged template is "too few sites" only when the test that would
+        // apply could not have rendered a verdict at all — not merely when it came
+        // back negative. The proportion arm needs the site floor; the count arm
+        // needs at least `max_unconverted_count` sites to be reachable. Modes that
+        // fall back to the count arm (Count, Either, Adaptive) are therefore "too
+        // few" only below the count threshold, not merely below the proportion
+        // floor — a template with enough sites to reach the count was genuinely
+        // checked (and cleared) by the count arm.
+        let checkable = match self.opts.mode {
+            DecisionMode::Count => count_reachable,
+            DecisionMode::Proportion => at_floor,
+            DecisionMode::Either | DecisionMode::Adaptive => at_floor || count_reachable,
+        };
+        if !unconverted && !checkable {
             return (false, DecidedBy::TooFewSites);
         }
         (unconverted, by)
@@ -921,9 +951,10 @@ impl TemplateTermini {
 ///
 /// - `stored`: half-open **stored read-position** intervals — the
 ///   `--ignore-template-ends` 5'/3' trims *and* the M-bias mask windows, unified.
-///   Sorted and merged, so the common case is empty (no trim, no mask) and the
-///   hot path skips the machinery entirely. May be interior (a propagated mask
-///   overhang), so it is a true interval set, never a 5'/3' length pair.
+///   Empty in the common case (no trim, no mask), so the hot path skips the
+///   machinery entirely; `tally_span` sorts and merges them when present (the
+///   caller does not). May be interior (a propagated mask overhang), so it is a
+///   true interval set, never a 5'/3' length pair.
 /// - `genomic`: a single **reference-position** interval — the PE-overlap dedup
 ///   region or an intruding mate terminus (the overlap subsumes the terminus when
 ///   both apply). Kept genomic rather than converted to stored: it is naturally a
@@ -960,7 +991,8 @@ pub(crate) struct Stats {
     /// Genome decision histogram keyed by `(checked_sites, unconverted_sites)`
     /// over the threshold contexts → template count. Populated only when
     /// `record_matrix` is set (drives the `conversion-matrix.tsv` output under
-    /// `--metrics-prefix`).
+    /// `--metrics-prefix`). Note the key stores *unconverted* sites; the TSV emits
+    /// the complementary `converted_sites` (= checked − unconverted) for readers.
     pub(crate) conversion_matrix: BTreeMap<(u64, u64), u64>,
 }
 
@@ -1104,8 +1136,9 @@ struct SpanParams<'a> {
     pub(crate) seq_len: usize,
     /// Contig length (reference positions are valid in `0..ref_len`).
     pub(crate) ref_len: usize,
-    /// Stored read-position intervals to exclude (trims ∪ mask windows), sorted
-    /// and merged. Empty in the hot path (no trim, no masking).
+    /// Stored read-position intervals to exclude (trims ∪ mask windows), in
+    /// arrival order (`tally_span` sorts and merges them). Empty in the hot path
+    /// (no trim, no masking).
     pub(crate) stored_skips: &'a [(usize, usize)],
     /// A single reference half-open interval `[start, end)` to skip: the PE-overlap
     /// dedup region, or the mate's template terminus that intrudes into this read.
@@ -1248,30 +1281,30 @@ fn tally_span(
     // General path (trim and/or masking active): gather every exclusion as a `k`
     // range — stored intervals via `rp`, the genomic skip via `gp` — then tally
     // the gaps between them. Both inputs collapse to the same `k` offset, so one
-    // mechanism covers trims, mask windows, and the dedup skip alike. The buffer
-    // is fixed-size: a record carries at most a handful of disjoint exclusions.
-    const MAX_EXCL: usize = 8;
-    let mut ex: [(usize, usize); MAX_EXCL] = [(0, 0); MAX_EXCL];
-    let mut n = 0;
+    // mechanism covers trims, mask windows, and the dedup skip alike. Inline
+    // capacity covers the usual handful of exclusions; a pathological record (many
+    // propagated mask windows) spills to the heap rather than silently dropping
+    // intervals — dropping would leave bases masked in the BAM but still counted
+    // in the tally, breaking the "one geometry drives both" invariant.
+    let mut ex: SmallVec<[(usize, usize); 8]> = SmallVec::new();
     for &(a, b) in p.stored_skips {
         let lo = a.saturating_sub(rp_start).min(k1);
         let hi = b.saturating_sub(rp_start).min(k1);
-        if lo < hi && n < MAX_EXCL {
-            ex[n] = (lo, hi);
-            n += 1;
+        if lo < hi {
+            ex.push((lo, hi));
         }
     }
     if let Some((s, e)) = p.skip {
         let lo = s.saturating_sub(gp_start).min(k1);
         let hi = e.saturating_sub(gp_start).min(k1);
-        if lo < hi && n < MAX_EXCL {
-            ex[n] = (lo, hi);
-            n += 1;
+        if lo < hi {
+            ex.push((lo, hi));
         }
     }
-    ex[..n].sort_unstable();
+    ex.sort_unstable();
 
     // Walk the complement of the merged exclusions over `[0, k1)`.
+    let n = ex.len();
     let mut cur = 0;
     let mut i = 0;
     while i < n {
@@ -1409,20 +1442,34 @@ mod tests {
 
     #[test]
     fn classify_reports_decided_by_and_matches_decide() {
-        // Zero sites, or below the floor with nothing flagging it → too few sites
-        // to classify, regardless of mode.
+        // "Too few sites" means the applied test could not render a verdict at all,
+        // not merely that it came back negative. The count arm needs enough sites
+        // to *reach* the threshold (`max_unconverted_count`); the proportion arm
+        // needs the site floor. With zero sites nothing can be checked in any mode.
         let d = decider(DecisionMode::Adaptive, 3, 0.05, 40);
         assert_eq!(d.classify(0, 0), (false, DecidedBy::TooFewSites));
-        assert_eq!(d.classify(1, 10), (false, DecidedBy::TooFewSites), "below floor, not flagged");
+        // Below the count threshold (2 < 3): count can never fire, so genuinely
+        // too few — even in adaptive/count/either.
+        assert_eq!(d.classify(1, 2), (false, DecidedBy::TooFewSites), "unreachable count");
+        // Enough sites to reach the count (10 ≥ 3) but below the proportion floor:
+        // the count arm genuinely checked it (and cleared it), so it is a `count`
+        // verdict, not `too_few_sites`.
+        assert_eq!(d.classify(1, 10), (false, DecidedBy::Count), "count-checkable below floor");
 
-        // Count mode reports the count arm when it can render a verdict — a flag
-        // (any site count) or a non-flag with enough sites.
+        // Count mode reports the count arm whenever the count is reachable (flag or
+        // not); it is only "too few" below the count threshold itself.
         let c = decider(DecisionMode::Count, 3, 0.05, 40);
         assert_eq!(c.classify(3, 10), (true, DecidedBy::Count), "count flags regardless of floor");
-        assert_eq!(c.classify(2, 50), (false, DecidedBy::Count), "at floor, count says converted");
-        assert_eq!(c.classify(2, 10), (false, DecidedBy::TooFewSites), "below floor, not flagged");
+        assert_eq!(c.classify(2, 50), (false, DecidedBy::Count), "reachable, count says converted");
+        assert_eq!(c.classify(2, 10), (false, DecidedBy::Count), "reachable below floor → count");
+        assert_eq!(
+            c.classify(2, 2),
+            (false, DecidedBy::TooFewSites),
+            "unreachable count → too few"
+        );
 
-        // Proportion mode: the rate at/above the floor; below it there is too little.
+        // Proportion mode: the rate at/above the floor; below it the rate is
+        // unestimable, so too few regardless of how many (sub-floor) sites there are.
         let p = decider(DecisionMode::Proportion, 3, 0.05, 40);
         assert_eq!(p.classify(5, 10), (false, DecidedBy::TooFewSites));
         assert_eq!(p.classify(5, 50), (true, DecidedBy::Proportion));
@@ -1432,13 +1479,19 @@ mod tests {
         assert_eq!(d.classify(3, 10), (true, DecidedBy::Count));
         assert_eq!(d.classify(1, 50), (false, DecidedBy::Proportion));
 
-        // Either OR's the two; below the floor a non-flag is still too few sites.
+        // Either OR's the two; reachable-by-count below the floor is an `either`
+        // verdict, and only sub-count-threshold is too few.
         let e = decider(DecisionMode::Either, 3, 0.05, 40);
         assert_eq!(e.classify(3, 10), (true, DecidedBy::Either));
-        assert_eq!(e.classify(2, 10), (false, DecidedBy::TooFewSites));
+        assert_eq!(e.classify(2, 10), (false, DecidedBy::Either), "reachable below floor → either");
+        assert_eq!(
+            e.classify(1, 2),
+            (false, DecidedBy::TooFewSites),
+            "unreachable count → too few"
+        );
 
         // classify(.0) can never drift from decide() over the same counts.
-        for &(u, t) in &[(0, 0), (3, 10), (2, 10), (5, 50), (1, 50), (40, 100)] {
+        for &(u, t) in &[(0, 0), (3, 10), (2, 10), (2, 2), (5, 50), (1, 50), (40, 100)] {
             assert_eq!(d.classify(u, t).0, d.decide(&cph_counters(u, t)), "u={u} t={t}");
         }
     }
@@ -1555,5 +1608,26 @@ mod tests {
             .map(|c| c.total())
             .sum();
         assert_eq!(recorded, 5, "M-bias records every site, ignoring the tally mask window");
+    }
+
+    #[test]
+    fn tally_honors_more_than_eight_windows() {
+        // A record can carry more than eight disjoint mask windows (many mate
+        // windows propagated onto a chimeric template). Every window must be
+        // excluded from the tally — matching what `apply_windows` masks in the
+        // BAM — rather than the 9th+ being silently dropped and counted.
+        let seq = "CA".repeat(20); // 40 bp: a CpA C at every even stored position
+        let reference = Reference::from_encoded_contigs(vec![enc(&seq)]);
+        let proc = RecordProcessor::new(reference, opts(cph_mask(), 3));
+        let qual = "I".repeat(40);
+        let recs = parse_sam_records(&[&sam_line(0, 1, "40M", &seq, &qual)], 40);
+        // Nine disjoint single-base windows over the CpA C's at stored 0,2,…,16.
+        let windows: Vec<(usize, usize)> = (0..9).map(|k| (2 * k, 2 * k + 1)).collect();
+        let skips = RecordSkips { stored: &windows, genomic: None };
+        let mut counters = PerContextCounters::default();
+        proc.tally_record(&recs[0], skips, &mut counters);
+        // 20 CpA total, 9 masked → 11 remain. (A fixed eight-slot buffer would
+        // drop the 9th window and leave 12.)
+        assert_eq!(counters.total[Context::CpA.index()], 11, "all nine windows honored");
     }
 }

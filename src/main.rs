@@ -422,8 +422,9 @@ pub struct Args {
 const SHORT_ABOUT: &str = "Tag or filter unconverted reads in bisulfite / EM-seq SAM/BAM files.";
 const LONG_ABOUT: &str = "Tag or filter incompletely-converted reads in directional bisulfite or \
 EM-seq data.\n\
-Makes one per-template decision using all of a QNAME's primary and supplementary records, \
-propagates it to every record, and emits a per-context / per-spike-in conversion-rate TSV. \
+Makes one per-template decision using all of a QNAME's primary and supplementary records \
+and propagates it to every record; with --metrics-prefix it also writes per-context / \
+per-spike-in conversion and M-bias metrics. \
 Input must be query-grouped and should be adapter-trimmed first: untrimmed adapter \
 read-through on short inserts can be force-aligned and read as spurious unconverted CpH. \
 Output is always BAM.";

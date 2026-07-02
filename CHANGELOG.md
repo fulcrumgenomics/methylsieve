@@ -56,6 +56,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them. The 2-bit fold of non-ACGT bases to A is unchanged (see "Reference
   memory" in the README).
 
+### Fixed
+- The threaded BAM writer no longer hangs if the downstream consumer closes the
+  pipe (EPIPE) or the disk fills mid-write: the IO error is now surfaced from the
+  next `write`/`finish` instead of blocking forever on a full ring.
+- M-bias learning and `mbias.tsv` exclude `--control-contig` reads, so spike-in
+  methylation (e.g. methylated pUC19 / unmethylated lambda) no longer skews the
+  learned 5'/3' mask lengths or the reported per-cycle curve. Control reads are
+  still tallied into their own summary rows.
+- `--mbias-mask`: a record with more than eight combined exclusion intervals
+  (many propagated mate windows on a chimeric template) no longer has the excess
+  intervals silently counted in the decision tally while masked in the BAM — all
+  intervals are honored.
+- `too_few_sites` (the `decided_by` label in `conversion-matrix.tsv`) now marks
+  only templates the applied test genuinely could not evaluate. For count-based
+  modes (`count`, and the count fallback of `either`/`adaptive`) that means fewer
+  monitored sites than `--max-unconverted-count` — where the count can never be
+  reached — rather than merely below the proportion floor `--min-sites`.
+
 ## [0.1.0] - 2026-06-13
 
 ### Added

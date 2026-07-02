@@ -152,7 +152,8 @@ impl TwoBitCodes<'_> {
         let val = (self.data[pos >> 2] >> ((pos & 3) * 2)) & 0x3;
         val == code.trailing_zeros() as u8
     }
-    /// Top-strand context implied by the 3' neighbor base at `pos` (`ref[i+1]`).
+    /// Top-strand context implied by the base at `pos`, which the caller passes as
+    /// the monitored C's 3' neighbor (`gp + 1`).
     #[inline]
     pub(crate) fn ctx_top(&self, pos: usize) -> Option<Context> {
         // 2-bit value 0/1/2/3 (A/C/G/T) indexes the contexts CpA/CpC/CpG/CpT
@@ -161,8 +162,8 @@ impl TwoBitCodes<'_> {
         let val = (self.data[pos >> 2] >> ((pos & 3) * 2)) & 0x3;
         Some(Context::ALL[val as usize])
     }
-    /// Bottom-strand context implied by the 5' neighbor base at `pos`
-    /// (`ref[i-1]`, complemented).
+    /// Bottom-strand context implied by the base at `pos`, which the caller passes
+    /// as the monitored G's 5' neighbor (`gp - 1`), complemented (A↔T, C↔G).
     #[inline]
     pub(crate) fn ctx_bottom(&self, pos: usize) -> Option<Context> {
         // Bottom strand uses the complement of the neighbor: A↔T, C↔G, which on
@@ -360,6 +361,16 @@ impl Reference {
             }
 
             let (line_bases, line_width) = (g.line_bases as usize, g.line_width as usize);
+            // A well-formed .fai has line_width >= line_bases > 0 (the terminator
+            // is the difference). A malformed/hand-edited index that violates this
+            // would make total_sequence_bytes mis-stride and silently pack a wrong
+            // reference — reject it. noodles' .fai reader does not validate this.
+            if bam_len > 0 && (line_bases == 0 || line_width < line_bases) {
+                bail!(
+                    "Corrupt .fai for contig '{name_str}': line_bases={line_bases}, \
+                     line_width={line_width} (need line_width >= line_bases > 0)."
+                );
+            }
             let total = total_sequence_bytes(bam_len, line_bases, line_width);
             reader
                 .get_mut()
@@ -440,9 +451,12 @@ impl Reference {
     }
 }
 
-/// The sibling `.fai` path (`<fasta>.fai`) if it exists.
+/// The sibling `.fai` path (`<fasta>.fai`) if it exists. Built by appending to
+/// the path's raw bytes (not `Display`) so non-UTF-8 paths are preserved.
 fn fai_path(path: &Path) -> Option<std::path::PathBuf> {
-    let candidate = std::path::PathBuf::from(format!("{}.fai", path.display()));
+    let mut candidate = path.as_os_str().to_os_string();
+    candidate.push(".fai");
+    let candidate = std::path::PathBuf::from(candidate);
     candidate.exists().then_some(candidate)
 }
 

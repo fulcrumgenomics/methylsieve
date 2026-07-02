@@ -264,8 +264,8 @@ pub(crate) fn write_matrix_pdf(
     let pct = if total > 0 { 100.0 * unconverted as f64 / total as f64 } else { 0.0 };
     let title = format!(
         "{contexts} Conversion in Templates from {sample}\n\n{} Templates · {} ({pct:.1}%) Flagged as Unconverted",
-        count_label(total as f64),
-        count_label(unconverted as f64),
+        si_compact(total as f64),
+        si_compact(unconverted as f64),
     );
 
     let plots = vec![Plot::Hexbin(hex), Plot::Line(bound)];
@@ -290,26 +290,15 @@ pub(crate) fn write_matrix_pdf(
     write_scene_pdf(path, &scene)
 }
 
-/// SI-compact number for colorbar tick labels: `100000 → "100k"`, `1.2e6 → "1.2M"`,
-/// smaller values rounded to an integer.
+/// SI-compact number for colorbar tick labels and the title summary:
+/// `100000 → "100k"`, `1.2e6 → "1.2M"`, smaller values rounded to an integer.
+/// Uses conventional SI casing (`k` = 10³, `M` = 10⁶).
 fn si_compact(v: f64) -> String {
     let a = v.abs();
     if a >= 1e6 {
         format!("{:.1}M", v / 1e6)
     } else if a >= 1e3 {
         format!("{:.0}k", v / 1e3)
-    } else {
-        format!("{v:.0}")
-    }
-}
-
-/// Compact count for the title summary: `3.0e6 → "3.0m"`, `90000 → "90K"`.
-fn count_label(v: f64) -> String {
-    let a = v.abs();
-    if a >= 1e6 {
-        format!("{:.1}m", v / 1e6)
-    } else if a >= 1e3 {
-        format!("{:.0}K", v / 1e3)
     } else {
         format!("{v:.0}")
     }

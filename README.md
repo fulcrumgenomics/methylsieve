@@ -164,9 +164,7 @@ Because the proportion test abstains below `--min-sites`, **`proportion` mode
 never flags a template with fewer than `--min-sites` sites**, no matter how badly
 converted — those reads pass through. `count`, `either`, and `adaptive` still
 evaluate them via the count test. In `proportion` mode methylsieve prints a stderr
-warning with the count of templates that escaped, and the
-`below_min_sites_templates` column in the metrics summary exposes that population in every
-mode.
+warning with the count of templates that escaped.
 
 ## Defaults and tuning
 
@@ -192,8 +190,8 @@ Two caveats:
 - **Short-insert / cfDNA libraries** have few monitored sites per template (a
   130 bp fragment yields ~25 CpH sites after quality filtering and overlap
   dedup), so most templates fall below `--min-sites = 40` and lean on the count
-  fallback. Watch `below_min_sites_templates` in the metrics summary; consider a lower
-  floor (with the coupling above) if it dominates.
+  fallback. In `proportion` mode the stderr warning reports how many templates
+  escaped; consider a lower floor (with the coupling above) if it dominates.
 - **Samples with real non-CpG methylation** (plant, neuronal, embryonic-stem
   tissues, where mCH can reach a few percent) will read genuine methylation as
   "unconverted" at fraction 0.05. Use `--mode count` or a higher fraction there.

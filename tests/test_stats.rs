@@ -69,9 +69,17 @@ fn metrics_prefix_writes_all_files() {
         run_methylsieve(&sam, &reference, &env, &["--metrics-prefix", &env.metrics_prefix_arg()]);
     assert!(r.status_ok, "stderr: {}", r.stderr);
     let pfx = env.metrics_prefix.to_str().unwrap();
+    // Each TSV must exist AND have content (a header plus at least one data row),
+    // so a bug that wrote an empty file wouldn't pass.
     for suffix in ["summary.tsv", "mbias.tsv", "conversion-matrix.tsv"] {
         let p = std::path::PathBuf::from(format!("{pfx}.{suffix}"));
         assert!(p.exists(), "expected metrics file {}", p.display());
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            text.lines().filter(|l| !l.trim().is_empty()).count() >= 2,
+            "{} should have a header and at least one data row, got:\n{text}",
+            p.display()
+        );
     }
     // The separate mbias-bounds file was folded into the summary.
     assert!(

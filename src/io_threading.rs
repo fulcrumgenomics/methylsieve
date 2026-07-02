@@ -265,9 +265,19 @@ impl Write for ThreadedWriter {
                 buf = &buf[pushed..];
                 self.io_thread.unpark();
             } else {
-                // Ring is full — let the IO thread drain. Park; the
-                // IO thread will unpark us after it writes.
+                // Ring is full. If the IO thread has died (e.g. a closed
+                // downstream pipe → EPIPE, or a full disk), it will never drain
+                // the ring, so parking here would hang forever. Surface its error
+                // instead — checked both before parking (it may have already
+                // failed) and after waking (it records the error, unparks us, then
+                // exits), so we never park a second time into a dead thread.
+                if let Some(e) = self.take_error() {
+                    return Err(e);
+                }
                 thread::park();
+                if let Some(e) = self.take_error() {
+                    return Err(e);
+                }
             }
         }
         Ok(initial_len)
@@ -384,5 +394,33 @@ mod tests {
         w.write_all(&payload).unwrap();
         w.finish().unwrap();
         assert_eq!(*captured.lock().unwrap(), payload);
+    }
+
+    /// A dead IO thread (e.g. downstream pipe closed → EPIPE) must not hang the
+    /// producer on a full ring: the error surfaces from `write`/`finish` instead.
+    /// Regression for a park-forever bug where `write` checked the error only once
+    /// before parking.
+    #[test]
+    fn threaded_writer_surfaces_error_without_hanging() {
+        struct FailSink;
+        impl Write for FailSink {
+            fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "downstream closed"))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "downstream closed"))
+            }
+        }
+        // Payload larger than the (floored 64 KiB) ring forces the producer to
+        // block once the ring fills, exercising the park-then-recheck path. If the
+        // error weren't surfaced there, this test would hang.
+        let payload = vec![0u8; 256 * 1024];
+        let mut w = ThreadedWriter::new(FailSink, 64 * 1024);
+        let write_err = w.write_all(&payload).err();
+        let finish_err = w.finish().err();
+        assert!(
+            write_err.is_some() || finish_err.is_some(),
+            "broken-pipe error must surface from write() or finish()"
+        );
     }
 }
