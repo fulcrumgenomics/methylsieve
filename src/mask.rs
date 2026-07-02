@@ -239,8 +239,11 @@ pub(crate) fn compute_mask_windows(plan: &MaskPlan, recs: &[RawRecord]) -> Vec<M
     // the other side that covers it *on the same contig* — coverage- and
     // contig-driven, so it spans split-read supplementaries that cross an SV
     // breakpoint onto the mate's contig, not just same-contig primary mates.
-    let mut r1_ranges: Vec<(i32, usize, usize)> = Vec::new();
-    let mut r2_ranges: Vec<(i32, usize, usize)> = Vec::new();
+    // Small inline capacity: a proper pair contributes ~1-2 reference ranges per
+    // side, so the common case stays on the stack (a chimeric split read with
+    // more supplementaries spills to the heap).
+    let mut r1_ranges: SmallVec<[(i32, usize, usize); 2]> = SmallVec::new();
+    let mut r2_ranges: SmallVec<[(i32, usize, usize); 2]> = SmallVec::new();
     for i in 0..n {
         if windows[i].is_empty() || !propagatable(&recs[i]) {
             continue;
