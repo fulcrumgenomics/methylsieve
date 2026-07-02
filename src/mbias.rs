@@ -249,28 +249,30 @@ impl Default for DetectParams {
     }
 }
 
-/// Decide how many cycles to mask from `end` of `role`, from the CpG curve.
+/// Decide how many cycles to mask from `end` of `role`, and the CpG plateau it
+/// was cut against, from a single pass over the CpG curve.
 ///
 /// The plateau is the median of well-covered rates *beyond* `max_mask` (past the
 /// ramp); the mask length is the first cycle whose lightly-smoothed rate reaches
 /// `plateau_fraction × plateau`, minus one — i.e. we cut just before the read
 /// becomes trustworthy. Scanning for the *first* crossing (rather than the last
-/// deviation) means a noisy interior never inflates the mask. Returns 0 when
-/// there is no usable signal (no data, or no estimable plateau).
+/// deviation) means a noisy interior never inflates the mask. Returns `(0, None)`
+/// when there is no usable signal (no data, or no estimable plateau); otherwise
+/// the plateau is `Some` (exposed so plots can draw `plateau_fraction × plateau`).
 #[must_use]
-pub(crate) fn detect_mask_length(
+pub(crate) fn detect_mask(
     acc: &MbiasAccumulator,
     role: ReadRole,
     end: ReadEnd,
     p: DetectParams,
-) -> usize {
+) -> (usize, Option<f64>) {
     let rates = cpg_rates(acc, role, end, p.min_cycle_cov);
     if rates.is_empty() {
-        return 0;
+        return (0, None);
     }
 
     let Some(plateau) = estimate_plateau(&rates, p.max_mask) else {
-        return 0;
+        return (0, None);
     };
     let threshold = plateau * p.plateau_fraction;
 
@@ -278,11 +280,25 @@ pub(crate) fn detect_mask_length(
     let scan_to = smoothed.len().min(p.max_mask + 1);
     for (cycle, &r) in smoothed.iter().enumerate().take(scan_to) {
         if r.is_finite() && r >= threshold {
-            return cycle; // first trustworthy cycle → mask the `cycle` cycles before it
+            // First trustworthy cycle → mask the `cycle` cycles before it.
+            return (cycle, Some(plateau));
         }
     }
     // No cycle reached the plateau within the cap → mask up to the cap.
-    p.max_mask.min(rates.len())
+    (p.max_mask.min(rates.len()), Some(plateau))
+}
+
+/// The mask length for `(role, end)` — [`detect_mask`] discarding the plateau.
+/// Test-only convenience; production uses [`detect_mask`] for both values at once.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn detect_mask_length(
+    acc: &MbiasAccumulator,
+    role: ReadRole,
+    end: ReadEnd,
+    p: DetectParams,
+) -> usize {
+    detect_mask(acc, role, end, p).0
 }
 
 /// Per-cycle CpG methylation rates for `(role, end)`: `meth / total` where
@@ -297,20 +313,6 @@ fn cpg_rates(acc: &MbiasAccumulator, role: ReadRole, end: ReadEnd, min_cycle_cov
             },
         )
         .collect()
-}
-
-/// The estimated CpG methylation plateau for `(role, end)` — the same value
-/// [`detect_mask_length`] derives the mask threshold from. `None` when there is
-/// no usable signal. Exposed so plots can draw the `plateau_fraction × plateau`
-/// detection threshold.
-#[must_use]
-pub(crate) fn cpg_plateau(
-    acc: &MbiasAccumulator,
-    role: ReadRole,
-    end: ReadEnd,
-    p: DetectParams,
-) -> Option<f64> {
-    estimate_plateau(&cpg_rates(acc, role, end, p.min_cycle_cov), p.max_mask)
 }
 
 /// Median of finite per-cycle rates from cycle `max_mask` onward (the region

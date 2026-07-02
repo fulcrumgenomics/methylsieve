@@ -48,9 +48,7 @@
 use fgumi_raw_bam::RawRecord;
 use smallvec::SmallVec;
 
-use crate::mbias::{
-    DetectParams, MbiasAccumulator, ReadEnd, ReadRole, cpg_plateau, detect_mask_length,
-};
+use crate::mbias::{DetectParams, MbiasAccumulator, ReadEnd, ReadRole, detect_mask};
 use crate::record::{
     FLAG_FIRST_SEGMENT, FLAG_LAST_SEGMENT, FLAG_MATE_UNMAPPED, FLAG_PAIRED, FLAG_REVERSE,
     FLAG_SECONDARY, FLAG_UNMAPPED, has, read_role, ref_span_for_query_window,
@@ -82,16 +80,20 @@ impl MaskPlan {
     /// Learn the plan from accumulated M-bias (CpG curves).
     #[must_use]
     pub(crate) fn learn(acc: &MbiasAccumulator, detect: DetectParams, mask_quality: u8) -> Self {
-        let d = |role, end| detect_mask_length(acc, role, end, detect);
+        // One CpG-rate pass per role/end yields both the mask length and the
+        // plateau it was cut against (the 5' plateaus feed the plot threshold).
+        let mut k_5p = [0usize; 3];
         let mut plateau_5p = [None; 3];
         for role in ReadRole::ALL {
-            plateau_5p[role.index()] = cpg_plateau(acc, role, ReadEnd::FivePrime, detect);
+            let (k, plateau) = detect_mask(acc, role, ReadEnd::FivePrime, detect);
+            k_5p[role.index()] = k;
+            plateau_5p[role.index()] = plateau;
         }
         Self {
-            k_r1_5p: d(ReadRole::R1, ReadEnd::FivePrime),
-            k_r2_5p: d(ReadRole::R2, ReadEnd::FivePrime),
-            k_se_5p: d(ReadRole::Se, ReadEnd::FivePrime),
-            k_se_3p: d(ReadRole::Se, ReadEnd::ThreePrime),
+            k_r1_5p: k_5p[ReadRole::R1.index()],
+            k_r2_5p: k_5p[ReadRole::R2.index()],
+            k_se_5p: k_5p[ReadRole::Se.index()],
+            k_se_3p: detect_mask(acc, ReadRole::Se, ReadEnd::ThreePrime, detect).0,
             mask_quality,
             plateau_5p,
             plateau_fraction: detect.plateau_fraction,
