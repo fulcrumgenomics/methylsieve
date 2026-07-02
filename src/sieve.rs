@@ -49,6 +49,33 @@ pub(crate) struct RecordProcessor {
     has_controls: bool,
 }
 
+/// The best primary-record candidate for classifying a template, in preference
+/// order R1 > sole unpaired > any. Used by [`RecordProcessor::classification_index`]
+/// to pick within the mapped tier first, then the unmapped tier.
+#[derive(Default)]
+struct PrimaryPick {
+    r1: Option<usize>,
+    unpaired: Option<usize>,
+    any: Option<usize>,
+}
+
+impl PrimaryPick {
+    /// Offer primary record `i` with flags `f` (first offer per slot wins).
+    fn offer(&mut self, i: usize, f: u16) {
+        self.any.get_or_insert(i);
+        if !has(f, FLAG_PAIRED) {
+            self.unpaired.get_or_insert(i);
+        } else if has(f, FLAG_FIRST_SEGMENT) {
+            self.r1.get_or_insert(i);
+        }
+    }
+
+    /// The preferred candidate, if any.
+    fn pick(&self) -> Option<usize> {
+        self.r1.or(self.unpaired).or(self.any)
+    }
+}
+
 impl RecordProcessor {
     /// Build from a loaded reference and resolved options.
     #[must_use]
@@ -78,7 +105,9 @@ impl RecordProcessor {
         let class_idx = self.classification_index(block)?;
         let class_rec = &block[class_idx];
 
-        // Unmapped primary R1 → pass through, no tally, no decision.
+        // No primary mapped (fully unmapped template) → pass through, no tally,
+        // no decision. A half-mapped pair classifies on its mapped mate above, so
+        // it does not reach here.
         if has(class_rec.flags(), FLAG_UNMAPPED) {
             stats.genome.n_templates += 1;
             stats.unmapped_templates += 1;
@@ -249,26 +278,27 @@ impl RecordProcessor {
         }
     }
 
-    /// Index of the record whose contig classifies the template: primary R1 if
-    /// present, else the sole unpaired primary, else any primary. Bails when no
-    /// primary exists (the signature of non-query-grouped input).
+    /// Index of the record whose contig classifies the template. Prefers a
+    /// **mapped** primary — R1, else the sole unpaired, else any — since its
+    /// contig is what places the template (genome vs. control). Only when no
+    /// primary is mapped does it fall back to an unmapped primary, so a
+    /// half-mapped pair (e.g. R1 unmapped, R2 a mapped primary) classifies and is
+    /// evaluated on the mapped mate instead of being passed through as unmapped.
+    /// Bails when no primary exists at all (the signature of non-query-grouped
+    /// input).
     fn classification_index(&self, block: &[RawRecord]) -> Result<usize> {
-        let mut r1_primary = None;
-        let mut unpaired_primary = None;
-        let mut any_primary = None;
+        // Preference within a mapped/unmapped tier: R1 primary > sole unpaired
+        // primary > any primary.
+        let mut mapped = PrimaryPick::default();
+        let mut unmapped = PrimaryPick::default();
         for (i, rec) in block.iter().enumerate() {
             let f = rec.flags();
             if has(f, FLAG_SECONDARY | FLAG_SUPPLEMENTARY) {
                 continue;
             }
-            any_primary.get_or_insert(i);
-            if !has(f, FLAG_PAIRED) {
-                unpaired_primary.get_or_insert(i);
-            } else if has(f, FLAG_FIRST_SEGMENT) {
-                r1_primary.get_or_insert(i);
-            }
+            if has(f, FLAG_UNMAPPED) { &mut unmapped } else { &mut mapped }.offer(i, f);
         }
-        r1_primary.or(unpaired_primary).or(any_primary).ok_or_else(|| {
+        mapped.pick().or_else(|| unmapped.pick()).ok_or_else(|| {
             let qname = block.first().map(|r| r.read_name().to_vec()).unwrap_or_default();
             anyhow::anyhow!(
                 "QNAME {} appeared with {} record(s) but no primary alignment — the primary must \
@@ -1573,5 +1603,34 @@ mod tests {
         // 20 CpA total, 9 masked → 11 remain. (A fixed eight-slot buffer would
         // drop the 9th window and leave 12.)
         assert_eq!(counters.total[Context::CpA.index()], 11, "all nine windows honored");
+    }
+
+    #[test]
+    fn classification_prefers_mapped_mate_over_unmapped_r1() {
+        let reference = Reference::from_encoded_contigs(vec![enc("CACACACACA")]);
+        let proc = RecordProcessor::new(reference, opts(cph_mask(), 3));
+        let r1_unmapped = FLAG_PAIRED | FLAG_UNMAPPED | FLAG_FIRST_SEGMENT;
+
+        // Half-mapped pair (R1 unmapped, R2 a mapped primary): classification must
+        // pick the mapped R2 (index 1), so the template is evaluated on it rather
+        // than passed through as unmapped.
+        let half = parse_sam_records(
+            &[
+                &sam_line(r1_unmapped, 1, "*", "CACACACACA", "IIIIIIIIII"),
+                &sam_line(FLAG_PAIRED | FLAG_LAST_SEGMENT, 1, "10M", "CACACACACA", "IIIIIIIIII"),
+            ],
+            10,
+        );
+        assert_eq!(proc.classification_index(&half).unwrap(), 1, "mapped R2 classifies");
+
+        // Fully-unmapped template falls back to the (unmapped) R1 at index 0.
+        let both = parse_sam_records(
+            &[
+                &sam_line(r1_unmapped, 1, "*", "CACA", "IIII"),
+                &sam_line(FLAG_PAIRED | FLAG_UNMAPPED | FLAG_LAST_SEGMENT, 1, "*", "CACA", "IIII"),
+            ],
+            10,
+        );
+        assert_eq!(proc.classification_index(&both).unwrap(), 0, "fully unmapped falls back");
     }
 }

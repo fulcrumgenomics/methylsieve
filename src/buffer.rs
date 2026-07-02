@@ -104,6 +104,16 @@ impl TemplateArena {
         if recs.is_empty() {
             return true;
         }
+        // Enforce the byte ceiling *before* copying, so one large template can't
+        // push the arena past its RSS guard. Always allow the first template
+        // (empty arena) so a pathologically large one still buffers rather than
+        // leaving the learn phase with nothing.
+        let template_bytes: usize = recs.iter().map(|r| r.as_ref().len()).sum();
+        if self.total_bytes > 0
+            && self.total_bytes.saturating_add(template_bytes) > self.byte_ceiling
+        {
+            return false;
+        }
         let first = self.records.len() as u32;
         for rec in recs {
             self.append_record(rec.as_ref());
@@ -205,6 +215,22 @@ mod tests {
         assert!(a.is_full());
         assert!(!a.push_template(&[rec(3, 4)]), "push past target is rejected");
         assert_eq!(a.template_count(), 2);
+    }
+
+    #[test]
+    fn stops_at_byte_ceiling_without_overshooting() {
+        // High template target so the *byte* ceiling is the limiter; shrink it
+        // directly for the test.
+        let mut a = TemplateArena::with_target(1_000_000);
+        a.byte_ceiling = 100;
+        // The first template always buffers (empty arena).
+        assert!(a.push_template(&[rec(1, 60)]));
+        assert_eq!(a.total_bytes, 60);
+        // A second 60-byte template would reach 120 > 100 — rejected before any
+        // copy, so the ceiling is honored rather than overshot.
+        assert!(!a.push_template(&[rec(2, 60)]), "template past the byte ceiling is rejected");
+        assert_eq!(a.total_bytes, 60, "rejected template is not copied");
+        assert_eq!(a.template_count(), 1);
     }
 
     #[test]

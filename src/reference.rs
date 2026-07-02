@@ -41,16 +41,32 @@ pub(crate) const BASE_T: u8 = 8;
 #[allow(dead_code)]
 pub(crate) const BASE_N: u8 = 15;
 
-/// ASCII reference base → 2-bit code (A=0, C=1, G=2, T=3). Anything that isn't a
-/// plain A/C/G/T — IUPAC ambiguity codes and `N` — folds to A (0). This matches
-/// the prior two-step ASCII→4-bit→2-bit fold exactly (non-ACGT became N then
-/// folded to A): folding N→A never creates a spurious monitored site (A is never
-/// the monitored C/G), and only gives a former-N neighbor a concrete context
-/// instead of being skipped — immaterial in practice (these sit in assembly gaps).
+/// Sentinel in [`REF_ASCII_TO_2BIT`] for a byte that is not a valid sequence
+/// character. The index-driven loader locates bases by `.fai` arithmetic, so a
+/// corrupt index or malformed FASTA can slip a structural byte (`>`, a digit,
+/// whitespace, a stray newline) into what we treat as sequence; folding those
+/// silently to A would build a wrong reference, so the loader rejects them.
+const INVALID_BASE: u8 = 0xFF;
+
+/// ASCII reference base → 2-bit code (A=0, C=1, G=2, T=3). Any other **letter** —
+/// IUPAC ambiguity codes and `N` — folds to A (0); this matches the prior
+/// ASCII→4-bit→2-bit fold (non-ACGT became N then A): folding N→A never creates a
+/// spurious monitored site (A is never the monitored C/G), and only gives a
+/// former-N neighbor a concrete context instead of being skipped — immaterial in
+/// practice (assembly gaps). Non-letter bytes map to [`INVALID_BASE`] so the
+/// loader can reject them rather than silently fold structural bytes to A.
 const REF_ASCII_TO_2BIT: [u8; 256] = build_ref_2bit();
 
 const fn build_ref_2bit() -> [u8; 256] {
-    let mut t = [0u8; 256]; // default A (0) — also the fold target for N / ambiguity
+    let mut t = [INVALID_BASE; 256];
+    // Every ASCII letter is a valid sequence character; non-ACGT (N / IUPAC)
+    // folds to A (0). A/a are left at 0 by the ACGT assignments below.
+    let mut b = b'A';
+    while b <= b'Z' {
+        t[b as usize] = 0;
+        t[(b + 32) as usize] = 0; // lowercase
+        b += 1;
+    }
     t[b'C' as usize] = 1;
     t[b'c' as usize] = 1;
     t[b'G' as usize] = 2;
@@ -191,15 +207,20 @@ pub(crate) struct PackedContig {
 /// line_bases` terminator is skipped between lines. ASCII→2-bit translation
 /// ([`REF_ASCII_TO_2BIT`]) is fused into this single pass, so the bases are
 /// never materialized unpacked.
+///
+/// # Errors
+/// Returns an error on a non-letter byte in the sequence span (see
+/// [`INVALID_BASE`]) — a signal that the `.fai` geometry or FASTA is corrupt and
+/// we would otherwise silently pack a wrong reference.
 fn pack_twobit_from_lines(
     raw: &[u8],
     seq_len: usize,
     line_bases: usize,
     line_width: usize,
-) -> PackedContig {
+) -> Result<PackedContig> {
     let mut data = vec![0u8; seq_len.div_ceil(4)];
     if seq_len == 0 || line_bases == 0 {
-        return PackedContig { data, len: seq_len };
+        return Ok(PackedContig { data, len: seq_len });
     }
     let terminator_len = line_width.saturating_sub(line_bases);
     // Build each output byte from its four bases in a register (`acc`) and store
@@ -223,7 +244,16 @@ fn pack_twobit_from_lines(
         }
         // Slice once per line so the inner loop has no per-base bounds check on `raw`.
         for &b in &raw[src..src + n] {
-            acc |= REF_ASCII_TO_2BIT[b as usize] << filled_bits;
+            let code = REF_ASCII_TO_2BIT[b as usize];
+            if code == INVALID_BASE {
+                bail!(
+                    "non-sequence byte {:#04x} ({:?}) where a reference base was expected — the \
+                     .fai index or FASTA is likely corrupt",
+                    b,
+                    b as char
+                );
+            }
+            acc |= code << filled_bits;
             filled_bits += 2;
             if filled_bits == 8 {
                 data[out] = acc;
@@ -241,7 +271,7 @@ fn pack_twobit_from_lines(
     if filled_bits > 0 {
         data[out] = acc; // flush the final partial byte
     }
-    PackedContig { data, len: seq_len }
+    Ok(PackedContig { data, len: seq_len })
 }
 
 /// The total on-disk byte span of a contig's sequence: complete lines (each
@@ -381,7 +411,10 @@ impl Reference {
                 .get_mut()
                 .read_exact(&mut raw)
                 .with_context(|| format!("reading contig '{name_str}' from {}", path.display()))?;
-            contigs.push(pack_twobit_from_lines(&raw, bam_len, line_bases, line_width));
+            contigs.push(
+                pack_twobit_from_lines(&raw, bam_len, line_bases, line_width)
+                    .with_context(|| format!("packing contig '{name_str}'"))?,
+            );
         }
         Ok(Reference { contigs })
     }
@@ -402,8 +435,9 @@ impl Reference {
             let name = String::from_utf8_lossy(record.name()).into_owned();
             let bases = record.sequence().as_ref();
             // Treat the stripped sequence as a single line (no terminators).
-            by_name
-                .insert(name, pack_twobit_from_lines(bases, bases.len(), bases.len(), bases.len()));
+            let packed = pack_twobit_from_lines(bases, bases.len(), bases.len(), bases.len())
+                .with_context(|| format!("packing contig '{name}'"))?;
+            by_name.insert(name, packed);
         }
 
         let mut contigs = Vec::with_capacity(header.reference_sequences().len());
@@ -695,6 +729,19 @@ mod tests {
         let fa = write_fasta(dir.path(), &[("chr1", "ACGT")], 10, true);
         let err = Reference::load(&fa, &header).err().expect("should error").to_string();
         assert!(err.contains("not present in the reference"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn load_rejects_non_sequence_bytes() {
+        // A structural/garbage byte (here a digit) in the sequence must be an
+        // error, not silently folded to A — the arithmetic loader would otherwise
+        // build a wrong reference from a corrupt .fai or malformed FASTA. IUPAC
+        // letters (N/R/Y) are fine (see the fold tests); only non-letters bail.
+        let header = header_for(&[("chr1", 10)]);
+        let dir = tempfile::tempdir().unwrap();
+        let fa = write_fasta(dir.path(), &[("chr1", "ACGT1CGTAC")], 10, true);
+        let err = format!("{:#}", Reference::load(&fa, &header).err().expect("should error"));
+        assert!(err.contains("non-sequence byte"), "unexpected error: {err}");
     }
 
     #[test]
