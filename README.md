@@ -5,8 +5,9 @@
 
 # methylsieve
 
-Fast, streaming per-template tagging and filtering of **unconverted reads** in
-directional bisulfite-sequencing (WGBS) and EM-seq SAM/BAM files.
+Fast, streaming cleanup of directional bisulfite-sequencing (WGBS) and EM-seq
+SAM/BAM: per-template **unconverted-read filtering** and **M-bias masking**, done
+correctly, in a single pass that disappears into the alignment pipe.
 
 <p>
 <a href="https://fulcrumgenomics.com">
@@ -24,18 +25,31 @@ directional bisulfite-sequencing (WGBS) and EM-seq SAM/BAM files.
 <a href="https://www.fulcrumgenomics.com"><img src="https://img.shields.io/badge/Visit_Us-%2326a8e0.svg?&style=for-the-badge&logo=wordpress&logoColor=white"/></a>
 
 In bisulfite sequencing and EM-seq, unmethylated cytosines are converted to
-uracil and read as `T`; a read that escaped conversion still reads `C` at
-unmethylated positions and silently inflates methylation estimates. methylsieve
-reads query-grouped SAM/BAM, makes a single **per-template** decision from all of
-a QNAME's primary and supplementary records (using CpH cytosines), and propagates
-that decision — an aux tag, the QC-fail flag, or outright removal — to every record
-of the template. It also emits a per-context (CpA/CpC/CpT/CpG) and per-spike-in
-conversion-rate TSV suitable for MultiQC.
+uracil and read as `T`. Two artifacts impact methylation estimates: reads
+that *escaped conversion* still read `C` at unmethylated positions, and end-repair
+fill-in can cause a drop in observed methylation where unmethylated Cs were 
+incorporated at recessed 3' ends (**M-bias**).  Both processes affect _templates_
+yet most tools evaluate _reads_ independently. Methylsieve addresses both artifacts,
+correctly, in one streaming pass over query-grouped SAM/BAM:
+
+- **Unconverted-read filtering.** It makes a single **per-template** decision from
+  all of a QNAME's primary and supplementary records (using CpH cytosines) and
+  propagates that call — an aux tag, the QC-fail flag, or outright removal — to
+  every record of the template, rather than judging each read on its own.
+- **M-bias masking** *(opt-in, `--mbias-mask`)*. It learns the per-cycle
+  methylation ramp on the fly, freezes the biased 5' (and, for single-end, 3')
+  lengths, and sets those bases' qualities to Q2 so base-quality-aware callers
+  drop them — no clip, no coordinate/CIGAR rewrite.  Read's 3' ends are also 
+  masked if/when they overlap their mate's 5' mask region.
+
+Both run in the same pass, and methylsieve emits per-context (CpA/CpC/CpT/CpG) and
+per-spike-in conversion metrics — TSVs plus M-bias and decision-matrix plots —
+suitable for QC.
 
 methylsieve runs inline in the alignment pipe with negligible overhead:
 
 ```bash
-bwa-meth.py --reference genome.fa R1.fq.gz R2.fq.gz \
+bwa-mem3 --meth genome.fa R1.fq.gz R2.fq.gz \
   | methylsieve --reference genome.fa -o - \
   | dupblaster \
   | samtools sort -o final.bam
@@ -45,7 +59,7 @@ methylsieve reads SAM or BAM (auto-detected) and writes BAM. Input must be
 **query-grouped** — all records for a QNAME adjacent, as produced directly by
 the aligner — and should be **adapter-trimmed** first: untrimmed adapter
 read-through on short inserts can be force-aligned and read as spurious
-unconverted CpH. See `methylsieve --help` for the full option list.
+unconverted Cytosines.
 
 ## Motivation
 
@@ -69,6 +83,12 @@ just in the common case.
 - **No sharp edges.** It evaluates single-end reads and orphans, and stays fast
   even when a large fraction of reads fail conversion — cases where simpler
   per-read approaches tend to break down.
+- **M-bias handled automatically, per read class.** The usual fix is to eyeball a
+  per-cycle plot and hand a single fixed trim to the downstream caller, applied to
+  read 1 and read 2 alike. methylsieve learns the ramp from the data and freezes an
+  independent mask for read 1, read 2, and single-end reads (read 1's bias is a
+  couple of cycles; read 2's can run past 20), so the right number of bases is
+  neutralized — in the same pass, with no measure-then-rerun loop.
 - **Disappears into a pipe.** Input and output each run on a dedicated IO thread
   with a large ring buffer ahead of the worker (`--read-buffer-mb`,
   `--write-buffer-mb`). Those buffers soak up bursty output from the aligner
@@ -143,6 +163,17 @@ The `--mode` option selects how they combine:
 | `proportion` | proportion test only (abstains below `--min-sites`) | not recommended; use `adaptive` instead |
 | `either` | flag if **either** test fires | the most aggressive catch |
 | `adaptive` *(default)* | proportion at/above `--min-sites`, count below it | read/insert lengths vary — the usual case |
+
+With `--metrics-prefix`, every template's `(monitored sites, converted sites)` pair
+is binned into a density hexbin and the live decision boundary is drawn over it, so
+the calls written to the BAM are legible at a glance — the fully-converted mass
+hugs the diagonal, and flagged templates fall away below the boundary:
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/fulcrumgenomics/methylsieve/main/docs/img/conversion-matrix.png"
+       alt="Conversion-matrix hexbin for an EM-seq library — converted templates cluster on the diagonal, the converted/unconverted boundary is drawn, and flagged templates fall below it"
+       width="560">
+</p>
 
 ### Why `adaptive` is the default
 
@@ -314,6 +345,24 @@ End-repair fill-in skews the methylation calls at the first sequencing cycles of
 a read — especially read 2 — so the per-cycle methylation rate ramps up to a
 plateau over the first 10–25 bp. `--mbias-mask` measures that ramp and neutralizes
 the biased bases:
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/fulcrumgenomics/methylsieve/main/docs/img/mbias-cfdna.png"
+       alt="M-bias curves for a cfDNA EM-seq library — read 2 ramps over ~20 cycles, read 1 needs no 5' mask but declines at the 3' end from adapter read-through"
+       width="760">
+  <br>
+  <img src="https://raw.githubusercontent.com/fulcrumgenomics/methylsieve/main/docs/img/mbias-emseq.png"
+       alt="M-bias curves for a standard EM-seq library — read 1 needs no mask, read 2 only three cycles"
+       width="760">
+</p>
+
+The same option, two libraries, two answers: the short-insert cfDNA library (top)
+needs a 20-cycle read-2 mask and also trims read-1 3' bases that read through into
+the adapter, while the standard EM-seq library (bottom) is well-behaved enough to
+need no read-1 mask and only three read-2 cycles. No single `--ignore-template-ends`
+value is right for both — so methylsieve learns the mask per library and per read
+class instead of asking you to guess one. The dashed line marks the chosen mask
+length; the shaded band is what gets masked.
 
 1. **Learn.** Buffer the first `--mbias-buffer-templates` templates (default
    500,000) and accumulate the per-cycle CpG methylation curve for R1, R2, and
