@@ -2,7 +2,8 @@
 //! data as the metric TSVs (see [`crate::metrics`]):
 //!
 //! - `PREFIX.mbias.pdf` — per-read-cycle cytosine-retention curves by context
-//!   (one panel per read), with the applied 5' mask shaded.
+//!   (one panel per read end), with the applied mask shaded — the 5' mask for
+//!   every read, plus the single-end 3' mask on its own panel.
 //! - `PREFIX.conversion-matrix.pdf` — a hexbin of per-template observed-vs-
 //!   converted sites (log-scaled template density) with the converted/unconverted
 //!   decision boundary overlaid.
@@ -59,13 +60,14 @@ fn write_scene_pdf(path: &Path, scene: &Scene) -> Result<()> {
 
 // ── M-bias ──────────────────────────────────────────────────────────────────
 
-/// One read's panel: a retention-rate-vs-cycle line per context (5' end).
-fn mbias_panel(mbias: &MbiasAccumulator, role: ReadRole, legend: bool) -> Vec<Plot> {
+/// One read's panel: a retention-rate-vs-cycle line per context, for the given
+/// read `end` (5' cycles counted from the read start, 3' from the read end).
+fn mbias_panel(mbias: &MbiasAccumulator, role: ReadRole, end: ReadEnd, legend: bool) -> Vec<Plot> {
     Context::ALL
         .iter()
         .filter_map(|&ctx| {
             let pts: Vec<(f64, f64)> = mbias
-                .cycles(role, ReadEnd::FivePrime, ctx)
+                .cycles(role, end, ctx)
                 .iter()
                 .enumerate()
                 .filter_map(|(i, cc)| cc.frac().map(|f| ((i + 1) as f64, f)))
@@ -87,6 +89,7 @@ fn mbias_panel(mbias: &MbiasAccumulator, role: ReadRole, legend: bool) -> Vec<Pl
 /// drawing the `fraction × plateau` detection threshold as a horizontal cut line.
 fn mbias_layout(
     title: &str,
+    x_label: &str,
     y_label: bool,
     max_cycle: f64,
     mask: Option<usize>,
@@ -95,7 +98,7 @@ fn mbias_layout(
 ) -> Layout {
     let mut l = Layout::new((0.0, max_cycle), (0.0, 1.0))
         .with_title(title)
-        .with_x_label("Position in Read")
+        .with_x_label(x_label)
         // Stop the x-axis at the read length rather than a major tick wider.
         .with_x_axis_min(0.0)
         .with_x_axis_max(max_cycle)
@@ -143,40 +146,74 @@ pub(crate) fn write_mbias_pdf(
     mask_plan: Option<&MaskPlan>,
     sample: &str,
 ) -> Result<()> {
-    let roles: Vec<ReadRole> =
-        ReadRole::ALL.iter().copied().filter(|&r| mbias.has_data(r, ReadEnd::FivePrime)).collect();
-    if roles.is_empty() {
-        return Ok(());
-    }
-    let max_cycle = roles
-        .iter()
-        .flat_map(|&r| {
-            Context::ALL.iter().map(move |&c| mbias.cycles(r, ReadEnd::FivePrime, c).len())
-        })
-        .max()
-        .unwrap_or(1) as f64;
     let role_title = |r: ReadRole| match r {
         ReadRole::R1 => "Read 1",
         ReadRole::R2 => "Read 2",
         ReadRole::Se => "Single-End",
     };
 
+    // One panel per (role, end) with data: the 5' curve for every role, plus the
+    // single-end 3' curve, which has its own learned mask (`k_se_3p`) that the 5'
+    // panels never show. The 3' panel plots position-from-3'-end, so its mask
+    // shades from the left exactly like the 5' panels.
+    struct PanelSpec {
+        role: ReadRole,
+        end: ReadEnd,
+        title: String,
+        x_label: &'static str,
+        mask: Option<usize>,
+        threshold: Option<f64>,
+    }
+    let mut specs: Vec<PanelSpec> = Vec::new();
+    for &role in &ReadRole::ALL {
+        if mbias.has_data(role, ReadEnd::FivePrime) {
+            specs.push(PanelSpec {
+                role,
+                end: ReadEnd::FivePrime,
+                title: role_title(role).to_string(),
+                x_label: "Position in Read",
+                mask: mask_plan.map(|p| p.role_5p(role)),
+                threshold: mask_plan.and_then(|p| p.threshold_5p(role)),
+            });
+        }
+    }
+    if mbias.has_data(ReadRole::Se, ReadEnd::ThreePrime) {
+        specs.push(PanelSpec {
+            role: ReadRole::Se,
+            end: ReadEnd::ThreePrime,
+            title: "Single-End 3'".to_string(),
+            x_label: "Position from 3' End",
+            mask: mask_plan.map(|p| p.k_se_3p()),
+            threshold: None, // no 3' plateau is stored; the applied mask is shaded
+        });
+    }
+    if specs.is_empty() {
+        return Ok(());
+    }
+
+    let max_cycle = specs
+        .iter()
+        .flat_map(|s| Context::ALL.iter().map(move |&c| mbias.cycles(s.role, s.end, c).len()))
+        .max()
+        .unwrap_or(1) as f64;
+
     let frac = mask_plan.map_or(0.0, MaskPlan::plateau_fraction);
-    let mut panels = Vec::with_capacity(roles.len());
-    let mut layouts = Vec::with_capacity(roles.len());
-    for (i, &role) in roles.iter().enumerate() {
+    let mut panels = Vec::with_capacity(specs.len());
+    let mut layouts = Vec::with_capacity(specs.len());
+    for (i, s) in specs.iter().enumerate() {
         let first = i == 0;
-        panels.push(mbias_panel(mbias, role, first));
+        panels.push(mbias_panel(mbias, s.role, s.end, first));
         layouts.push(mbias_layout(
-            role_title(role),
+            &s.title,
+            s.x_label,
             first,
             max_cycle,
-            mask_plan.map(|p| p.role_5p(role)),
-            mask_plan.and_then(|p| p.threshold_5p(role)),
+            s.mask,
+            s.threshold,
             frac,
         ));
     }
-    let scene = Figure::new(1, roles.len())
+    let scene = Figure::new(1, specs.len())
         .with_plots(panels)
         .with_layouts(layouts)
         .with_shared_legend()
@@ -240,7 +277,10 @@ pub(crate) fn write_matrix_pdf(
         .with_z(zs, ZReduce::Sum)
         .with_log_color(true)
         .with_color_map(ColorMap::Inferno)
-        .with_n_bins((cap as usize).max(1))
+        // One bin per checked-site value up to a cap, so a heavy-tailed dataset
+        // (thousands of sites on long templates) doesn't render a multi-thousand-
+        // bin hexbin for a title/summary plot.
+        .with_n_bins((cap as usize).clamp(1, 300))
         .with_x_range(0.0, span)
         .with_y_range(0.0, span)
         .with_min_count(1)

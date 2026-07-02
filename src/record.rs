@@ -31,8 +31,10 @@ pub(crate) const FLAG_QC_FAIL: u16 = 0x200;
 /// SAM FLAG 0x800: supplementary (chimeric) alignment.
 pub(crate) const FLAG_SUPPLEMENTARY: u16 = 0x800;
 
-/// Whether `flags` has every bit in `bit` set (any-of for a single bit, all-of
-/// for an OR'd mask — callers pass single bits or OR'd groups accordingly).
+/// Whether `flags` has **any** bit in `bit` set (`flags & bit != 0`). For a
+/// single-bit `bit` this is the obvious "is this flag set?"; for an OR'd mask it
+/// is "any of these flags set" — e.g. `has(f, FLAG_SECONDARY | FLAG_SUPPLEMENTARY)`
+/// tests secondary-or-supplementary.
 #[inline]
 pub(crate) fn has(flags: u16, bit: u16) -> bool {
     flags & bit != 0

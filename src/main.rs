@@ -653,6 +653,21 @@ fn run(args: Args) -> Result<()> {
                 args.ignore_template_ends
             );
         }
+        // Masked bases are excluded from methylsieve's own tally only when the
+        // mask quality drops them below the base-quality gate. Setting the mask
+        // quality at/above the gate still rewrites QUAL for downstream callers but
+        // leaves the biased bases in our own decision — almost certainly not what
+        // the user wants.
+        if args.mbias_mask_quality >= args.min_base_quality {
+            log::warn!(
+                "--mbias-mask-quality={} is >= --min-base-quality={}: masked bases still count \
+                 toward methylsieve's own conversion tally/decision (they only lower emitted QUAL \
+                 for downstream callers). Set the mask quality below the base-quality gate to \
+                 exclude them.",
+                args.mbias_mask_quality,
+                args.min_base_quality
+            );
+        }
         0
     } else {
         args.ignore_template_ends

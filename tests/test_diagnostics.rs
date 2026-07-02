@@ -12,7 +12,7 @@ fn unmapped_template_passes_through_untouched() {
     // unmapped, never evaluated.
     let env = TestEnv::new();
     let reference = RefBuilder::new().contig("chr1", REF);
-    let stats = env.metrics_prefix.to_str().unwrap().to_string();
+    let stats = env.metrics_prefix_arg();
     let r1 = FLAG_PAIRED | FLAG_UNMAPPED | FLAG_MATE_UNMAPPED | FLAG_FIRST_SEGMENT;
     let r2 = FLAG_PAIRED | FLAG_UNMAPPED | FLAG_MATE_UNMAPPED | FLAG_LAST_SEGMENT;
     let sam = SamBuilder::new()
@@ -37,7 +37,7 @@ fn zero_site_template_is_counted_and_not_tagged() {
     // A read over an all-A region has no monitored C — zero sites.
     let env = TestEnv::new();
     let reference = RefBuilder::new().contig("chr1", "AAAAAAAAAA");
-    let stats = env.metrics_prefix.to_str().unwrap().to_string();
+    let stats = env.metrics_prefix_arg();
     let sam =
         SamBuilder::new().sq("chr1", 10).record("z", 0, "chr1", 1, "10M", "AAAAAAAAAA", &q40(10));
 
@@ -89,7 +89,7 @@ fn deletion_skips_reference_cytosines() {
     // (first block) and 6,8 (second block) = 4; the deleted C@4 is NOT tallied.
     let env = TestEnv::new();
     let reference = RefBuilder::new().contig("chr1", REF);
-    let stats = env.metrics_prefix.to_str().unwrap().to_string();
+    let stats = env.metrics_prefix_arg();
     // Read bases (8) for ref 0-3 ("CACA") then ref 6-9 ("CACA"), all matching.
     let sam = SamBuilder::new().sq("chr1", REF.len()).record(
         "d",

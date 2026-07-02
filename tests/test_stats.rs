@@ -11,7 +11,7 @@ const REF: &str = "CACGCACGCA";
 fn per_context_counts_and_conv_rates() {
     let env = TestEnv::new();
     let reference = RefBuilder::new().contig("chr1", REF);
-    let stats = env.metrics_prefix.to_str().unwrap().to_string();
+    let stats = env.metrics_prefix_arg();
     let sam = SamBuilder::new().rg("rg1", "sampleX").sq("chr1", REF.len()).record(
         "r",
         0,
@@ -44,7 +44,7 @@ fn per_context_counts_and_conv_rates() {
 fn sample_override_wins_over_read_group() {
     let env = TestEnv::new();
     let reference = RefBuilder::new().contig("chr1", REF);
-    let stats = env.metrics_prefix.to_str().unwrap().to_string();
+    let stats = env.metrics_prefix_arg();
     let sam = SamBuilder::new().rg("rg1", "sampleX").sq("chr1", REF.len()).record(
         "r",
         0,

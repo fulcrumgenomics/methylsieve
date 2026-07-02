@@ -18,14 +18,14 @@ fn indexed_and_unindexed_reference_agree() {
 
     let indexed = {
         let env = TestEnv::new();
-        let stats = env.metrics_prefix.to_str().unwrap().to_string();
+        let stats = env.metrics_prefix_arg();
         run_ok(&sam, &RefBuilder::new().contig("chr1", REF), &env, &["--metrics-prefix", &stats]);
         genome_stats(&env.stats)
     };
 
     let unindexed = {
         let env = TestEnv::new();
-        let stats = env.metrics_prefix.to_str().unwrap().to_string();
+        let stats = env.metrics_prefix_arg();
         run_ok(
             &sam,
             &RefBuilder::new().contig("chr1", REF).without_fai(),

@@ -22,7 +22,10 @@ cargo ci-test   # nextest (or `cargo test`)
 ### NEB concordance
 
 `dev/neb_concordance.py` cross-checks methylsieve against NEB's
-`mark-nonconverted-reads` on synthetic data. It needs `pysam` and `samtools`:
+`mark-nonconverted-reads` on synthetic data. It needs `pysam` (pip) and
+`samtools` — not a pip package, so install it via your package manager (e.g.
+`conda install -c bioconda samtools` or `brew install samtools`) and make sure
+it is on your `PATH`:
 
 ```bash
 python3 -m venv neb-venv && neb-venv/bin/pip install pysam

@@ -12,7 +12,7 @@ const SEQ10: &str = "CACACACACA"; // 5 CpA top-strand C's
 fn control_reads_are_separated_and_chimeric_is_counted() {
     let env = TestEnv::new();
     let reference = RefBuilder::new().contig("chr1", SEQ10).contig("lambda", SEQ10);
-    let stats = env.metrics_prefix.to_str().unwrap().to_string();
+    let stats = env.metrics_prefix_arg();
     let sam = SamBuilder::new()
         .sq("chr1", SEQ10.len())
         .sq("lambda", SEQ10.len())
