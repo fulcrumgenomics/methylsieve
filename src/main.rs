@@ -12,7 +12,6 @@
 //! `-q` quiet.
 
 mod buffer;
-mod io_threading;
 mod mask;
 mod mbias;
 mod metrics;
@@ -587,7 +586,7 @@ fn run(args: Args) -> Result<()> {
     };
     let read_buf_bytes = (args.read_buffer_mb as usize).saturating_mul(1024 * 1024);
     let mut reader_box: Box<dyn BufRead> =
-        Box::new(crate::io_threading::ThreadedReader::new(raw_source, read_buf_bytes));
+        Box::new(rawb_io::ReadAhead::with_thread_name(raw_source, read_buf_bytes, "methylsieve"));
     let input_name =
         args.input.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "stdin".into());
     let input_format = detect_format(&mut reader_box)?;
