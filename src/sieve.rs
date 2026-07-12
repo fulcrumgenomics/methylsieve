@@ -26,29 +26,17 @@ use std::collections::BTreeMap;
 
 use anyhow::Result;
 use fgumi_raw_bam::RawRecord;
+use smallvec::SmallVec;
 
-use crate::raw_writer::RawBamWriter;
-use crate::reference::{BASE_A, BASE_C, BASE_G, BASE_T, Context, RefCodes, RefEncoding, Reference};
+use crate::mask::MaskWindows;
+use crate::mbias::{MbiasAccumulator, ReadEnd, ReadRole};
+use crate::record::{
+    FLAG_FIRST_SEGMENT, FLAG_LAST_SEGMENT, FLAG_PAIRED, FLAG_QC_FAIL, FLAG_REVERSE, FLAG_SECONDARY,
+    FLAG_SUPPLEMENTARY, FLAG_UNMAPPED, five_prime_ref_span, has, is_primary_mapped, monitor_c_of,
+    read_role, three_prime_ref_span,
+};
+use crate::reference::{BASE_A, BASE_C, BASE_G, BASE_T, Context, Reference, TwoBitCodes};
 use crate::{ContextMask, TagSpec};
-
-// ── SAM flag constants ──────────────────────────────────────────────────────
-
-/// SAM FLAG 0x1: template has multiple segments (paired-end).
-pub(crate) const FLAG_PAIRED: u16 = 0x1;
-/// SAM FLAG 0x4: segment unmapped.
-pub(crate) const FLAG_UNMAPPED: u16 = 0x4;
-/// SAM FLAG 0x10: this segment is on the reverse strand.
-pub(crate) const FLAG_REVERSE: u16 = 0x10;
-/// SAM FLAG 0x40: first segment in the template (R1).
-pub(crate) const FLAG_FIRST_SEGMENT: u16 = 0x40;
-/// SAM FLAG 0x80: last segment in the template (R2).
-pub(crate) const FLAG_LAST_SEGMENT: u16 = 0x80;
-/// SAM FLAG 0x100: secondary alignment.
-pub(crate) const FLAG_SECONDARY: u16 = 0x100;
-/// SAM FLAG 0x200: QC-fail (the bit we OR in for unconverted templates).
-pub(crate) const FLAG_QC_FAIL: u16 = 0x200;
-/// SAM FLAG 0x800: supplementary (chimeric) alignment.
-pub(crate) const FLAG_SUPPLEMENTARY: u16 = 0x800;
 
 // ── Processor ───────────────────────────────────────────────────────────────
 
@@ -61,6 +49,33 @@ pub(crate) struct RecordProcessor {
     has_controls: bool,
 }
 
+/// The best primary-record candidate for classifying a template, in preference
+/// order R1 > sole unpaired > any. Used by [`RecordProcessor::classification_index`]
+/// to pick within the mapped tier first, then the unmapped tier.
+#[derive(Default)]
+struct PrimaryPick {
+    r1: Option<usize>,
+    unpaired: Option<usize>,
+    any: Option<usize>,
+}
+
+impl PrimaryPick {
+    /// Offer primary record `i` with flags `f` (first offer per slot wins).
+    fn offer(&mut self, i: usize, f: u16) {
+        self.any.get_or_insert(i);
+        if !has(f, FLAG_PAIRED) {
+            self.unpaired.get_or_insert(i);
+        } else if has(f, FLAG_FIRST_SEGMENT) {
+            self.r1.get_or_insert(i);
+        }
+    }
+
+    /// The preferred candidate, if any.
+    fn pick(&self) -> Option<usize> {
+        self.r1.or(self.unpaired).or(self.any)
+    }
+}
+
 impl RecordProcessor {
     /// Build from a loaded reference and resolved options.
     #[must_use]
@@ -69,27 +84,35 @@ impl RecordProcessor {
         Self { reference, opts, has_controls }
     }
 
-    /// Process one QNAME block: classify, tally, decide, propagate, emit.
+    /// Classify, tally, accumulate M-bias, decide, and **stamp** every record of
+    /// the template with the conversion tag / flag (no write). Returns whether
+    /// the template should be emitted ([`Disposition::Keep`]) or dropped
+    /// (`--remove-unconverted`). The caller owns emission, so it can buffer the
+    /// stamped records (M-bias learn phase), mask them, or write them straight
+    /// through.
     ///
     /// # Errors
-    /// Returns an error if the block is not query-grouped (no primary present)
-    /// or the output write fails.
+    /// Returns an error if the block is not query-grouped (no primary present).
     pub(crate) fn process_block(
         &self,
         block: &mut [RawRecord],
         stats: &mut Stats,
-        out: &mut RawBamWriter,
-    ) -> Result<()> {
+        mut mbias: Option<&mut MbiasAccumulator>,
+        mask_windows: &[MaskWindows],
+    ) -> Result<Disposition> {
         stats.total_templates += 1;
 
         let class_idx = self.classification_index(block)?;
         let class_rec = &block[class_idx];
 
-        // Unmapped primary R1 → pass through, no tally, no decision.
+        // No primary mapped (fully unmapped template) → pass through, no tally,
+        // no decision. A half-mapped pair classifies on its mapped mate above, so
+        // it does not reach here.
         if has(class_rec.flags(), FLAG_UNMAPPED) {
             stats.genome.n_templates += 1;
             stats.unmapped_templates += 1;
-            return self.emit(block, Action::PassThrough, (0, 0), out);
+            self.stamp(block, Action::PassThrough, (0, 0));
+            return Ok(Disposition::Keep);
         }
 
         let tid = class_rec.ref_id();
@@ -104,20 +127,35 @@ impl RecordProcessor {
         let trimming = self.opts.ignore_template_ends > 0;
         let termini =
             if trimming { self.template_termini(block) } else { TemplateTermini::default() };
+        // Per-record mask windows (stored positions) when masking is active; empty
+        // otherwise. The caller has already gated on `mask_quality < min_base_quality`
+        // (passing no windows when masking wouldn't lower a base below the gate), so
+        // the tally excludes exactly the bases a downstream caller would drop.
+        let masking = !mask_windows.is_empty();
         let mut counters = PerContextCounters::default();
         for (i, rec) in block.iter().enumerate() {
             if self.is_evidence_record(rec) {
-                // Per-record trim: own 5' (or both ends for SE/orphan) via the read
-                // window, plus one interior genomic skip. The overlap dedup region
-                // takes precedence; an intruding mate terminus is used only when
-                // there is no overlap (it is otherwise contained within it). The
-                // terminus machinery is bypassed entirely when not trimming.
-                let (trim_lo, trim_hi, mate_terminus) = if trimming {
+                let seq_len = rec.l_seq() as usize;
+                // Stored-position exclusions for this record: own template-end trims
+                // (`--ignore-template-ends`) as intervals, plus its M-bias mask
+                // windows. The two never coexist (masking forces the trim to 0), but
+                // the unified set carries either. `tally_span` sorts/merges them.
+                let mut stored: SmallVec<[(usize, usize); 4]> = SmallVec::new();
+                let mate_terminus = if trimming {
                     let (lo, hi) = termini.own_trim_for(rec, self.opts.ignore_template_ends);
-                    (lo, hi, termini.mate_skip_for(rec))
+                    if lo > 0 {
+                        stored.push((0, lo));
+                    }
+                    if hi > 0 {
+                        stored.push((seq_len.saturating_sub(hi), seq_len));
+                    }
+                    termini.mate_skip_for(rec)
                 } else {
-                    (0, 0, None)
+                    None
                 };
+                if masking {
+                    stored.extend_from_slice(&mask_windows[i]);
+                }
                 // Overlap handling: split the overlap at its midpoint and let each
                 // mate keep the half nearer its own 5' end (where its base quality
                 // is higher), so neither read's calls dominate the whole overlap.
@@ -126,9 +164,10 @@ impl RecordProcessor {
                         return None;
                     }
                     if trimming {
-                        // Keep legacy R1-takes-all so a 5' template-end trim still
-                        // occupies the single skip slot (split and trimming aren't
-                        // combined).
+                        // Split-dedup and end-trimming are mutually exclusive per
+                        // record (one interior-skip slot), so when trimming, assign
+                        // the whole overlap to R2 and leave that slot free for the
+                        // 5' template-end trim.
                         return (i == i2).then_some((os, oe));
                     }
                     let mid = os + (oe - os) / 2;
@@ -138,8 +177,23 @@ impl RecordProcessor {
                     // partition the overlap with no double count.
                     Some(if has(rec.flags(), FLAG_REVERSE) { (os, mid) } else { (mid, oe) })
                 });
-                let trim = RecordTrim { trim_lo, trim_hi, skip: overlap_iv.or(mate_terminus) };
-                self.tally_record(rec, trim, &mut counters);
+                let skips = RecordSkips { stored: &stored, genomic: overlap_iv.or(mate_terminus) };
+                // When M-bias is being collected, a primary mapped record's
+                // decision tally and M-bias accumulation share a single reference
+                // scan: the M-bias sites (every called cytosine, no trim/dedup) are
+                // a superset of the decision's, so one walk feeds both. Supplementary
+                // evidence — and every record when M-bias is off — takes the plain
+                // decision walk, leaving the masking-off hot path untouched.
+                // Control-contig reads are tallied (for the control summary) but
+                // excluded from M-bias, so spike-ins never skew the learned curve.
+                match mbias.as_deref_mut() {
+                    Some(acc)
+                        if is_primary_mapped(rec.flags()) && self.is_genome_tid(rec.ref_id()) =>
+                    {
+                        self.tally_and_accumulate(rec, skips, &mut counters, acc);
+                    }
+                    _ => self.tally_record(rec, skips, &mut counters),
+                }
             }
         }
 
@@ -172,12 +226,15 @@ impl RecordProcessor {
                 if monitored > 0 {
                     scope.n_evaluated += 1;
                 }
+                scope.n_mapped += 1;
                 scope.counters.add(&counters);
-                self.emit(block, Action::PassThrough, counts, out)
+                self.stamp(block, Action::PassThrough, counts);
+                Ok(Disposition::Keep)
             }
             None => {
                 // Main (genome) template.
                 stats.genome.n_templates += 1;
+                stats.genome.n_mapped += 1;
                 stats.genome.counters.add(&counters);
                 if self.opts.record_matrix {
                     // Histogram cell keyed by (checked, unconverted) over the
@@ -212,31 +269,36 @@ impl RecordProcessor {
                 } else {
                     Action::PassThrough
                 };
-                self.emit(block, action, counts, out)
+                if action == Action::Remove {
+                    return Ok(Disposition::Drop);
+                }
+                self.stamp(block, action, counts);
+                Ok(Disposition::Keep)
             }
         }
     }
 
-    /// Index of the record whose contig classifies the template: primary R1 if
-    /// present, else the sole unpaired primary, else any primary. Bails when no
-    /// primary exists (the signature of non-query-grouped input).
+    /// Index of the record whose contig classifies the template. Prefers a
+    /// **mapped** primary — R1, else the sole unpaired, else any — since its
+    /// contig is what places the template (genome vs. control). Only when no
+    /// primary is mapped does it fall back to an unmapped primary, so a
+    /// half-mapped pair (e.g. R1 unmapped, R2 a mapped primary) classifies and is
+    /// evaluated on the mapped mate instead of being passed through as unmapped.
+    /// Bails when no primary exists at all (the signature of non-query-grouped
+    /// input).
     fn classification_index(&self, block: &[RawRecord]) -> Result<usize> {
-        let mut r1_primary = None;
-        let mut unpaired_primary = None;
-        let mut any_primary = None;
+        // Preference within a mapped/unmapped tier: R1 primary > sole unpaired
+        // primary > any primary.
+        let mut mapped = PrimaryPick::default();
+        let mut unmapped = PrimaryPick::default();
         for (i, rec) in block.iter().enumerate() {
             let f = rec.flags();
             if has(f, FLAG_SECONDARY | FLAG_SUPPLEMENTARY) {
                 continue;
             }
-            any_primary.get_or_insert(i);
-            if !has(f, FLAG_PAIRED) {
-                unpaired_primary.get_or_insert(i);
-            } else if has(f, FLAG_FIRST_SEGMENT) {
-                r1_primary.get_or_insert(i);
-            }
+            if has(f, FLAG_UNMAPPED) { &mut unmapped } else { &mut mapped }.offer(i, f);
         }
-        r1_primary.or(unpaired_primary).or(any_primary).ok_or_else(|| {
+        mapped.pick().or_else(|| unmapped.pick()).ok_or_else(|| {
             let qname = block.first().map(|r| r.read_name().to_vec()).unwrap_or_default();
             anyhow::anyhow!(
                 "QNAME {} appeared with {} record(s) but no primary alignment — the primary must \
@@ -371,38 +433,22 @@ impl RecordProcessor {
     }
 
     /// Walk one record's aligned positions and add its monitored cytosines to
-    /// `counters`, dispatching once on the reference encoding so the inner walk
-    /// is monomorphized per [`RefCodes`] layout.
-    fn tally_record(&self, rec: &RawRecord, trim: RecordTrim, counters: &mut PerContextCounters) {
-        let tid = rec.ref_id();
-        match self.reference.encoding() {
-            RefEncoding::Bytes => {
-                if let Some(c) = self.reference.byte_codes(tid) {
-                    self.tally_aligned(rec, c, trim, counters);
-                }
-            }
-            RefEncoding::Nibble => {
-                if let Some(c) = self.reference.nibble_codes(tid) {
-                    self.tally_aligned(rec, c, trim, counters);
-                }
-            }
-            RefEncoding::TwoBit => {
-                if let Some(c) = self.reference.twobit_codes(tid) {
-                    self.tally_aligned(rec, c, trim, counters);
-                }
-            }
+    /// `counters`.
+    fn tally_record(&self, rec: &RawRecord, skips: RecordSkips, counters: &mut PerContextCounters) {
+        if let Some(c) = self.reference.codes(rec.ref_id()) {
+            self.tally_aligned(rec, c, skips, counters);
         }
     }
 
-    /// Walk one record's aligned positions over a concrete reference encoding.
+    /// Walk one record's aligned positions over its reference contig.
     ///
     /// The inner per-aligned-base work (ref-base check → context → BQ →
     /// read-base compare → counter bump) is the hot path, run by [`tally_span`].
-    fn tally_aligned<R: RefCodes + Copy>(
+    fn tally_aligned(
         &self,
         rec: &RawRecord,
-        refc: R,
-        trim: RecordTrim,
+        refc: TwoBitCodes<'_>,
+        skips: RecordSkips,
         counters: &mut PerContextCounters,
     ) {
         let seq_len = rec.l_seq() as usize;
@@ -416,16 +462,10 @@ impl RecordProcessor {
         let f = rec.flags();
         let monitor_c = monitor_c_of(f);
 
-        // Template-end trim window over *stored* read positions [keep_lo, keep_hi).
-        // `trim.trim_lo`/`trim.trim_hi` are already resolved (by the caller) for
-        // this record's strand and role: a paired read trims only its own 5' end,
-        // a single-end/orphan read trims both ends. Stored soft-clips occupy the
-        // read-position extremes, so they naturally count toward the budget. The
-        // interior genomic skip (`trim.skip`) carries the mate's terminus or the
-        // PE-overlap dedup region, which fall in this read's interior.
-        let keep_lo = trim.trim_lo;
-        let keep_hi = seq_len.saturating_sub(trim.trim_hi);
-
+        // `skips.stored` holds the stored-position exclusions (trims ∪ mask
+        // windows), already resolved for this record's strand/role and sorted;
+        // `skips.genomic` carries the mate terminus or PE-overlap dedup region.
+        // Both are applied in `tally_span` over the per-base `k` offset.
         let min_bq = self.opts.min_base_quality;
         // The monitored reference base is fixed for the whole record by strand.
         let monitored_base = if monitor_c { BASE_C } else { BASE_G };
@@ -440,11 +480,10 @@ impl RecordProcessor {
             monitor_c,
             monitored_base,
             min_bq,
-            keep_lo,
-            keep_hi,
             seq_len,
             ref_len,
-            skip: trim.skip,
+            stored_skips: skips.stored,
+            skip: skips.genomic,
         };
         for op in rec.cigar_ops_iter() {
             let len = (op >> 4) as usize;
@@ -469,6 +508,155 @@ impl RecordProcessor {
         }
     }
 
+    /// Tally one primary mapped record's decision counts **and** its per-cycle
+    /// M-bias in a single reference scan, dispatching once on the encoding.
+    ///
+    /// Used in place of a separate [`Self::tally_aligned`] + M-bias pass whenever
+    /// M-bias is being collected (`--metrics-prefix` or, pre-freeze, masking):
+    /// the M-bias sites — every called cytosine at its true cycle, no end-trim and
+    /// no overlap dedup — are a superset of the decision's, so one walk feeds both
+    /// and `classify_site` runs once per site instead of twice. The masking-off
+    /// decision path never reaches here; it keeps using [`Self::tally_aligned`]
+    /// untouched, so that codegen-sensitive hot loop is unaffected.
+    fn tally_and_accumulate(
+        &self,
+        rec: &RawRecord,
+        skips: RecordSkips,
+        counters: &mut PerContextCounters,
+        acc: &mut MbiasAccumulator,
+    ) {
+        if let Some(c) = self.reference.codes(rec.ref_id()) {
+            self.fused_walk(rec, c, skips, counters, acc);
+        }
+    }
+
+    /// Single-scan decision tally + M-bias accumulation for one primary mapped
+    /// record over its reference contig.
+    ///
+    /// The scan visits the full aligned range — every called cytosine — and
+    /// records each into the M-bias accumulator at its 5' cycle (reverse records
+    /// store SEQ forward-genomic, so their 5' end is the high stored position;
+    /// single-end reads also record from the 3' end). It additionally bumps the
+    /// decision counters for the subset of sites the decision walk would have
+    /// counted: stored read position outside every `skips.stored` interval and
+    /// genomic position outside the `skips.genomic` dedup region — the same
+    /// exclusions [`tally_span`] applies, evaluated per site here (cheap, since the
+    /// site is already classified). M-bias records every site regardless of the
+    /// exclusions, so the learned curve stays a pre-mask measurement even when the
+    /// tally drops the masked bases. `classify_site` and the per-base reference
+    /// probe thus run once instead of once per walk.
+    fn fused_walk(
+        &self,
+        rec: &RawRecord,
+        refc: TwoBitCodes<'_>,
+        skips: RecordSkips,
+        counters: &mut PerContextCounters,
+        acc: &mut MbiasAccumulator,
+    ) {
+        let seq_len = rec.l_seq() as usize;
+        let pos = rec.pos();
+        if seq_len == 0 || pos < 0 {
+            return;
+        }
+        let ref_len = refc.len();
+        let f = rec.flags();
+        let monitor_c = monitor_c_of(f);
+        let monitored_base = if monitor_c { BASE_C } else { BASE_G };
+        let role = read_role(f);
+        let is_se = role == ReadRole::Se;
+        let reverse = has(f, FLAG_REVERSE);
+        let min_bq = self.opts.min_base_quality;
+
+        // Decision-counter gate, mirroring `tally_span`: a site counts iff its
+        // genomic position is outside the dedup skip and its stored position is
+        // outside every exclusion interval (trims ∪ mask windows). M-bias records
+        // every classified site regardless of the exclusions, so the learned curve
+        // stays a pre-mask measurement. `has_stored` is hoisted so the common
+        // no-trim/no-mask path skips the interval scan with a single bool test.
+        let (skip_s, skip_e) = skips.genomic.unwrap_or((usize::MAX, usize::MAX));
+        let stored = skips.stored;
+        let has_stored = !stored.is_empty();
+
+        let mut read_pos = 0usize;
+        let mut ref_pos = pos as usize;
+        for op in rec.cigar_ops_iter() {
+            let len = (op >> 4) as usize;
+            match op & 0xf {
+                // M, =, X — aligned; both read and reference advance.
+                0 | 7 | 8 => {
+                    // Clip the op to positions valid in both SEQ and the contig,
+                    // so the inner loop needs no per-base bounds test.
+                    let k1 = len
+                        .min(seq_len.saturating_sub(read_pos))
+                        .min(ref_len.saturating_sub(ref_pos));
+                    for k in 0..k1 {
+                        let gp = ref_pos + k;
+                        if !refc.monitors(gp, monitored_base) {
+                            continue;
+                        }
+                        let rp = read_pos + k;
+                        if let Some((ctx, unconverted)) =
+                            classify_site(rec, refc, rp, gp, monitor_c, min_bq, ref_len)
+                        {
+                            let cycle_5p = if reverse { seq_len - 1 - rp } else { rp };
+                            acc.record(role, ReadEnd::FivePrime, ctx, cycle_5p, unconverted);
+                            if is_se {
+                                let c3 = seq_len - 1 - cycle_5p;
+                                acc.record(role, ReadEnd::ThreePrime, ctx, c3, unconverted);
+                            }
+                            let excluded = (gp >= skip_s && gp < skip_e)
+                                || (has_stored && stored.iter().any(|&(a, b)| rp >= a && rp < b));
+                            if !excluded {
+                                counters.record(ctx, unconverted);
+                            }
+                        }
+                    }
+                    read_pos += len;
+                    ref_pos += len;
+                }
+                1 | 4 => read_pos += len,
+                2 | 3 => ref_pos += len,
+                _ => {}
+            }
+        }
+    }
+
+    /// Whether `tid` maps to the genome scope (not a `--control-contig`). M-bias
+    /// is learned and reported only from genome reads, so spike-in controls
+    /// (methylated pUC19 / unmethylated lambda) never skew the CpG curve, the
+    /// frozen mask lengths, or `mbias.tsv`. Short-circuits when no controls are
+    /// configured so the common case pays nothing.
+    #[inline]
+    fn is_genome_tid(&self, tid: i32) -> bool {
+        !self.has_controls
+            || (tid >= 0 && self.opts.scope_of_tid.get(tid as usize).copied().flatten().is_none())
+    }
+
+    /// Accumulate per-cycle M-bias for one template's primary mapped **genome**
+    /// records, **without** committing the decision. Used in the masking learn
+    /// phase, where the curve is measured pre-mask but the unconverted decision is
+    /// deferred to the post-mask drain.
+    ///
+    /// Reuses the streaming [`Self::fused_walk`] (M-bias + decision tally) and
+    /// **discards its tally**: the M-bias half is byte-identical to the streaming
+    /// path's, so the learned curve matches exactly, and passing no exclusions
+    /// (`RecordSkips::default`) records every site as M-bias requires. The learn
+    /// phase is a one-time buffered-prefix cost, so the thrown-away tally work is
+    /// immaterial — and sharing one walk keeps the two from ever diverging on the
+    /// cycle mapping. Control-contig reads are excluded (see [`Self::is_genome_tid`]).
+    pub(crate) fn accumulate_mbias(&self, block: &[RawRecord], acc: &mut MbiasAccumulator) {
+        let mut discard = PerContextCounters::default();
+        for rec in block {
+            if self.is_evidence_record(rec)
+                && is_primary_mapped(rec.flags())
+                && self.is_genome_tid(rec.ref_id())
+                && let Some(c) = self.reference.codes(rec.ref_id())
+            {
+                self.fused_walk(rec, c, RecordSkips::default(), &mut discard, acc);
+            }
+        }
+    }
+
     /// Decide whether a template is unconverted from its aggregated counts.
     /// Thin wrapper over [`Self::classify`] on the threshold-context totals.
     fn decide(&self, counters: &PerContextCounters) -> bool {
@@ -480,30 +668,29 @@ impl RecordProcessor {
     /// Classify a template from its `(unconverted, monitored)` site counts over
     /// the threshold contexts: returns whether it is unconverted and which arm
     /// of the decision logic applied. Pure in `(unconv, monitored)` given the
-    /// configured mode/thresholds, so `--conversion-matrix` can replay it per
-    /// cell without re-tallying; `decide` is this `.0`.
+    /// configured mode/thresholds, so the `conversion-matrix.tsv` output (under
+    /// `--metrics-prefix`) can replay it per cell without re-tallying; `decide` is
+    /// this `.0`.
     ///
     /// `min_sites` is a **floor**: the proportion test is unestimable below it
     /// and abstains. A template with no monitored sites is never unconverted.
     pub(crate) fn classify(&self, unconv: u64, monitored: u64) -> (bool, DecidedBy) {
         if monitored == 0 {
-            return (false, DecidedBy::ZeroSites);
+            return (false, DecidedBy::TooFewSites);
         }
         let count_hit = unconv >= u64::from(self.opts.max_unconverted_count);
         // The proportion is only estimable at/above the site floor; below it the
         // proportion test abstains.
         let at_floor = monitored >= u64::from(self.opts.min_sites);
+        // The count test can only ever fire with at least `max_unconverted_count`
+        // monitored sites — you cannot reach N unconverted with fewer than N
+        // sites. Below that the count arm is not merely unhit, it is *unreachable*.
+        let count_reachable = monitored >= u64::from(self.opts.max_unconverted_count);
         let frac_hit =
             at_floor && (unconv as f64) / (monitored as f64) > self.opts.max_unconverted_fraction;
-        match self.opts.mode {
+        let (unconverted, by) = match self.opts.mode {
             DecisionMode::Count => (count_hit, DecidedBy::Count),
-            DecisionMode::Proportion => {
-                if at_floor {
-                    (frac_hit, DecidedBy::Proportion)
-                } else {
-                    (false, DecidedBy::MinSitesFloor)
-                }
-            }
+            DecisionMode::Proportion => (at_floor && frac_hit, DecidedBy::Proportion),
             DecisionMode::Either => (count_hit || frac_hit, DecidedBy::Either),
             // Trust the rate at/above the floor (an absolute count over-penalizes
             // long reads); fall back to the count below it, where the rate can't
@@ -515,23 +702,32 @@ impl RecordProcessor {
                     (count_hit, DecidedBy::Count)
                 }
             }
+        };
+        // A not-flagged template is "too few sites" only when the test that would
+        // apply could not have rendered a verdict at all — not merely when it came
+        // back negative. The proportion arm needs the site floor; the count arm
+        // needs at least `max_unconverted_count` sites to be reachable. Modes that
+        // fall back to the count arm (Count, Either, Adaptive) are therefore "too
+        // few" only below the count threshold, not merely below the proportion
+        // floor — a template with enough sites to reach the count was genuinely
+        // checked (and cleared) by the count arm.
+        let checkable = match self.opts.mode {
+            DecisionMode::Count => count_reachable,
+            DecisionMode::Proportion => at_floor,
+            DecisionMode::Either | DecisionMode::Adaptive => at_floor || count_reachable,
+        };
+        if !unconverted && !checkable {
+            return (false, DecidedBy::TooFewSites);
         }
+        (unconverted, by)
     }
 
-    /// Apply `action` to every record of the block and write to `out`.
-    /// Apply `action` to every record of the block and write to `out`. `counts`
-    /// is the template's `(unconverted, total)` over the decision contexts, used
-    /// only for the optional `--count-tag` annotation.
-    fn emit(
-        &self,
-        block: &mut [RawRecord],
-        action: Action,
-        counts: (u64, u64),
-        out: &mut RawBamWriter,
-    ) -> Result<()> {
-        if action == Action::Remove {
-            return Ok(());
-        }
+    /// Stamp every record of the template with the conversion tag / QC-fail flag
+    /// (for [`Action::Mark`]) and the optional per-record count tag. Mutates in
+    /// place; does not write. `counts` is the template's `(unconverted, total)`
+    /// over the decision contexts (for `--count-tag`). Not called for
+    /// [`Action::Remove`] (the caller drops the template instead).
+    fn stamp(&self, block: &mut [RawRecord], action: Action, counts: (u64, u64)) {
         // The count tag is a per-template aggregate (u/n over the decision
         // contexts): build the value once, stamp every record. Applied on every
         // template, flagged or not, so a user can inspect surprises either way.
@@ -551,10 +747,17 @@ impl RecordProcessor {
             {
                 rec.tags_editor().append_string(tag, value.as_bytes());
             }
-            out.write_record(rec)?;
         }
-        Ok(())
     }
+}
+
+/// Whether a processed template should be emitted or dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Disposition {
+    /// Emit every record (already stamped).
+    Keep,
+    /// Drop the whole template (`--remove-unconverted`).
+    Drop,
 }
 
 /// How the per-template unconverted decision combines the count and proportion
@@ -577,19 +780,19 @@ pub(crate) enum DecisionMode {
 }
 
 /// Which arm of [`RecordProcessor::classify`] produced a template's verdict —
-/// surfaced per cell by `--conversion-matrix`.
+/// surfaced per cell in the `decided_by` column of `conversion-matrix.tsv`
+/// (under `--metrics-prefix`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DecidedBy {
-    /// No monitored sites in the threshold contexts → converted by default.
-    ZeroSites,
+    /// Too few sites to render a verdict: zero monitored sites, or below the
+    /// `min_sites` floor with nothing flagging it — the template passes through
+    /// converted, but on insufficient evidence to classify either way.
+    TooFewSites,
     /// The count test was the operative arm (count mode, or the sub-floor
     /// fallback in adaptive mode).
     Count,
     /// The proportion test was the operative arm (at/above `min_sites`).
     Proportion,
-    /// Proportion mode below the `min_sites` floor: the test abstains and the
-    /// template passes through converted.
-    MinSitesFloor,
     /// Either mode: the count and proportion tests OR'd together.
     Either,
 }
@@ -597,10 +800,9 @@ pub(crate) enum DecidedBy {
 impl DecidedBy {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            DecidedBy::ZeroSites => "zero_sites",
+            DecidedBy::TooFewSites => "too_few_sites",
             DecidedBy::Count => "count",
             DecidedBy::Proportion => "proportion",
-            DecidedBy::MinSitesFloor => "min_sites_floor",
             DecidedBy::Either => "either",
         }
     }
@@ -638,8 +840,9 @@ pub(crate) struct ProcessorOptions {
     pub(crate) remove_unconverted: bool,
     /// Scope per BAM tid: `None` → genome, `Some(i)` → `controls[i]`.
     pub(crate) scope_of_tid: Vec<Option<usize>>,
-    /// Accumulate the per-`(checked, unconverted)` decision histogram for
-    /// `--conversion-matrix`. Off by default to avoid per-template map cost.
+    /// Accumulate the per-`(checked, unconverted)` decision histogram for the
+    /// `conversion-matrix.tsv` output (under `--metrics-prefix`). Off by default
+    /// to avoid per-template map cost.
     pub(crate) record_matrix: bool,
 }
 
@@ -692,7 +895,7 @@ impl TemplateTermini {
     /// The genomic terminus belonging to the *other* mate, if it intrudes into
     /// this record's reference span (so non-overlapping mates contribute no
     /// per-base skip). `None` for single-end/orphan reads (both ends already
-    /// handled by [`own_trim_for`]).
+    /// handled by [`Self::own_trim_for`]).
     #[inline(never)]
     fn mate_skip_for(&self, rec: &RawRecord) -> Option<(usize, usize)> {
         if self.single {
@@ -716,17 +919,25 @@ impl TemplateTermini {
     }
 }
 
-/// Per-record trimming resolved at the template level and handed to the tally.
-#[derive(Debug, Clone, Copy, Default)]
-struct RecordTrim {
-    /// Stored read bases to drop from the low-position end.
-    trim_lo: usize,
-    /// Stored read bases to drop from the high-position end.
-    trim_hi: usize,
-    /// Single genomic interval to skip in this record's interior: the PE-overlap
-    /// dedup region, or the mate's intruding template terminus (the overlap
-    /// subsumes the terminus when both apply).
-    skip: Option<(usize, usize)>,
+/// One record's tally exclusions: the bases that don't count toward the
+/// unconverted decision. A single generalized "ignore these" set fed by two
+/// inputs that share the per-base `k` offset along an M-span:
+///
+/// - `stored`: half-open **stored read-position** intervals — the
+///   `--ignore-template-ends` 5'/3' trims *and* the M-bias mask windows, unified.
+///   Empty in the common case (no trim, no mask), so the hot path skips the
+///   machinery entirely; `tally_span` sorts and merges them when present (the
+///   caller does not). May be interior (a propagated mask overhang), so it is a
+///   true interval set, never a 5'/3' length pair.
+/// - `genomic`: a single **reference-position** interval — the PE-overlap dedup
+///   region or an intruding mate terminus (the overlap subsumes the terminus when
+///   both apply). Kept genomic rather than converted to stored: it is naturally a
+///   reference span and converting it would cost a CIGAR walk on the hot
+///   overlap-heavy path.
+#[derive(Clone, Copy, Default)]
+struct RecordSkips<'a> {
+    stored: &'a [(usize, usize)],
+    genomic: Option<(usize, usize)>,
 }
 
 // ── Stats ───────────────────────────────────────────────────────────────────
@@ -753,7 +964,9 @@ pub(crate) struct Stats {
     pub(crate) total_templates: u64,
     /// Genome decision histogram keyed by `(checked_sites, unconverted_sites)`
     /// over the threshold contexts → template count. Populated only when
-    /// `record_matrix` is set (drives the `--conversion-matrix` output).
+    /// `record_matrix` is set (drives the `conversion-matrix.tsv` output under
+    /// `--metrics-prefix`). Note the key stores *unconverted* sites; the TSV emits
+    /// the complementary `converted_sites` (= checked − unconverted) for readers.
     pub(crate) conversion_matrix: BTreeMap<(u64, u64), u64>,
 }
 
@@ -781,6 +994,8 @@ pub(crate) struct ScopeStats {
     pub(crate) name: String,
     /// Templates routed to this scope (mapped, unmapped, and zero-site alike).
     pub(crate) n_templates: u64,
+    /// Templates with at least one mapped primary alignment.
+    pub(crate) n_mapped: u64,
     /// Templates that produced at least one monitored site (in any context).
     pub(crate) n_evaluated: u64,
     /// Templates decided unconverted (always 0 for control scopes).
@@ -796,6 +1011,7 @@ impl ScopeStats {
         Self {
             name,
             n_templates: 0,
+            n_mapped: 0,
             n_evaluated: 0,
             n_unconverted: 0,
             n_removed: 0,
@@ -811,9 +1027,9 @@ impl ScopeStats {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct PerContextCounters {
     /// Unconverted cytosines (ref C read as C / ref G read as G) per context.
-    pub(crate) unconv: [u64; 4],
+    unconv: [u64; 4],
     /// Total monitored & called cytosines (converted + unconverted) per context.
-    pub(crate) total: [u64; 4],
+    total: [u64; 4],
 }
 
 impl PerContextCounters {
@@ -824,6 +1040,26 @@ impl PerContextCounters {
         if unconverted {
             self.unconv[i] += 1;
         }
+    }
+
+    /// Add `unconv` unconverted of `total` monitored sites to `ctx` (bulk form of
+    /// [`Self::record`], for seeding counters in tests).
+    #[cfg(test)]
+    pub(crate) fn add_counts(&mut self, ctx: Context, unconv: u64, total: u64) {
+        self.unconv[ctx.index()] += unconv;
+        self.total[ctx.index()] += total;
+    }
+
+    /// Unconverted count for one context.
+    #[must_use]
+    pub(crate) fn unconv_for(&self, ctx: Context) -> u64 {
+        self.unconv[ctx.index()]
+    }
+
+    /// Total monitored count for one context.
+    #[must_use]
+    pub(crate) fn total_for(&self, ctx: Context) -> u64 {
+        self.total[ctx.index()]
     }
 
     /// Accumulate `other` into `self`.
@@ -863,76 +1099,87 @@ impl PerContextCounters {
 
 /// Fixed-per-record parameters threaded into the span kernels.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct SpanParams {
+struct SpanParams<'a> {
     /// Whether this record monitors reference C (top) or G (bottom).
     pub(crate) monitor_c: bool,
     /// The monitored 4-bit reference base code (C=2 or G=4).
     pub(crate) monitored_base: u8,
     /// Minimum base quality to tally a site.
     pub(crate) min_bq: u8,
-    /// Inclusive lower bound of the kept read-position window (the record's own
-    /// 5'-end template trim folds into this; see [`RecordProcessor::tally_aligned`]).
-    pub(crate) keep_lo: usize,
-    /// Exclusive upper bound of the kept read-position window.
-    pub(crate) keep_hi: usize,
     /// Stored SEQ length (read positions are valid in `0..seq_len`).
     pub(crate) seq_len: usize,
     /// Contig length (reference positions are valid in `0..ref_len`).
     pub(crate) ref_len: usize,
-    /// A single reference half-open interval `[start, end)` to skip even when it
-    /// falls inside the kept window: the PE-overlap dedup region, or the mate's
-    /// template terminus that intrudes into this read. One interval suffices
-    /// because an intruding mate terminus is always contained in the overlap
-    /// region when both apply — see [`RecordProcessor::process_block`]. `None` in
-    /// the common case (one cheap discriminant check on the per-base hot path).
+    /// Stored read-position intervals to exclude (trims ∪ mask windows), in
+    /// arrival order (`tally_span` sorts and merges them). Empty in the hot path
+    /// (no trim, no masking).
+    pub(crate) stored_skips: &'a [(usize, usize)],
+    /// A single reference half-open interval `[start, end)` to skip: the PE-overlap
+    /// dedup region, or the mate's template terminus that intrudes into this read.
+    /// One interval suffices because an intruding mate terminus is always contained
+    /// in the overlap region when both apply — see [`RecordProcessor::process_block`].
+    /// `None` in the common case (one cheap discriminant check on the per-base hot path).
     pub(crate) skip: Option<(usize, usize)>,
 }
 
-/// Classify a single already-matched monitored cytosine at read position `rp` /
-/// reference position `gp` and record it. `ref_codes[gp]` is assumed to equal
-/// the monitored base and `gp < ref_len`.
+/// Classify one already-matched monitored cytosine at read position `rp` /
+/// reference position `gp`: returns its `(context, unconverted)`, or `None` to
+/// drop it (base quality below `min_bq`, a chromosome edge with no neighbor, or
+/// a read base that is neither the unconverted nor converted call — SNP / N).
+/// `refc[gp]` is assumed to equal the monitored base. Shared by the decision
+/// tally ([`tally_site`]) and the fused decision+M-bias walk
+/// ([`RecordProcessor::fused_walk`]) so the two agree on context/edge/drop rules;
+/// `#[inline]` so it folds into the decision hot loop with no call overhead.
 #[inline]
-fn tally_site<R: RefCodes>(
+fn classify_site(
     rec: &RawRecord,
-    refc: R,
+    refc: TwoBitCodes<'_>,
+    rp: usize,
+    gp: usize,
+    monitor_c: bool,
+    min_bq: u8,
+    ref_len: usize,
+) -> Option<(Context, bool)> {
+    if rec.get_qual(rp) < min_bq {
+        return None;
+    }
+    // Context from the reference neighbor (chrom-end safe), decoded in the
+    // encoding's native space (no per-neighbor 4-bit decode for packed layouts).
+    let ctx = if monitor_c {
+        if gp + 1 >= ref_len {
+            return None;
+        }
+        refc.ctx_top(gp + 1)
+    } else {
+        if gp == 0 {
+            return None;
+        }
+        refc.ctx_bottom(gp - 1)
+    }?;
+    let unconverted = match (monitor_c, rec.get_base(rp)) {
+        (true, BASE_C) | (false, BASE_G) => true,  // unconverted
+        (true, BASE_T) | (false, BASE_A) => false, // converted
+        _ => return None,                          // SNP / N — drop
+    };
+    Some((ctx, unconverted))
+}
+
+/// Classify a single already-matched monitored cytosine and record it into the
+/// decision counters. `refc[gp]` is assumed to equal the monitored base.
+#[inline]
+fn tally_site(
+    rec: &RawRecord,
+    refc: TwoBitCodes<'_>,
     rp: usize,
     gp: usize,
     p: &SpanParams,
     counters: &mut PerContextCounters,
 ) {
-    if rec.get_qual(rp) < p.min_bq {
-        return;
+    if let Some((ctx, unconverted)) =
+        classify_site(rec, refc, rp, gp, p.monitor_c, p.min_bq, p.ref_len)
+    {
+        counters.record(ctx, unconverted);
     }
-    // Context from the reference neighbor (chrom-end safe), decoded in the
-    // encoding's native space (no per-neighbor 4-bit decode for packed layouts).
-    let ctx = if p.monitor_c {
-        if gp + 1 >= p.ref_len {
-            return;
-        }
-        refc.ctx_top(gp + 1)
-    } else {
-        if gp == 0 {
-            return;
-        }
-        refc.ctx_bottom(gp - 1)
-    };
-    let Some(ctx) = ctx else { return };
-
-    let readb = rec.get_base(rp);
-    let unconverted = if p.monitor_c {
-        match readb {
-            BASE_C => true,  // unconverted
-            BASE_T => false, // converted
-            _ => return,     // SNP / N — drop
-        }
-    } else {
-        match readb {
-            BASE_G => true,
-            BASE_A => false,
-            _ => return,
-        }
-    };
-    counters.record(ctx, unconverted);
 }
 
 /// Tally a contiguous run of aligned positions `[lo, hi)` (in local `k`
@@ -941,9 +1188,9 @@ fn tally_site<R: RefCodes>(
 /// threaded as scalars (not a `Range`) so they stay in registers on the hot path.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-fn tally_run<R: RefCodes + Copy>(
+fn tally_run(
     rec: &RawRecord,
-    refc: R,
+    refc: TwoBitCodes<'_>,
     rp_start: usize,
     gp_start: usize,
     lo: usize,
@@ -963,10 +1210,9 @@ fn tally_run<R: RefCodes + Copy>(
     }
 }
 
-/// Scalar reference-span tally generic over the reference encoding: walk `len`
-/// aligned positions from read position `rp_start` / reference position
-/// `gp_start`. Monomorphized per [`RefCodes`] impl, so each encoding gets its
-/// own branch-free-on-layout loop.
+/// Scalar reference-span tally: walk `len` aligned positions from read position
+/// `rp_start` / reference position `gp_start`, comparing against the 2-bit packed
+/// reference in its native space (no per-base decode).
 ///
 /// Any genomic skip (mate terminus / PE-overlap dedup) is carved out of the scan
 /// *range* rather than tested per base: the common no-skip case is a single tight
@@ -975,120 +1221,82 @@ fn tally_run<R: RefCodes + Copy>(
 /// excluded middle. (Keeping the skip handling inline matters: any out-of-line
 /// helper here stops `tally_span` from fusing into the caller and regresses the
 /// hot path.)
-pub(crate) fn tally_span<R: RefCodes + Copy>(
+fn tally_span(
     rec: &RawRecord,
-    refc: R,
+    refc: TwoBitCodes<'_>,
     rp_start: usize,
     gp_start: usize,
     len: usize,
     p: &SpanParams,
     counters: &mut PerContextCounters,
 ) {
-    // Hoist the read-position window and contig/SEQ bounds out of the per-base
-    // loop: across an M-span `rp = rp_start + k` and `gp = gp_start + k` move
-    // together, so the four per-base bounds checks collapse to a single `k` range.
-    let k0 = p.keep_lo.saturating_sub(rp_start);
-    let k1 = len
-        .min(p.keep_hi.saturating_sub(rp_start))
-        .min(p.seq_len.saturating_sub(rp_start))
-        .min(p.ref_len.saturating_sub(gp_start));
-    match p.skip {
-        None => tally_run(rec, refc, rp_start, gp_start, k0, k1, p, counters),
-        Some((s, e)) => {
-            // Skip applies where `gp ∈ [s, e)`, i.e. `k ∈ [s-gp_start, e-gp_start)`,
-            // clamped into `[k0, k1)`. A skip outside the span leaves one side empty.
-            let sk0 = s.saturating_sub(gp_start).clamp(k0, k1);
-            let sk1 = e.saturating_sub(gp_start).clamp(k0, k1);
-            tally_run(rec, refc, rp_start, gp_start, k0, sk0, p, counters);
-            tally_run(rec, refc, rp_start, gp_start, sk1, k1, p, counters);
-        }
-    }
-}
+    // Hoist the contig/SEQ bounds out of the per-base loop: across an M-span
+    // `rp = rp_start + k` and `gp = gp_start + k` move together, so the per-base
+    // bounds checks collapse to a single valid `k` range `[0, k1)`.
+    let k1 = len.min(p.seq_len.saturating_sub(rp_start)).min(p.ref_len.saturating_sub(gp_start));
 
-// ── Flag & CIGAR helpers ────────────────────────────────────────────────────
-
-#[inline]
-fn has(flags: u16, bit: u16) -> bool {
-    flags & bit != 0
-}
-
-/// Whether a record monitors reference C (top, `true`) or G (bottom, `false`),
-/// per the per-record MethylDackel rule: treat single-end and R1 the same, then
-/// XOR with the record's own reverse bit.
-#[inline]
-fn monitor_c_of(flags: u16) -> bool {
-    let treat_as_read1 = has(flags, FLAG_FIRST_SEGMENT) || !has(flags, FLAG_PAIRED);
-    treat_as_read1 ^ has(flags, FLAG_REVERSE)
-}
-
-/// Reference half-open interval `[start, end)` covered by the alignment of the
-/// stored query positions in `[q_lo, q_hi)`. Returns `None` if no aligned base
-/// falls in that window (e.g. a fully soft-clipped end). Insertions/soft-clips
-/// inside the window consume query budget but contribute no reference positions;
-/// a deletion inside the window stretches the returned span across the gap, so
-/// the result is a single contiguous interval. Assumes `rec.pos() >= 0`.
-fn ref_span_for_query_window(rec: &RawRecord, q_lo: usize, q_hi: usize) -> Option<(usize, usize)> {
-    if q_lo >= q_hi {
-        return None;
-    }
-    let mut qpos = 0usize;
-    let mut rpos = rec.pos().max(0) as usize;
-    let mut lo = usize::MAX;
-    let mut hi = 0usize;
-    for op in rec.cigar_ops_iter() {
-        let len = (op >> 4) as usize;
-        match op & 0xf {
-            // M, =, X — aligned 1:1; intersect this op's query range with the window.
-            0 | 7 | 8 => {
-                let a = qpos.max(q_lo);
-                let b = (qpos + len).min(q_hi);
-                if a < b {
-                    lo = lo.min(rpos + (a - qpos));
-                    hi = hi.max(rpos + (b - qpos));
-                }
-                qpos += len;
-                rpos += len;
+    // Hot path: no stored exclusions (no trim, no masking). The genomic dedup
+    // skip is the only possible exclusion, handled exactly as before so this
+    // codegen-sensitive path is unchanged.
+    if p.stored_skips.is_empty() {
+        match p.skip {
+            None => tally_run(rec, refc, rp_start, gp_start, 0, k1, p, counters),
+            Some((s, e)) => {
+                // Skip applies where `gp ∈ [s, e)`, i.e. `k ∈ [s-gp_start, e-gp_start)`.
+                let sk0 = s.saturating_sub(gp_start).clamp(0, k1);
+                let sk1 = e.saturating_sub(gp_start).clamp(0, k1);
+                tally_run(rec, refc, rp_start, gp_start, 0, sk0, p, counters);
+                tally_run(rec, refc, rp_start, gp_start, sk1, k1, p, counters);
             }
-            // I, S — consume query only.
-            1 | 4 => qpos += len,
-            // D, N — consume reference only.
-            2 | 3 => rpos += len,
-            // H, P — consume neither.
-            _ => {}
         }
-        if qpos >= q_hi {
-            break;
+        return;
+    }
+
+    // General path (trim and/or masking active): gather every exclusion as a `k`
+    // range — stored intervals via `rp`, the genomic skip via `gp` — then tally
+    // the gaps between them. Both inputs collapse to the same `k` offset, so one
+    // mechanism covers trims, mask windows, and the dedup skip alike. Inline
+    // capacity covers the usual handful of exclusions; a pathological record (many
+    // propagated mask windows) spills to the heap rather than silently dropping
+    // intervals — dropping would leave bases masked in the BAM but still counted
+    // in the tally, breaking the "one geometry drives both" invariant.
+    let mut ex: SmallVec<[(usize, usize); 8]> = SmallVec::new();
+    for &(a, b) in p.stored_skips {
+        let lo = a.saturating_sub(rp_start).min(k1);
+        let hi = b.saturating_sub(rp_start).min(k1);
+        if lo < hi {
+            ex.push((lo, hi));
         }
     }
-    (lo < hi).then_some((lo, hi))
-}
-
-/// Reference span of the `n` sequenced bases at the read's 5' end (sequencing
-/// order). For a forward record the 5' end is the low stored-position end; for a
-/// reverse record SEQ is stored reverse-complemented, so the 5' end is the high
-/// stored-position end. Returns `None` if `n == 0` or those bases include no
-/// aligned position.
-fn five_prime_ref_span(rec: &RawRecord, n: usize) -> Option<(usize, usize)> {
-    if n == 0 {
-        return None;
+    if let Some((s, e)) = p.skip {
+        let lo = s.saturating_sub(gp_start).min(k1);
+        let hi = e.saturating_sub(gp_start).min(k1);
+        if lo < hi {
+            ex.push((lo, hi));
+        }
     }
-    let seq_len = rec.l_seq() as usize;
-    let (q_lo, q_hi) =
-        if has(rec.flags(), FLAG_REVERSE) { (seq_len.saturating_sub(n), seq_len) } else { (0, n) };
-    ref_span_for_query_window(rec, q_lo, q_hi)
-}
+    ex.sort_unstable();
 
-/// Reference span of the `n` sequenced bases at the read's 3' end — the opposite
-/// end from [`five_prime_ref_span`]. Used only for a lone (single-end or orphan)
-/// read, whose far template terminus can't be located, so both ends are trimmed.
-fn three_prime_ref_span(rec: &RawRecord, n: usize) -> Option<(usize, usize)> {
-    if n == 0 {
-        return None;
+    // Walk the complement of the merged exclusions over `[0, k1)`.
+    let n = ex.len();
+    let mut cur = 0;
+    let mut i = 0;
+    while i < n {
+        let (lo, mut hi) = ex[i];
+        if lo > cur {
+            tally_run(rec, refc, rp_start, gp_start, cur, lo, p, counters);
+        }
+        let mut j = i + 1;
+        while j < n && ex[j].0 <= hi {
+            hi = hi.max(ex[j].1);
+            j += 1;
+        }
+        cur = cur.max(hi);
+        i = j;
     }
-    let seq_len = rec.l_seq() as usize;
-    let (q_lo, q_hi) =
-        if has(rec.flags(), FLAG_REVERSE) { (0, n) } else { (seq_len.saturating_sub(n), seq_len) };
-    ref_span_for_query_window(rec, q_lo, q_hi)
+    if cur < k1 {
+        tally_run(rec, refc, rp_start, gp_start, cur, k1, p, counters);
+    }
 }
 
 #[cfg(test)]
@@ -1208,31 +1416,56 @@ mod tests {
 
     #[test]
     fn classify_reports_decided_by_and_matches_decide() {
-        // Zero monitored sites → converted, regardless of mode.
+        // "Too few sites" means the applied test could not render a verdict at all,
+        // not merely that it came back negative. The count arm needs enough sites
+        // to *reach* the threshold (`max_unconverted_count`); the proportion arm
+        // needs the site floor. With zero sites nothing can be checked in any mode.
         let d = decider(DecisionMode::Adaptive, 3, 0.05, 40);
-        assert_eq!(d.classify(0, 0), (false, DecidedBy::ZeroSites));
+        assert_eq!(d.classify(0, 0), (false, DecidedBy::TooFewSites));
+        // Below the count threshold (2 < 3): count can never fire, so genuinely
+        // too few — even in adaptive/count/either.
+        assert_eq!(d.classify(1, 2), (false, DecidedBy::TooFewSites), "unreachable count");
+        // Enough sites to reach the count (10 ≥ 3) but below the proportion floor:
+        // the count arm genuinely checked it (and cleared it), so it is a `count`
+        // verdict, not `too_few_sites`.
+        assert_eq!(d.classify(1, 10), (false, DecidedBy::Count), "count-checkable below floor");
 
-        // Count mode always reports the count arm.
+        // Count mode reports the count arm whenever the count is reachable (flag or
+        // not); it is only "too few" below the count threshold itself.
         let c = decider(DecisionMode::Count, 3, 0.05, 40);
-        assert_eq!(c.classify(3, 10), (true, DecidedBy::Count));
-        assert_eq!(c.classify(2, 10), (false, DecidedBy::Count));
+        assert_eq!(c.classify(3, 10), (true, DecidedBy::Count), "count flags regardless of floor");
+        assert_eq!(c.classify(2, 50), (false, DecidedBy::Count), "reachable, count says converted");
+        assert_eq!(c.classify(2, 10), (false, DecidedBy::Count), "reachable below floor → count");
+        assert_eq!(
+            c.classify(2, 2),
+            (false, DecidedBy::TooFewSites),
+            "unreachable count → too few"
+        );
 
-        // Proportion mode abstains below the floor, applies the rate at/above it.
+        // Proportion mode: the rate at/above the floor; below it the rate is
+        // unestimable, so too few regardless of how many (sub-floor) sites there are.
         let p = decider(DecisionMode::Proportion, 3, 0.05, 40);
-        assert_eq!(p.classify(5, 10), (false, DecidedBy::MinSitesFloor));
+        assert_eq!(p.classify(5, 10), (false, DecidedBy::TooFewSites));
         assert_eq!(p.classify(5, 50), (true, DecidedBy::Proportion));
 
-        // Adaptive: count arm below the floor, proportion arm at/above it.
+        // Adaptive: the count arm can still flag below the floor; otherwise the
+        // proportion arm at/above it.
         assert_eq!(d.classify(3, 10), (true, DecidedBy::Count));
         assert_eq!(d.classify(1, 50), (false, DecidedBy::Proportion));
 
-        // Either OR's the two tests under one label.
+        // Either OR's the two; reachable-by-count below the floor is an `either`
+        // verdict, and only sub-count-threshold is too few.
         let e = decider(DecisionMode::Either, 3, 0.05, 40);
         assert_eq!(e.classify(3, 10), (true, DecidedBy::Either));
-        assert_eq!(e.classify(2, 10), (false, DecidedBy::Either));
+        assert_eq!(e.classify(2, 10), (false, DecidedBy::Either), "reachable below floor → either");
+        assert_eq!(
+            e.classify(1, 2),
+            (false, DecidedBy::TooFewSites),
+            "unreachable count → too few"
+        );
 
         // classify(.0) can never drift from decide() over the same counts.
-        for &(u, t) in &[(0, 0), (3, 10), (2, 10), (5, 50), (1, 50), (40, 100)] {
+        for &(u, t) in &[(0, 0), (3, 10), (2, 10), (2, 2), (5, 50), (1, 50), (40, 100)] {
             assert_eq!(d.classify(u, t).0, d.decide(&cph_counters(u, t)), "u={u} t={t}");
         }
     }
@@ -1273,7 +1506,7 @@ mod tests {
         let proc = RecordProcessor::new(reference, opts(cph_mask(), 3));
         let recs = parse_sam_records(&[&sam_line(0, 1, "10M", "CACACACACA", "IIIIIIIIII")], 10);
         let mut counters = PerContextCounters::default();
-        proc.tally_record(&recs[0], RecordTrim::default(), &mut counters);
+        proc.tally_record(&recs[0], RecordSkips::default(), &mut counters);
         assert_eq!(counters.unconv[Context::CpA.index()], 5);
         assert_eq!(counters.total[Context::CpA.index()], 5);
         assert!(proc.decide(&counters), "5 unconverted CpA ≥ 3 → unconverted");
@@ -1285,7 +1518,7 @@ mod tests {
         let proc = RecordProcessor::new(reference, opts(cph_mask(), 3));
         let recs = parse_sam_records(&[&sam_line(0, 1, "10M", "TATATATATA", "IIIIIIIIII")], 10);
         let mut counters = PerContextCounters::default();
-        proc.tally_record(&recs[0], RecordTrim::default(), &mut counters);
+        proc.tally_record(&recs[0], RecordSkips::default(), &mut counters);
         assert_eq!(counters.unconv[Context::CpA.index()], 0);
         assert_eq!(counters.total[Context::CpA.index()], 5);
         assert!(!proc.decide(&counters));
@@ -1303,41 +1536,101 @@ mod tests {
         let recs =
             parse_sam_records(&[&sam_line(FLAG_REVERSE, 1, "10M", "TGTGTGTGTG", "IIIIIIIIII")], 10);
         let mut counters = PerContextCounters::default();
-        proc.tally_record(&recs[0], RecordTrim::default(), &mut counters);
+        proc.tally_record(&recs[0], RecordSkips::default(), &mut counters);
         // ref G at positions 1,3,5,7,9 (0-based); each has ref[i-1]=T → CpA.
         assert_eq!(counters.unconv[Context::CpA.index()], 5);
         assert_eq!(counters.total[Context::CpA.index()], 5);
     }
 
     #[test]
-    fn five_prime_span_forward_and_reverse() {
-        let q = "I".repeat(10);
-        let fwd = parse_sam_records(&[&sam_line(0, 1, "10M", "CACACACACA", &q)], 30);
-        assert_eq!(five_prime_ref_span(&fwd[0], 3), Some((0, 3)));
-        assert_eq!(three_prime_ref_span(&fwd[0], 3), Some((7, 10)));
-
-        // Reverse: SEQ is stored forward-genomic, so the 5' end is the HIGH end.
-        let rev = parse_sam_records(&[&sam_line(FLAG_REVERSE, 1, "10M", "CACACACACA", &q)], 30);
-        assert_eq!(five_prime_ref_span(&rev[0], 3), Some((7, 10)));
-        assert_eq!(three_prime_ref_span(&rev[0], 3), Some((0, 3)));
+    fn mask_window_excludes_five_prime_sites_from_tally() {
+        // Same all-unconverted CpA read, but a stored mask window over the first
+        // five positions drops the CpA C's at stored 0/2/4, leaving 6/8 — so the
+        // post-mask tally counts 2, below the count threshold, and the template is
+        // no longer flagged. This is the geometry exclusion the masking path uses.
+        let reference = Reference::from_encoded_contigs(vec![enc("CACACACACA")]);
+        let proc = RecordProcessor::new(reference, opts(cph_mask(), 3));
+        let recs = parse_sam_records(&[&sam_line(0, 1, "10M", "CACACACACA", "IIIIIIIIII")], 10);
+        let skips = RecordSkips { stored: &[(0, 5)], genomic: None };
+        let mut counters = PerContextCounters::default();
+        proc.tally_record(&recs[0], skips, &mut counters);
+        assert_eq!(counters.unconv[Context::CpA.index()], 2, "3 of 5 CpA masked out of the tally");
+        assert_eq!(counters.total[Context::CpA.index()], 2);
+        assert!(!proc.decide(&counters), "2 < count threshold 3 once the masked 5' sites drop");
     }
 
     #[test]
-    fn five_prime_span_skips_leading_soft_clip() {
-        let q = "I".repeat(10);
-        let recs = parse_sam_records(&[&sam_line(0, 1, "3S7M", "GGGCACACAC", &q)], 30);
-        // First 3 sequenced bases are soft-clipped → no aligned position.
-        assert_eq!(five_prime_ref_span(&recs[0], 3), None);
-        // First 5 sequenced bases → 2 aligned (stored 3,4) → ref [0,2).
-        assert_eq!(five_prime_ref_span(&recs[0], 5), Some((0, 2)));
+    fn fused_walk_masks_tally_but_records_all_mbias() {
+        // The fused (decision + M-bias) scan must apply the mask window to the
+        // decision tally yet still record *every* site into the M-bias curve, so
+        // the learned curve stays a pre-mask measurement. Same fixture + window.
+        let reference = Reference::from_encoded_contigs(vec![enc("CACACACACA")]);
+        let proc = RecordProcessor::new(reference, opts(cph_mask(), 3));
+        let recs = parse_sam_records(&[&sam_line(0, 1, "10M", "CACACACACA", "IIIIIIIIII")], 10);
+        let skips = RecordSkips { stored: &[(0, 5)], genomic: None };
+        let mut counters = PerContextCounters::default();
+        let mut acc = MbiasAccumulator::new();
+        proc.tally_and_accumulate(&recs[0], skips, &mut counters, &mut acc);
+
+        // Tally: masked 5' sites excluded, exactly as the non-fused path.
+        assert_eq!(counters.unconv[Context::CpA.index()], 2, "fused tally honors the mask window");
+
+        // M-bias: all five CpA observations recorded despite the mask window.
+        let recorded: u64 = acc
+            .cycles(ReadRole::Se, ReadEnd::FivePrime, Context::CpA)
+            .iter()
+            .map(|c| c.total())
+            .sum();
+        assert_eq!(recorded, 5, "M-bias records every site, ignoring the tally mask window");
     }
 
     #[test]
-    fn ref_span_stretches_across_deletion() {
-        let q = "I".repeat(6);
-        // 2M3D4M at ref 0: query[0,4) covers stored 0,1 (ref0,1) and stored 2,3
-        // (ref5,6); the deletion stretches the returned span to [0,7).
-        let recs = parse_sam_records(&[&sam_line(0, 1, "2M3D4M", "CACGTA", &q)], 30);
-        assert_eq!(five_prime_ref_span(&recs[0], 4), Some((0, 7)));
+    fn tally_honors_more_than_eight_windows() {
+        // A record can carry more than eight disjoint mask windows (many mate
+        // windows propagated onto a chimeric template). Every window must be
+        // excluded from the tally — matching what `apply_windows` masks in the
+        // BAM — rather than the 9th+ being silently dropped and counted.
+        let seq = "CA".repeat(20); // 40 bp: a CpA C at every even stored position
+        let reference = Reference::from_encoded_contigs(vec![enc(&seq)]);
+        let proc = RecordProcessor::new(reference, opts(cph_mask(), 3));
+        let qual = "I".repeat(40);
+        let recs = parse_sam_records(&[&sam_line(0, 1, "40M", &seq, &qual)], 40);
+        // Nine disjoint single-base windows over the CpA C's at stored 0,2,…,16.
+        let windows: Vec<(usize, usize)> = (0..9).map(|k| (2 * k, 2 * k + 1)).collect();
+        let skips = RecordSkips { stored: &windows, genomic: None };
+        let mut counters = PerContextCounters::default();
+        proc.tally_record(&recs[0], skips, &mut counters);
+        // 20 CpA total, 9 masked → 11 remain. (A fixed eight-slot buffer would
+        // drop the 9th window and leave 12.)
+        assert_eq!(counters.total[Context::CpA.index()], 11, "all nine windows honored");
+    }
+
+    #[test]
+    fn classification_prefers_mapped_mate_over_unmapped_r1() {
+        let reference = Reference::from_encoded_contigs(vec![enc("CACACACACA")]);
+        let proc = RecordProcessor::new(reference, opts(cph_mask(), 3));
+        let r1_unmapped = FLAG_PAIRED | FLAG_UNMAPPED | FLAG_FIRST_SEGMENT;
+
+        // Half-mapped pair (R1 unmapped, R2 a mapped primary): classification must
+        // pick the mapped R2 (index 1), so the template is evaluated on it rather
+        // than passed through as unmapped.
+        let half = parse_sam_records(
+            &[
+                &sam_line(r1_unmapped, 1, "*", "CACACACACA", "IIIIIIIIII"),
+                &sam_line(FLAG_PAIRED | FLAG_LAST_SEGMENT, 1, "10M", "CACACACACA", "IIIIIIIIII"),
+            ],
+            10,
+        );
+        assert_eq!(proc.classification_index(&half).unwrap(), 1, "mapped R2 classifies");
+
+        // Fully-unmapped template falls back to the (unmapped) R1 at index 0.
+        let both = parse_sam_records(
+            &[
+                &sam_line(r1_unmapped, 1, "*", "CACA", "IIII"),
+                &sam_line(FLAG_PAIRED | FLAG_UNMAPPED | FLAG_LAST_SEGMENT, 1, "*", "CACA", "IIII"),
+            ],
+            10,
+        );
+        assert_eq!(proc.classification_index(&both).unwrap(), 0, "fully unmapped falls back");
     }
 }

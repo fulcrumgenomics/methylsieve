@@ -2,21 +2,27 @@
 //!
 //! This binary is the whole tool: CLI parsing ([`Args`]), end-to-end run
 //! orchestration ([`run`]), and the end-of-run resource-usage footer. The
-//! per-template tagging engine and IO live in sibling modules (`sieve`,
-//! `reference`, the readers/writers, `stats`, …) — this file wires them
-//! together and talks to the user.
+//! per-template tagging engine (`sieve`), M-bias learning/masking (`mbias`,
+//! `mask`, `buffer`), metric output (`metrics`), shared record geometry
+//! (`record`), the reference, and IO live in sibling modules — this file wires
+//! them together and talks to the user.
 //!
 //! Long-form flags follow GNU style (`--kebab-case`). Short flags mirror the
 //! conventions of sibling tools: `-i` input, `-o` output, `-r` reference,
 //! `-q` quiet.
 
+mod buffer;
 mod io_threading;
+mod mask;
+mod mbias;
+mod metrics;
+mod plots;
 mod raw_reader;
 mod raw_writer;
+mod record;
 mod reference;
 mod sam_reader;
 mod sieve;
-mod stats;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -34,11 +40,14 @@ use noodles_sam::header::record::value::Map;
 use noodles_sam::header::record::value::map::Program;
 use noodles_sam::header::record::value::map::program::tag as program_tag;
 
+use crate::buffer::TemplateArena;
+use crate::mask::{MaskPlan, MaskWindows, apply_windows, compute_mask_windows};
+use crate::mbias::{DetectParams, MbiasAccumulator};
 use crate::raw_reader::RawBamReader;
 use crate::raw_writer::RawBamWriter;
-use crate::reference::{Context, RefEncoding, Reference};
+use crate::reference::{Context, Reference};
 use crate::sam_reader::SamReader;
-use crate::sieve::{DecisionMode, ProcessorOptions, RecordProcessor, Stats};
+use crate::sieve::{DecisionMode, Disposition, ProcessorOptions, RecordProcessor, Stats};
 
 /// Crate build identifier shown in `--version` and the `@PG VN:` tag.
 const METHYLSIEVE_BUILD: &str = env!("CARGO_PKG_VERSION");
@@ -49,30 +58,6 @@ const METHYLSIEVE_BUILD: &str = env!("CARGO_PKG_VERSION");
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 // ── Command-line interface ──────────────────────────────────────────────────
-
-/// CLI mirror of [`RefEncoding`] so the kebab-case spellings live with the CLI.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub(crate) enum RefEncodingCli {
-    /// 1 byte per base — fastest, ~3.1 GB for a human genome.
-    #[value(name = "bytes")]
-    Bytes,
-    /// 4-bit packed, 2 bases/byte — ~½ the memory.
-    #[value(name = "nibble")]
-    Nibble,
-    /// 2-bit packed, 4 bases/byte — ~¼ the memory; non-ACGT folded to A.
-    #[value(name = "twobit")]
-    TwoBit,
-}
-
-impl From<RefEncodingCli> for RefEncoding {
-    fn from(c: RefEncodingCli) -> Self {
-        match c {
-            RefEncodingCli::Bytes => RefEncoding::Bytes,
-            RefEncodingCli::Nibble => RefEncoding::Nibble,
-            RefEncodingCli::TwoBit => RefEncoding::TwoBit,
-        }
-    }
-}
 
 /// CLI mirror of [`DecisionMode`] so the kebab-case spellings and per-variant
 /// help live with the CLI.
@@ -130,6 +115,26 @@ impl ContextMask {
     pub(crate) fn contains(self, ctx: Context) -> bool {
         self.0[ctx.index()]
     }
+
+    /// Short human label for the selected contexts: `"CpH"` for the CpA/CpC/CpT
+    /// set (the conversion default), otherwise the selected context names joined
+    /// with `+` (e.g. `"CpG"`, `"CpA+CpG"`). Used in plot titles/axes.
+    #[must_use]
+    pub(crate) fn label(self) -> String {
+        let is_cph = self.contains(Context::CpA)
+            && self.contains(Context::CpC)
+            && self.contains(Context::CpT)
+            && !self.contains(Context::CpG);
+        if is_cph {
+            return "CpH".to_string();
+        }
+        Context::ALL
+            .iter()
+            .filter(|&&c| self.contains(c))
+            .map(|c| c.label())
+            .collect::<Vec<_>>()
+            .join("+")
+    }
 }
 
 /// Parse a comma-separated context list (e.g. `CpA,CpC,CpT`). Token matching is
@@ -161,7 +166,7 @@ pub(crate) fn parse_contexts(s: &str) -> Result<ContextMask, String> {
 }
 
 /// A parsed aux-tag specification (`--tag`). Only string (`Z`) tags are
-/// supported in v1.
+/// supported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TagSpec {
     /// The two-byte aux tag (e.g. `XX`).
@@ -206,13 +211,13 @@ fn parse_tag_spec(s: &str) -> Result<TagSpec, String> {
 #[derive(Parser, Debug, Clone)]
 #[command(name = "methylsieve", version = METHYLSIEVE_BUILD, about = SHORT_ABOUT, long_about = LONG_ABOUT)]
 pub struct Args {
-    /// Input SAM/BAM file [stdin]. Must be query-grouped (all records for one
-    /// QNAME adjacent, typically straight from the aligner).
+    /// Input SAM/BAM file (defaults to stdin). Must be query-grouped (all records
+    /// for one QNAME adjacent, typically straight from the aligner).
     #[arg(short = 'i', long = "input", help_heading = "Inputs / outputs")]
     pub(crate) input: Option<PathBuf>,
 
-    /// Output BAM file [stdout]. The path must end in `.bam` — output is always
-    /// BAM, never SAM. Use `-` for stdout (no extension check).
+    /// Output BAM file (defaults to stdout). The path must end in `.bam` — output
+    /// is always BAM, never SAM. Use `-` for stdout (no extension check).
     #[arg(short = 'o', long = "output", help_heading = "Inputs / outputs")]
     pub(crate) output: Option<PathBuf>,
 
@@ -231,24 +236,10 @@ pub struct Args {
     #[arg(short = 'r', long = "reference", help_heading = "Inputs / outputs")]
     pub(crate) reference: PathBuf,
 
-    /// In-memory reference encoding. `twobit` (2-bit, the default) holds the
-    /// genome in ~¼ the memory (~0.8 GB vs ~3.1 GB for a human genome); its
-    /// small CPU cost is hidden when methylsieve is input-rate-limited in a
-    /// pipe. It folds non-ACGT reference bases (N, IUPAC ambiguity) to A: this
-    /// never changes a conversion call (only genuine C/G positions are
-    /// monitored, and those are represented exactly) — it can only relabel the
-    /// CpH/CpG context of a monitored C/G immediately adjacent to a former-N
-    /// (assembly-gap edges; below measurement noise). Use `bytes` (1 byte/base,
-    /// fastest) for a single max-throughput stream that isn't rate-limited, or
-    /// `nibble` (4-bit, ~½ memory) for bit-identical context labeling.
-    #[arg(long = "ref-encoding", value_enum, default_value_t = RefEncodingCli::TwoBit,
-          help_heading = "Inputs / outputs")]
-    pub(crate) ref_encoding: RefEncodingCli,
-
     /// Contexts (comma-separated CpA,CpC,CpT,CpG) counted toward the
     /// unconverted-decision threshold. The default is CpH (CpA,CpC,CpT); CpG is
     /// excluded because genuine methylation lives there. All four contexts are
-    /// always reported in `--stats` regardless of this subset.
+    /// reported in the `--metrics-prefix` summary regardless of this subset.
     #[arg(long = "contexts", default_value = "CpA,CpC,CpT", value_parser = parse_contexts,
           help_heading = "Decision")]
     pub(crate) contexts: ContextMask,
@@ -300,6 +291,9 @@ pub struct Args {
     /// unknown, so both ends of the read are trimmed instead. Counted over the
     /// stored SEQ in sequencing order, so 5'-end soft-clips count toward N;
     /// hard-clipped bases are absent from SEQ and do not. Default 0 (off).
+    /// Superseded by `--mbias-mask`: when masking is enabled this trim is forced
+    /// to 0 (both target the same fragment-end bias) and a warning is logged if a
+    /// non-zero value was set explicitly.
     #[arg(long = "ignore-template-ends", default_value_t = 0, help_heading = "Decision")]
     pub(crate) ignore_template_ends: u32,
 
@@ -327,24 +321,63 @@ pub struct Args {
 
     /// Spike-in control contig (repeatable). Reads whose primary R1 maps here
     /// are excluded from the main decision, never tagged, and tallied into a
-    /// separate `--stats` row.
+    /// separate metrics-summary row.
     #[arg(long = "control-contig", help_heading = "Spike-in controls")]
     pub(crate) control_contig: Vec<String>,
 
-    /// Write a multi-row TSV of run stats to PATH (one row for the `genome`
-    /// scope plus one per `--control-contig`).
-    #[arg(long = "stats", help_heading = "Stats & misc")]
-    pub(crate) stats: Option<PathBuf>,
+    /// Enable M-bias-aware masking: buffer the first reads to learn the per-cycle
+    /// CpG methylation curves, freeze 5' (and, for single-end, 3') mask lengths,
+    /// then set the biased bases' qualities to `--mbias-mask-quality` so
+    /// base-quality-aware callers ignore them. The alignment is otherwise
+    /// unchanged (no clip, no coordinate/CIGAR/tag/mate rewrite). Effective only
+    /// for downstream tools that honor base quality.
+    #[arg(long = "mbias-mask", help_heading = "M-bias masking")]
+    pub(crate) mbias_mask: bool,
 
-    /// Write the per-template decision histogram to PATH: one row per observed
-    /// `(checked_sites, unconverted_sites)` cell over the decision contexts,
-    /// with the template count and the cell's verdict (`decision`,
-    /// `decided_by`).
-    #[arg(long = "conversion-matrix", help_heading = "Stats & misc")]
-    pub(crate) conversion_matrix: Option<PathBuf>,
+    /// Templates to buffer while learning M-bias before masking begins. Memory
+    /// scales with this (≈0.5–1.3 KB/template). A pathological input stops
+    /// buffering early and decides on what it has.
+    #[arg(
+        long = "mbias-buffer-templates",
+        default_value_t = 500_000,
+        help_heading = "M-bias masking"
+    )]
+    pub(crate) mbias_buffer_templates: usize,
 
-    /// Sample name for the `sample` column of `--stats`. If omitted, the unique
-    /// `@RG SM:` values from the header are comma-joined.
+    /// Keep from the first 5' cycle whose smoothed CpG methylation reaches this
+    /// fraction of the plateau (so masking stops as soon as the read is
+    /// trustworthy). Must be in (0, 1].
+    #[arg(
+        long = "mbias-plateau-fraction",
+        default_value_t = 0.90,
+        help_heading = "M-bias masking"
+    )]
+    pub(crate) mbias_plateau_fraction: f64,
+
+    /// Never mask more than this many leading (or, for single-end, trailing)
+    /// cycles, regardless of the curve.
+    #[arg(long = "mbias-max-mask", default_value_t = 30, help_heading = "M-bias masking")]
+    pub(crate) mbias_max_mask: u32,
+
+    /// Quality value assigned to masked bases (default 2; keep below
+    /// `--min-base-quality` so the masked bases also drop from this tool's tally).
+    #[arg(long = "mbias-mask-quality", default_value_t = 2, help_heading = "M-bias masking")]
+    pub(crate) mbias_mask_quality: u8,
+
+    /// Write metric files under this path prefix: `PREFIX.summary.tsv` (one
+    /// per-context conversion row per scope — the genome, then each control contig
+    /// — with the applied 5'/3' mask lengths as `r1_mask_5p`/`r2_mask_5p`/
+    /// `se_mask_5p`/`se_mask_3p` columns), `PREFIX.mbias.tsv` (per-read-cycle
+    /// methylation), and `PREFIX.conversion-matrix.tsv` (the per-template decision
+    /// histogram), plus PDF plots `PREFIX.mbias.pdf` (M-bias curves) and
+    /// `PREFIX.conversion-matrix.pdf` (the decision hexbin). Computing these is a
+    /// single streaming pass; the output BAM is unchanged.
+    #[arg(long = "metrics-prefix", help_heading = "Stats & misc")]
+    pub(crate) metrics_prefix: Option<PathBuf>,
+
+    /// Sample name for the `sample` column of the metric TSVs. If omitted: the
+    /// unique `@RG SM:` values from the header, else the input file stem, else
+    /// `unknown`.
     #[arg(long = "sample", help_heading = "Stats & misc")]
     pub(crate) sample: Option<String>,
 
@@ -389,9 +422,12 @@ pub struct Args {
 const SHORT_ABOUT: &str = "Tag or filter unconverted reads in bisulfite / EM-seq SAM/BAM files.";
 const LONG_ABOUT: &str = "Tag or filter incompletely-converted reads in directional bisulfite or \
 EM-seq data.\n\
-Makes one per-template decision using all of a QNAME's primary and supplementary records, \
-propagates it to every record, and emits a per-context / per-spike-in conversion-rate TSV. \
-Input must be query-grouped; output is always BAM.";
+Makes one per-template decision using all of a QNAME's primary and supplementary records \
+and propagates it to every record; with --metrics-prefix it also writes per-context / \
+per-spike-in conversion and M-bias metrics. \
+Input must be query-grouped and should be adapter-trimmed first: untrimmed adapter \
+read-through on short inserts can be force-aligned and read as spurious unconverted CpH. \
+Output is always BAM.";
 
 impl Args {
     /// Resolved CRC-verify setting: explicit flags win; otherwise on for file
@@ -435,32 +471,9 @@ impl Args {
                 );
             }
         }
-        // At most one output stream may target stdout, or they would interleave
-        // and corrupt one another (the BAM in particular). The BAM goes to stdout
-        // by default when `-o` is omitted, or with `-o -`; `--stats` and
-        // `--conversion-matrix` each take `-` for stdout.
-        let mut stdout_streams: Vec<&str> = Vec::new();
-        let bam_to_stdout = match self.output.as_deref() {
-            None => true,
-            Some(p) => p.to_string_lossy() == "-",
-        };
-        if bam_to_stdout {
-            stdout_streams.push("the BAM output");
-        }
-        if matches!(self.stats.as_deref(), Some(p) if p.to_string_lossy() == "-") {
-            stdout_streams.push("--stats");
-        }
-        if matches!(self.conversion_matrix.as_deref(), Some(p) if p.to_string_lossy() == "-") {
-            stdout_streams.push("--conversion-matrix");
-        }
-        if stdout_streams.len() > 1 {
-            bail!(
-                "{} are all directed to stdout; at most one stream may use stdout, or \
-                 they would interleave. The BAM goes to stdout by default — send it to a \
-                 file with `-o out.bam`, or write --stats / --conversion-matrix to a path.",
-                stdout_streams.join(" and ")
-            );
-        }
+        // Metric TSVs are always written to files under `--metrics-prefix`, so
+        // only the BAM can contend for stdout — no inter-stream collision check
+        // is needed.
         if !(self.max_unconverted_fraction > 0.0 && self.max_unconverted_fraction <= 1.0) {
             bail!(
                 "--max-unconverted-fraction must be in (0, 1]; got {}",
@@ -471,6 +484,14 @@ impl Args {
             bail!(
                 "--max-unconverted-count must be >= 1 (a threshold of 0 would tag every \
                  template). Use --max-unconverted-fraction for fraction-based filtering."
+            );
+        }
+        if self.mbias_mask
+            && !(self.mbias_plateau_fraction > 0.0 && self.mbias_plateau_fraction <= 1.0)
+        {
+            bail!(
+                "--mbias-plateau-fraction must be in (0, 1]; got {}",
+                self.mbias_plateau_fraction
             );
         }
         Ok(())
@@ -600,9 +621,9 @@ fn run(args: Args) -> Result<()> {
         );
     }
 
-    // Load the reference (every @SQ contig, 4-bit encoded) and resolve control
+    // Load the reference (every @SQ contig, 2-bit packed) and resolve control
     // contigs to a per-tid scope map. Both cross-check against the header.
-    let reference = Reference::load(&args.reference, &header, args.ref_encoding.into())
+    let reference = Reference::load(&args.reference, &header)
         .with_context(|| format!("loading reference {}", args.reference.display()))?;
     if !args.quiet {
         eprintln!("methylsieve: Loaded reference {}.", args.reference.display());
@@ -619,6 +640,39 @@ fn run(args: Args) -> Result<()> {
         args.compression_level,
     )?;
 
+    // `--mbias-mask` automates and supersedes the manual `--ignore-template-ends`
+    // trim: both neutralize the same physical fragment-end bias (an FR pair's two
+    // outer ends are exactly R1's and R2's 5' ends), so running them together
+    // would double-trim. When masking is on, the manual trim is forced off — and
+    // a warning is logged if the user set it explicitly.
+    let ignore_template_ends = if args.mbias_mask {
+        if args.ignore_template_ends > 0 {
+            log::warn!(
+                "--ignore-template-ends={} is ignored because --mbias-mask is set; masking learns \
+                 and removes fragment-end bias automatically",
+                args.ignore_template_ends
+            );
+        }
+        // Masked bases are excluded from methylsieve's own tally only when the
+        // mask quality drops them below the base-quality gate. Setting the mask
+        // quality at/above the gate still rewrites QUAL for downstream callers but
+        // leaves the biased bases in our own decision — almost certainly not what
+        // the user wants.
+        if args.mbias_mask_quality >= args.min_base_quality {
+            log::warn!(
+                "--mbias-mask-quality={} is >= --min-base-quality={}: masked bases still count \
+                 toward methylsieve's own conversion tally/decision (they only lower emitted QUAL \
+                 for downstream callers). Set the mask quality below the base-quality gate to \
+                 exclude them.",
+                args.mbias_mask_quality,
+                args.min_base_quality
+            );
+        }
+        0
+    } else {
+        args.ignore_template_ends
+    };
+
     let opts = ProcessorOptions {
         contexts: args.contexts,
         mode: args.mode.into(),
@@ -626,43 +680,83 @@ fn run(args: Args) -> Result<()> {
         max_unconverted_fraction: args.max_unconverted_fraction,
         min_sites: args.min_sites,
         min_base_quality: args.min_base_quality,
-        ignore_template_ends: args.ignore_template_ends,
+        ignore_template_ends,
         ignore_supplementary_evidence: args.ignore_supplementary_evidence,
         tag: args.tag.clone(),
         count_tag: args.effective_count_tag(),
         qc_fail: args.qc_fail(),
         remove_unconverted: args.remove_unconverted,
         scope_of_tid,
-        record_matrix: args.conversion_matrix.is_some(),
+        record_matrix: args.metrics_prefix.is_some(),
     };
     let processor = RecordProcessor::new(reference, opts);
     let mut stats = Stats::new(&control_names);
 
+    // M-bias accumulation is enabled only when metric output or masking is
+    // requested; otherwise it stays `None` and the decision path is untouched —
+    // no per-cycle bookkeeping, no measurable overhead.
+    let want_mbias = args.metrics_prefix.is_some() || args.mbias_mask;
+    let mut mbias_acc = want_mbias.then(MbiasAccumulator::new);
+    let detect = DetectParams {
+        plateau_fraction: args.mbias_plateau_fraction,
+        max_mask: args.mbias_max_mask as usize,
+        ..DetectParams::default()
+    };
+
     // methylsieve requires query-grouped input: records are read in maximal
     // runs sharing a QNAME ("blocks") and each block is processed as a unit.
     let mut pool: Vec<RawRecord> = Vec::with_capacity(8);
-    for_each_block(&mut reader, &mut pool, |block| {
-        processor.process_block(block, &mut stats, &mut out)
-    })
-    .context("processing record block")?;
+    // The mask plan actually applied to the data (frozen from the learn-phase
+    // subset). `None` when masking is off — the summary then reports no mask
+    // lengths rather than a misleading full-file recomputation.
+    let applied_plan = if args.mbias_mask {
+        run_masking(
+            &mut reader,
+            &mut pool,
+            &processor,
+            &mut stats,
+            mbias_acc.as_mut().expect("masking enables the accumulator"),
+            &mut out,
+            MaskingRun {
+                detect,
+                buffer_templates: args.mbias_buffer_templates,
+                mask_quality: args.mbias_mask_quality,
+                min_base_quality: args.min_base_quality,
+                want_metrics: args.metrics_prefix.is_some(),
+                quiet: args.quiet,
+            },
+        )?
+    } else {
+        for_each_block(&mut reader, &mut pool, |block| {
+            // No masking: no stored exclusions, so pass an empty window set.
+            if processor.process_block(block, &mut stats, mbias_acc.as_mut(), &[])?
+                == Disposition::Keep
+            {
+                write_block(block, &mut out)?;
+            }
+            Ok(())
+        })
+        .context("processing record block")?;
+        None
+    };
 
     print_run_stats(&stats, &args);
     warn_proportion_blind_spot(&stats, &args);
 
-    if let Some(stats_path) = args.stats.as_deref() {
-        crate::stats::write_to_path(stats_path, &stats, &header, args.sample.as_deref())
-            .context("writing --stats TSV")?;
-    }
-
-    if let Some(matrix_path) = args.conversion_matrix.as_deref() {
-        crate::stats::write_matrix_to_path(
-            matrix_path,
+    if let Some(prefix) = args.metrics_prefix.as_deref() {
+        let mbias = mbias_acc.as_ref().expect("mbias accumulator present when metrics requested");
+        crate::metrics::write_all(
+            prefix,
             &stats,
+            mbias,
+            applied_plan.as_ref(),
             &header,
             args.sample.as_deref(),
+            args.input.as_deref(),
+            &args.contexts.label(),
             |unconv, monitored| processor.classify(unconv, monitored),
         )
-        .context("writing --conversion-matrix TSV")?;
+        .context("writing metric TSVs and plots")?;
     }
 
     out.finish().context("finishing main output")?;
@@ -747,6 +841,181 @@ fn for_each_block(
     Ok(())
 }
 
+/// Write every record of a block to `out`.
+fn write_block(block: &[RawRecord], out: &mut RawBamWriter) -> Result<()> {
+    for rec in block {
+        out.write_record(rec).context("writing record")?;
+    }
+    Ok(())
+}
+
+/// Resolved configuration for a [`run_masking`] pass.
+struct MaskingRun {
+    /// Mask-length detection tunables.
+    detect: DetectParams,
+    /// Templates to buffer in the learn phase.
+    buffer_templates: usize,
+    /// Quality value masked bases are set to.
+    mask_quality: u8,
+    /// The decision's base-quality gate. A mask window is excluded from the tally
+    /// only when `mask_quality < min_base_quality` — i.e. when masking actually
+    /// drops the base below the gate a downstream caller would apply.
+    min_base_quality: u8,
+    /// Keep accumulating M-bias after the plan freezes. Only needed to write the
+    /// whole-file curves under `--metrics-prefix`; when false, the post-freeze
+    /// stream skips the (now-useless) second M-bias walk entirely.
+    want_metrics: bool,
+    /// Suppress the run-summary line.
+    quiet: bool,
+}
+
+/// Mask one template and tally/decide/stamp it on the **resulting** data, so the
+/// reported metrics and the unconverted call both describe what a downstream
+/// caller will see. The mask geometry (`compute_mask_windows`) drives both the
+/// tally exclusion and the Q2 write, so the two never disagree; the exclusion is
+/// applied only when `mask_quality < min_base_quality` (otherwise a post-mask
+/// tally would still count those bases). M-bias is *not* accumulated here — the
+/// curve is a pre-mask measurement taken before this point. Returns whether the
+/// template should be emitted; the Q2 write is skipped for dropped templates.
+fn mask_and_process(
+    processor: &RecordProcessor,
+    stats: &mut Stats,
+    mbias: Option<&mut MbiasAccumulator>,
+    plan: &MaskPlan,
+    mask_quality: u8,
+    min_base_quality: u8,
+    block: &mut [RawRecord],
+) -> Result<Disposition> {
+    let windows = compute_mask_windows(plan, block);
+    let tally_windows: &[MaskWindows] =
+        if mask_quality < min_base_quality { &windows } else { &[] };
+    let disp = processor.process_block(block, stats, mbias, tally_windows)?;
+    if disp == Disposition::Keep {
+        apply_windows(block, &windows, mask_quality);
+    }
+    Ok(disp)
+}
+
+/// Two-phase M-bias masking run. **Learn:** buffer complete templates into the
+/// arena while accumulating the per-cycle M-bias curve (pre-mask), *deferring*
+/// the tally/decision/stamp so they can later run on the masked data. **Drain +
+/// stream:** freeze the mask lengths, then for every template — buffered first,
+/// then the streamed remainder — mask it, tally/decide/stamp on the masked
+/// result, and emit. If the file ends before the target, the whole file was
+/// buffered — drain it.
+fn run_masking(
+    reader: &mut Reader,
+    pool: &mut Vec<RawRecord>,
+    processor: &RecordProcessor,
+    stats: &mut Stats,
+    mbias: &mut MbiasAccumulator,
+    out: &mut RawBamWriter,
+    cfg: MaskingRun,
+) -> Result<Option<MaskPlan>> {
+    let mut arena = TemplateArena::with_target(cfg.buffer_templates);
+    let mut plan: Option<MaskPlan> = None;
+
+    for_each_block(reader, pool, |block| {
+        match &plan {
+            // Stream phase: tally/decide/stamp on the masked geometry, then emit.
+            // M-bias keeps accumulating (pre-mask) only when the whole-file curves
+            // are needed for metrics; otherwise the frozen plan never changes.
+            Some(p) => {
+                let feed = cfg.want_metrics.then_some(&mut *mbias);
+                let disp = mask_and_process(
+                    processor,
+                    stats,
+                    feed,
+                    p,
+                    cfg.mask_quality,
+                    cfg.min_base_quality,
+                    block,
+                )?;
+                if disp == Disposition::Keep {
+                    write_block(block, out)?;
+                }
+                Ok(())
+            }
+            // Learn phase: accumulate M-bias (pre-mask) only and buffer the raw
+            // template; the tally/decision is deferred to the drain pass below so
+            // it sees the masked data. Once the buffer fills, freeze and drain.
+            None => {
+                processor.accumulate_mbias(block, mbias);
+                let buffered = arena.push_template(block);
+                if buffered && !arena.is_full() {
+                    return Ok(());
+                }
+                let frozen = MaskPlan::learn(mbias, cfg.detect, cfg.mask_quality);
+                drain_masked(&arena, processor, stats, &frozen, &cfg, out)?;
+                if !buffered {
+                    // This block didn't fit the (now-full) arena → process + emit it.
+                    let disp = mask_and_process(
+                        processor,
+                        stats,
+                        None,
+                        &frozen,
+                        cfg.mask_quality,
+                        cfg.min_base_quality,
+                        block,
+                    )?;
+                    if disp == Disposition::Keep {
+                        write_block(block, out)?;
+                    }
+                }
+                plan = Some(frozen);
+                Ok(())
+            }
+        }
+    })
+    .context("processing record block")?;
+
+    // The file ended while still learning (fewer than the target): the entire
+    // input is buffered and undrained — freeze on what we have and emit it.
+    if plan.is_none() {
+        let frozen = MaskPlan::learn(mbias, cfg.detect, cfg.mask_quality);
+        drain_masked(&arena, processor, stats, &frozen, &cfg, out)?;
+        plan = Some(frozen);
+    }
+    if let Some(p) = &plan
+        && !cfg.quiet
+    {
+        eprintln!(
+            "methylsieve: M-bias masking applied — {} (learned from {} buffered templates)",
+            p.summary(),
+            arena.template_count()
+        );
+    }
+    Ok(plan)
+}
+
+/// Drain the buffered learn-phase templates: mask each, tally/decide/stamp it on
+/// the masked result (M-bias already captured during learn, so none here), and
+/// write it. Preserves arrival order.
+fn drain_masked(
+    arena: &TemplateArena,
+    processor: &RecordProcessor,
+    stats: &mut Stats,
+    plan: &MaskPlan,
+    cfg: &MaskingRun,
+    out: &mut RawBamWriter,
+) -> Result<()> {
+    arena.drain(|recs| {
+        let disp = mask_and_process(
+            processor,
+            stats,
+            None,
+            plan,
+            cfg.mask_quality,
+            cfg.min_base_quality,
+            recs,
+        )?;
+        if disp == Disposition::Keep {
+            write_block(recs, out)?;
+        }
+        Ok(())
+    })
+}
+
 /// Append methylsieve's `@PG` line to the header. noodles auto-chains via `PP:`.
 fn append_methylsieve_pg(header: &mut Header) -> Result<()> {
     // Defensive: a broken PP chain makes noodles' `programs.add` panic; convert
@@ -801,11 +1070,10 @@ fn print_run_stats(stats: &Stats, args: &Args) {
     }
     let g = &stats.genome;
     let verb = if args.remove_unconverted { "Removed" } else { "Tagged " };
-    let pct =
-        if g.n_evaluated > 0 { 100.0 * g.n_unconverted as f64 / g.n_evaluated as f64 } else { 0.0 };
+    let frac = if g.n_evaluated > 0 { g.n_unconverted as f64 / g.n_evaluated as f64 } else { 0.0 };
     eprintln!(
-        "methylsieve: {} {:>10} of {:>10} ({:5.3}%) evaluated genome templates as unconverted.",
-        verb, g.n_unconverted, g.n_evaluated, pct
+        "methylsieve: {} {:>10} of {:>10} (frac {:.5}) evaluated genome templates as unconverted.",
+        verb, g.n_unconverted, g.n_evaluated, frac
     );
     if stats.unmapped_templates > 0 || stats.zero_site_templates > 0 {
         eprintln!(
@@ -959,31 +1227,11 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_default_bam_stdout_plus_stats_stdout() {
-        // BAM defaults to stdout when -o is omitted; stats to stdout collides.
+    fn validate_allows_bam_stdout_with_metrics_prefix() {
+        // Metric TSVs are file-only (prefix), so the BAM may take stdout freely.
         let mut a = minimal_args();
         a.output = None;
-        a.stats = Some(PathBuf::from("-"));
-        let err = a.validate().unwrap_err().to_string();
-        assert!(err.contains("stdout"), "got: {err}");
-    }
-
-    #[test]
-    fn validate_rejects_stats_and_matrix_both_to_stdout() {
-        let mut a = minimal_args();
-        a.output = Some(PathBuf::from("out.bam")); // BAM to a file
-        a.stats = Some(PathBuf::from("-"));
-        a.conversion_matrix = Some(PathBuf::from("-"));
-        assert!(a.validate().is_err());
-    }
-
-    #[test]
-    fn validate_allows_a_single_stdout_stream() {
-        // BAM to a file frees stdout for exactly one TSV.
-        let mut a = minimal_args();
-        a.output = Some(PathBuf::from("out.bam"));
-        a.stats = Some(PathBuf::from("-"));
-        a.conversion_matrix = Some(PathBuf::from("matrix.tsv"));
+        a.metrics_prefix = Some(PathBuf::from("run_metrics"));
         assert!(a.validate().is_ok());
     }
 
@@ -1004,7 +1252,6 @@ mod tests {
             output: None,
             compression_level: CompressionLevel::new(0).unwrap(),
             reference: PathBuf::from("ref.fa"),
-            ref_encoding: RefEncodingCli::Bytes,
             contexts: parse_contexts("CpA,CpC,CpT").unwrap(),
             mode: DecisionModeCli::Adaptive,
             max_unconverted_count: 3,
@@ -1019,8 +1266,12 @@ mod tests {
             no_qc_fail: false,
             remove_unconverted: false,
             control_contig: vec![],
-            stats: None,
-            conversion_matrix: None,
+            mbias_mask: false,
+            mbias_buffer_templates: 500_000,
+            mbias_plateau_fraction: 0.90,
+            mbias_max_mask: 30,
+            mbias_mask_quality: 2,
+            metrics_prefix: None,
             sample: None,
             quiet: true,
             check_crc: false,

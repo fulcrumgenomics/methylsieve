@@ -83,14 +83,17 @@ pub fn q40(len: usize) -> String {
 
 // ── Reference building ──────────────────────────────────────────────────────
 
-/// Builds a tiny single-line-per-contig FASTA and a matching `.fai` index.
+/// Builds a tiny single-line-per-contig FASTA and (by default) a matching
+/// `.fai` index. Call [`RefBuilder::without_fai`] to exercise the unindexed
+/// sequential load path.
 pub struct RefBuilder {
     contigs: Vec<(String, String)>,
+    write_fai: bool,
 }
 
 impl RefBuilder {
     pub fn new() -> Self {
-        Self { contigs: Vec::new() }
+        Self { contigs: Vec::new(), write_fai: true }
     }
 
     /// Add a contig with the given uppercase ACGT sequence.
@@ -99,7 +102,14 @@ impl RefBuilder {
         self
     }
 
-    /// Write `<path>` and `<path>.fai`. Each contig is a single unwrapped line.
+    /// Skip writing the `.fai`, so the loader takes the sequential fallback.
+    pub fn without_fai(mut self) -> Self {
+        self.write_fai = false;
+        self
+    }
+
+    /// Write `<path>` and (unless [`Self::without_fai`]) `<path>.fai`. Each
+    /// contig is a single unwrapped line.
     pub fn write_to(&self, path: &Path) {
         let mut fa = String::new();
         let mut fai = String::new();
@@ -122,8 +132,10 @@ impl RefBuilder {
             offset = seq_offset + seq.len() as u64 + 1; // + sequence + '\n'
         }
         fs::write(path, fa).expect("write fasta");
-        let fai_path = format!("{}.fai", path.display());
-        fs::write(&fai_path, fai).expect("write fai");
+        if self.write_fai {
+            let fai_path = format!("{}.fai", path.display());
+            fs::write(&fai_path, fai).expect("write fai");
+        }
     }
 }
 
@@ -135,6 +147,10 @@ pub struct TestEnv {
     pub input: PathBuf,
     pub reference: PathBuf,
     pub output: PathBuf,
+    /// `--metrics-prefix` value passed to the binary.
+    pub metrics_prefix: PathBuf,
+    /// The `PREFIX.summary.tsv` the metrics prefix produces (the per-context
+    /// conversion summary; named `stats` for brevity in assertions).
     pub stats: PathBuf,
 }
 
@@ -146,9 +162,15 @@ impl TestEnv {
             input: p.join("in.sam"),
             reference: p.join("ref.fa"),
             output: p.join("out.bam"),
-            stats: p.join("stats.tsv"),
+            metrics_prefix: p.join("metrics"),
+            stats: p.join("metrics.summary.tsv"),
             _tmp: tmp,
         }
+    }
+
+    /// `--metrics-prefix` as a `&str` for arg lists.
+    pub fn metrics_prefix_arg(&self) -> String {
+        self.metrics_prefix.to_str().unwrap().to_string()
     }
 }
 
@@ -254,6 +276,16 @@ pub fn has_tag(rec: &RecordBuf, tag: [u8; 2]) -> bool {
     rec.data().get(&Tag::new(tag[0], tag[1])).is_some()
 }
 
+/// Phred quality scores of a record (raw values, not ASCII-offset).
+pub fn quality_scores(rec: &RecordBuf) -> Vec<u8> {
+    rec.quality_scores().as_ref().to_vec()
+}
+
+/// Count of leading bases at Phred quality `q` (e.g. the Q2 mask window).
+pub fn leading_quality_run(rec: &RecordBuf, q: u8) -> usize {
+    rec.quality_scores().as_ref().iter().take_while(|&&b| b == q).count()
+}
+
 // ── Stats TSV parsing ───────────────────────────────────────────────────────
 
 /// Parse a methylsieve `--stats` TSV into one column→value map per data row
@@ -276,6 +308,32 @@ pub fn read_stats_rows(path: &Path) -> Vec<std::collections::HashMap<String, Str
 /// Convenience: the genome (first) row of a stats TSV.
 pub fn genome_stats(path: &Path) -> std::collections::HashMap<String, String> {
     read_stats_rows(path).into_iter().next().expect("genome row")
+}
+
+/// Observed (total monitored) count for a context, from the `<ctx>_obs` column.
+pub fn ctx_obs(row: &std::collections::HashMap<String, String>, ctx: &str) -> u64 {
+    row[&format!("{ctx}_obs")].parse().unwrap()
+}
+
+/// Unconverted count for a context, derived from `<ctx>_obs` and
+/// `<ctx>_conv_rate` (the summary reports the rate, not the raw count).
+pub fn ctx_unconv(row: &std::collections::HashMap<String, String>, ctx: &str) -> u64 {
+    let obs = ctx_obs(row, ctx);
+    if obs == 0 {
+        return 0;
+    }
+    let conv: f64 = row[&format!("{ctx}_conv_rate")].parse().unwrap();
+    obs - (obs as f64 * conv).round() as u64
+}
+
+/// `ctx_obs` against the genome row of a stats TSV.
+pub fn genome_ctx_obs(path: &Path, ctx: &str) -> u64 {
+    ctx_obs(&genome_stats(path), ctx)
+}
+
+/// `ctx_unconv` against the genome row of a stats TSV.
+pub fn genome_ctx_unconv(path: &Path, ctx: &str) -> u64 {
+    ctx_unconv(&genome_stats(path), ctx)
 }
 
 /// SAM FLAG bit constants for fixtures and assertions.

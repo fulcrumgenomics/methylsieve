@@ -18,10 +18,10 @@ fn ot_r2() -> u16 {
     FLAG_PAIRED | FLAG_PROPER_PAIR | FLAG_LAST_SEGMENT | FLAG_REVERSE
 }
 fn ca_total(env: &TestEnv) -> u64 {
-    genome_stats(&env.stats)["CA_total"].parse().unwrap()
+    genome_ctx_obs(&env.stats, "CpA")
 }
 fn ca_unconv(env: &TestEnv) -> u64 {
-    genome_stats(&env.stats)["CA_unconv"].parse().unwrap()
+    genome_ctx_unconv(&env.stats, "CpA")
 }
 
 #[test]
@@ -57,8 +57,8 @@ fn each_overlapped_reference_base_counted_once() {
         .record("p", ot_r2(), "chr1", 6, "10M", "ACACACACAC", &q40(10)); // ref[5,15)
 
     let env = TestEnv::new();
-    let stats = env.stats.to_str().unwrap().to_string();
-    run_ok(&sam, &reference, &env, &["--stats", &stats]);
+    let stats = env.metrics_prefix_arg();
+    run_ok(&sam, &reference, &env, &["--metrics-prefix", &stats]);
     assert_eq!(ca_total(&env), 8, "overlapped C@6,8 counted once");
 }
 
@@ -76,8 +76,8 @@ fn overlap_split_assigns_each_half_to_the_nearer_mate() {
         .record("p", ot_r2(), "chr1", 1, "10M", "TATATATATA", &q40(10));
 
     let env = TestEnv::new();
-    let stats = env.stats.to_str().unwrap().to_string();
-    run_ok(&sam, &reference, &env, &["--stats", &stats]);
+    let stats = env.metrics_prefix_arg();
+    run_ok(&sam, &reference, &env, &["--metrics-prefix", &stats]);
     assert_eq!(ca_total(&env), 5, "5 distinct CpA sites across the split overlap");
     assert_eq!(ca_unconv(&env), 3, "only R1's half [0,5) contributes unconverted C's");
 }
@@ -92,8 +92,8 @@ fn non_overlapping_pair_is_unchanged() {
         .record("p", ot_r2(), "chr1", 11, "10M", "CACACACACA", &q40(10)); // ref[10,20)
 
     let env = TestEnv::new();
-    let stats = env.stats.to_str().unwrap().to_string();
-    run_ok(&sam, &reference, &env, &["--stats", &stats]);
+    let stats = env.metrics_prefix_arg();
+    run_ok(&sam, &reference, &env, &["--metrics-prefix", &stats]);
     assert_eq!(ca_total(&env), 10, "non-overlapping mates both fully counted");
 }
 
@@ -107,8 +107,8 @@ fn single_end_reads_are_unaffected_by_dedup() {
         .record("b", 0, "chr1", 1, "10M", "CACACACACA", &q40(10));
 
     let env = TestEnv::new();
-    let stats = env.stats.to_str().unwrap().to_string();
-    run_ok(&sam, &reference, &env, &["--stats", &stats]);
+    let stats = env.metrics_prefix_arg();
+    run_ok(&sam, &reference, &env, &["--metrics-prefix", &stats]);
     // Two separate templates, 5 CpA each → 10 total; dedup never applies to SE.
     assert_eq!(ca_total(&env), 10);
 }

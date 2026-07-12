@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **M-bias-aware masking** (`--mbias-mask`). A two-phase mode that buffers the
+  first `--mbias-buffer-templates` templates (default 500,000) to learn the
+  per-cycle CpG methylation curve for read 1 / read 2 / single-end reads, freezes
+  5' (and, for single-end, 3') mask lengths, then sets the biased bases'
+  qualities to `--mbias-mask-quality` (default 2) on every record carrying SEQ
+  and qualities except secondary alignments (primary, supplementary, and unmapped
+  records are all masked). Mask length is the first 5' cycle whose smoothed
+  methylation reaches `--mbias-plateau-fraction` of the plateau (default 0.90),
+  minus one, capped at `--mbias-max-mask` (default 30). Beyond the own-5' mask:
+  single-end reads mask the 3' end too; reads whose mate is unmapped or absent
+  mirror the mate role's 5' length onto their 3' end; proper pairs mask any 3'
+  bases extending past the mate's post-mask 5' end. Masking only lowers base
+  qualities — no clip, no coordinate/CIGAR/tag/mate rewrite — so it is effective
+  for base-quality-aware callers and is not idempotent. Masking off is
+  performance-neutral with the prior release.
+- **Metric files** under `--metrics-prefix PREFIX`, computed in a single
+  streaming pass: `PREFIX.summary.tsv` (one decision-basis per-context conversion
+  row per scope — the genome, then each `--control-contig` — with the applied
+  mask lengths as `r1_mask_5p` / `r2_mask_5p` / `se_mask_5p` / `se_mask_3p`
+  columns), `PREFIX.conversion-matrix.tsv` (the per-template decision histogram),
+  and `PREFIX.mbias.tsv` (per-read-cycle methylation with Agresti–Coull CIs),
+  plus PDF plots `PREFIX.mbias.pdf` and `PREFIX.conversion-matrix.pdf`.
+
+### Changed
+- **Breaking:** `--stats` and `--conversion-matrix` are replaced by a single
+  `--metrics-prefix PREFIX`, which writes `PREFIX.summary.tsv` (one per-context
+  conversion row per scope, with the applied mask-length columns),
+  `PREFIX.conversion-matrix.tsv`, and `PREFIX.mbias.tsv`. All metric rates are
+  emitted as fractions in `[0, 1]`.
+- `--mbias-mask` supersedes `--ignore-template-ends`: when masking is enabled the
+  manual end-trim is forced to 0 (both target the same fragment-end bias), with a
+  warning logged if a non-zero value was set explicitly.
+- Reference loading is now index-driven and single-pass: with a `.fai` beside the
+  FASTA, each contig is read by its byte span in one bulk read that strips
+  newlines (by the index line geometry) and packs to 2-bit in a single sweep,
+  building each packed byte from its four bases in a register, instead of the
+  previous read → encode → pack three-pass loop with a per-base read-modify-write.
+  An unindexed FASTA falls back to a sequential read (logged). On a human genome
+  this cuts startup user-CPU ~4.6× (≈8.5 s → ≈1.8 s) and peak load memory ~22%
+  (≈1.19 GB → ≈0.93 GB), and removes the direct `noodles-core` dependency.
+
+### Removed
+- **Breaking:** `--ref-encoding` and the `bytes` (1 byte/base) and `nibble`
+  (4-bit) reference layouts. methylsieve now always uses the 2-bit packing that
+  was the default, dropping the unused layout options and the code generic over
+  them. The 2-bit fold of non-ACGT bases to A is unchanged (see "Reference
+  memory" in the README).
+
+### Fixed
+- The threaded BAM writer no longer hangs if the downstream consumer closes the
+  pipe (EPIPE) or the disk fills mid-write: the IO error is now surfaced from the
+  next `write`/`finish` instead of blocking forever on a full ring.
+- M-bias learning and `mbias.tsv` exclude `--control-contig` reads, so spike-in
+  methylation (e.g. methylated pUC19 / unmethylated lambda) no longer skews the
+  learned 5'/3' mask lengths or the reported per-cycle curve. Control reads are
+  still tallied into their own summary rows.
+- `--mbias-mask`: a record with more than eight combined exclusion intervals
+  (many propagated mate windows on a chimeric template) no longer has the excess
+  intervals silently counted in the decision tally while masked in the BAM — all
+  intervals are honored.
+- `too_few_sites` (the `decided_by` label in `conversion-matrix.tsv`) now marks
+  only templates the applied test genuinely could not evaluate. For count-based
+  modes (`count`, and the count fallback of `either`/`adaptive`) that means fewer
+  monitored sites than `--max-unconverted-count` — where the count can never be
+  reached — rather than merely below the proportion floor `--min-sites`.
+
 ## [0.1.0] - 2026-06-13
 
 ### Added

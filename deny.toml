@@ -19,7 +19,14 @@ feature-depth = 1
 [advisories]
 version = 2
 yanked = "warn"
-ignore = []
+ignore = [
+    # ttf-parser is unmaintained (the author declared it so; no maintained
+    # successor exists yet). It is a transitive dependency of the PDF-plotting
+    # stack we don't control (kuva → svg2pdf → fontdb / usvg / rustybuzz), and
+    # this is an unmaintained notice, not a vulnerability. Revisit when the
+    # plotting stack moves off it.
+    "RUSTSEC-2026-0192",
+]
 
 # ---------------------------------------------------------------------------
 # Licenses: only permissive MIT-compatible licenses are allowed. Anything

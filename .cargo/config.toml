@@ -2,3 +2,10 @@
 ci-test = "nextest run --workspace --locked --no-tests=pass"
 ci-fmt = "fmt --all -- --check"
 ci-lint = "clippy --workspace --all-targets -- -D warnings"
+ci-doc = "doc --workspace --no-deps --document-private-items"
+
+# Treat rustdoc warnings (notably broken intra-doc links) as errors, so
+# `cargo ci-doc` gates docs the same way locally and in CI. Scoped to rustdoc,
+# so it does not affect normal builds.
+[env]
+RUSTDOCFLAGS = "-D warnings"
