@@ -30,7 +30,7 @@ fgoxide = "0.6"
 fgumi-raw-bam = "0.2.0"
 # Plotting for --metrics-prefix output (M-bias curves, conversion-matrix hexbin).
 # The `pdf` feature pulls resvg/svg2pdf to render PDF.
-kuva = { version = "0.3.0", features = ["pdf"] }
+kuva = { version = "0.4.0", features = ["pdf"] }
 libc = "0.2"
 libdeflater = "1.25"
 log = "0.4"
