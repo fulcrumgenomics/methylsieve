@@ -40,7 +40,7 @@ fn overlap_dedup_keeps_template_below_threshold() {
     let env = TestEnv::new();
     let deduped = run_ok(&sam, &reference, &env, &[]);
     assert!(
-        deduped.iter().all(|r| !has_tag(r, [b'X', b'X'])),
+        deduped.iter().all(|r| !has_tag(r, *b"XX")),
         "with overlap dedup, 2 unique unconverted < 3 → not tagged"
     );
 }

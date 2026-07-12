@@ -39,7 +39,7 @@ fn count_threshold_tags_at_three_and_four_not_zero_or_two() {
 
     for rec in &recs {
         let name = rec.name().unwrap().to_string();
-        let tagged = has_tag(rec, [b'X', b'X']);
+        let tagged = has_tag(rec, *b"XX");
         let qc_failed = u16::from(rec.flags()) & FLAG_QC_FAIL != 0;
         match name.as_str() {
             "r0" | "r2" => {
@@ -48,7 +48,7 @@ fn count_threshold_tags_at_three_and_four_not_zero_or_two() {
             }
             "r3" | "r4" => {
                 assert!(tagged, "{name} should be tagged unconverted");
-                assert_eq!(tag_string(rec, [b'X', b'X']).as_deref(), Some("UC"));
+                assert_eq!(tag_string(rec, *b"XX").as_deref(), Some("UC"));
                 assert!(qc_failed, "{name} should be QC-failed");
             }
             other => panic!("unexpected record {other}"),

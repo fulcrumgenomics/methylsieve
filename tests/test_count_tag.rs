@@ -45,7 +45,7 @@ fn count_tag_records_unconverted_over_total_on_every_template() {
             "r3" => "3/10",
             other => panic!("unexpected record {other}"),
         };
-        assert_eq!(tag_string(rec, [b'c', b'h']).as_deref(), Some(expected), "{name} ch tag");
+        assert_eq!(tag_string(rec, *b"ch").as_deref(), Some(expected), "{name} ch tag");
     }
 }
 
@@ -64,8 +64,8 @@ fn count_tag_name_is_configurable() {
     );
 
     let recs = run_ok(&sam, &reference, &env, &["--count-tag", "xy"]);
-    assert_eq!(tag_string(&recs[0], [b'x', b'y']).as_deref(), Some("2/10"));
-    assert!(!has_tag(&recs[0], [b'c', b'h']), "default name not used when overridden");
+    assert_eq!(tag_string(&recs[0], *b"xy").as_deref(), Some("2/10"));
+    assert!(!has_tag(&recs[0], *b"ch"), "default name not used when overridden");
 }
 
 #[test]
@@ -83,5 +83,5 @@ fn count_tag_disabled_with_no_count_tag() {
     );
 
     let recs = run_ok(&sam, &reference, &env, &["--no-count-tag"]);
-    assert!(!has_tag(&recs[0], [b'c', b'h']), "--no-count-tag suppresses the count tag");
+    assert!(!has_tag(&recs[0], *b"ch"), "--no-count-tag suppresses the count tag");
 }

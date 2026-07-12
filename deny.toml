@@ -26,6 +26,11 @@ ignore = [
     # this is an unmaintained notice, not a vulnerability. Revisit when the
     # plotting stack moves off it.
     "RUSTSEC-2026-0192",
+    # rustybuzz is unmaintained — same story as ttf-parser above: a transitive
+    # dep of the same PDF-plotting stack (kuva → svg2pdf → usvg → rustybuzz) we
+    # don't control, and an unmaintained notice rather than a vulnerability.
+    # Revisit when the plotting stack moves off it.
+    "RUSTSEC-2026-0206",
 ]
 
 # ---------------------------------------------------------------------------
