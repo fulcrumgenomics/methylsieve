@@ -15,7 +15,7 @@ fn default_tags_and_qc_fails() {
     let env = TestEnv::new();
     let reference = RefBuilder::new().contig("chr1", REF);
     let recs = run_ok(&one_unconverted_read(), &reference, &env, &[]);
-    assert_eq!(tag_string(&recs[0], [b'X', b'X']).as_deref(), Some("UC"));
+    assert_eq!(tag_string(&recs[0], *b"XX").as_deref(), Some("UC"));
     assert!(u16::from(recs[0].flags()) & FLAG_QC_FAIL != 0, "0x200 set by default");
 }
 
@@ -24,7 +24,7 @@ fn no_qc_fail_keeps_tag_without_flag() {
     let env = TestEnv::new();
     let reference = RefBuilder::new().contig("chr1", REF);
     let recs = run_ok(&one_unconverted_read(), &reference, &env, &["--no-qc-fail"]);
-    assert!(has_tag(&recs[0], [b'X', b'X']), "tag still set");
+    assert!(has_tag(&recs[0], *b"XX"), "tag still set");
     assert_eq!(u16::from(recs[0].flags()) & FLAG_QC_FAIL, 0, "0x200 must be off");
 }
 
@@ -41,6 +41,6 @@ fn custom_tag_is_honored() {
     let env = TestEnv::new();
     let reference = RefBuilder::new().contig("chr1", REF);
     let recs = run_ok(&one_unconverted_read(), &reference, &env, &["--tag", "YY:Z:FOO"]);
-    assert_eq!(tag_string(&recs[0], [b'Y', b'Y']).as_deref(), Some("FOO"));
-    assert!(!has_tag(&recs[0], [b'X', b'X']), "default tag not present when overridden");
+    assert_eq!(tag_string(&recs[0], *b"YY").as_deref(), Some("FOO"));
+    assert!(!has_tag(&recs[0], *b"XX"), "default tag not present when overridden");
 }

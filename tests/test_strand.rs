@@ -40,7 +40,7 @@ fn ot_pair_both_reads_monitor_ref_c() {
     let recs = run_ok(&sam, &reference, &env, &[]);
     assert_eq!(recs.len(), 2);
     for rec in &recs {
-        assert!(has_tag(rec, [b'X', b'X']), "both records of OT pair should be tagged");
+        assert!(has_tag(rec, *b"XX"), "both records of OT pair should be tagged");
     }
 }
 
@@ -62,7 +62,7 @@ fn ob_pair_both_reads_monitor_ref_g() {
     let recs = run_ok(&sam, &reference, &env, &[]);
     assert_eq!(recs.len(), 2);
     for rec in &recs {
-        assert!(has_tag(rec, [b'X', b'X']), "both records of OB pair should be tagged");
+        assert!(has_tag(rec, *b"XX"), "both records of OB pair should be tagged");
     }
 }
 
@@ -92,7 +92,7 @@ fn reverse_supplementary_flips_to_ref_g() {
     assert_eq!(recs.len(), 2);
     for rec in &recs {
         assert!(
-            has_tag(rec, [b'X', b'X']),
+            has_tag(rec, *b"XX"),
             "tag must propagate to all records (incl. the supplementary)"
         );
     }
@@ -112,6 +112,6 @@ fn ignore_supplementary_evidence_excludes_it_from_decision() {
 
     let recs = run_ok(&sam, &reference, &env, &["--ignore-supplementary-evidence"]);
     for rec in &recs {
-        assert!(!has_tag(rec, [b'X', b'X']), "no record should be tagged when below threshold");
+        assert!(!has_tag(rec, *b"XX"), "no record should be tagged when below threshold");
     }
 }

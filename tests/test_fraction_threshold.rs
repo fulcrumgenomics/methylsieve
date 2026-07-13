@@ -33,7 +33,7 @@ fn fraction_is_gated_below_min_sites_and_fires_above() {
     );
     for rec in &recs {
         let name = rec.name().unwrap().to_string();
-        let tagged = has_tag(rec, [b'X', b'X']);
+        let tagged = has_tag(rec, *b"XX");
         match name.as_str() {
             "few" => assert!(!tagged, "3 sites < min-sites 5 → fraction gated → not tagged"),
             "many" => assert!(tagged, "6 sites ≥ 5 and 0.67 > 0.5 → tagged"),
@@ -52,5 +52,5 @@ fn count_threshold_fires_even_when_fraction_is_gated() {
         SamBuilder::new().sq("chr1", REF.len()).record("r", 0, "chr1", 1, "6M", "CACACA", &q40(6));
     let recs =
         run_ok(&sam, &reference, &env, &["--max-unconverted-fraction", "0.5", "--min-sites", "5"]);
-    assert!(has_tag(&recs[0], [b'X', b'X']), "count path (3 ≥ 3) tags regardless of gating");
+    assert!(has_tag(&recs[0], *b"XX"), "count path (3 ≥ 3) tags regardless of gating");
 }

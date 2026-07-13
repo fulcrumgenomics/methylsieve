@@ -23,7 +23,7 @@ fn low_quality_cytosines_are_skipped() {
     );
     // Default --min-base-quality 10 skips the BQ-2 C's → 0 unconverted.
     let recs = run_ok(&sam, &reference, &env, &[]);
-    assert!(!has_tag(&recs[0], [b'X', b'X']), "BQ-2 cytosines must not count");
+    assert!(!has_tag(&recs[0], *b"XX"), "BQ-2 cytosines must not count");
 }
 
 #[test]
@@ -40,5 +40,5 @@ fn min_base_quality_zero_counts_them() {
         LOW_C_QUALS,
     );
     let recs = run_ok(&sam, &reference, &env, &["--min-base-quality", "0"]);
-    assert!(has_tag(&recs[0], [b'X', b'X']), "with -q0 the 5 unconverted C's tag the read");
+    assert!(has_tag(&recs[0], *b"XX"), "with -q0 the 5 unconverted C's tag the read");
 }

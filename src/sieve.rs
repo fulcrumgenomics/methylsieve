@@ -1327,7 +1327,7 @@ mod tests {
             min_base_quality: 0,
             ignore_template_ends: 0,
             ignore_supplementary_evidence: false,
-            tag: TagSpec { tag: [b'X', b'X'], value: b"UC".to_vec() },
+            tag: TagSpec { tag: *b"XX", value: b"UC".to_vec() },
             count_tag: None,
             qc_fail: true,
             remove_unconverted: false,

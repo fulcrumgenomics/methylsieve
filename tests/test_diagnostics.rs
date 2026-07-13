@@ -23,7 +23,7 @@ fn unmapped_template_passes_through_untouched() {
     let recs = run_ok(&sam, &reference, &env, &["--metrics-prefix", &stats]);
     assert_eq!(recs.len(), 2);
     for rec in &recs {
-        assert!(!has_tag(rec, [b'X', b'X']), "unmapped reads must not be tagged");
+        assert!(!has_tag(rec, *b"XX"), "unmapped reads must not be tagged");
         assert_eq!(u16::from(rec.flags()) & FLAG_QC_FAIL, 0);
     }
     let g = genome_stats(&env.stats);
@@ -42,7 +42,7 @@ fn zero_site_template_is_counted_and_not_tagged() {
         SamBuilder::new().sq("chr1", 10).record("z", 0, "chr1", 1, "10M", "AAAAAAAAAA", &q40(10));
 
     let recs = run_ok(&sam, &reference, &env, &["--metrics-prefix", &stats]);
-    assert!(!has_tag(&recs[0], [b'X', b'X']));
+    assert!(!has_tag(&recs[0], *b"XX"));
     let g = genome_stats(&env.stats);
     assert_eq!(g["n_mapped"], "1", "the read is mapped, just has no monitored sites");
     assert_eq!(g["n_evaluated"], "0", "no monitored sites → not evaluated");
@@ -64,11 +64,11 @@ fn count_threshold_boundary_is_inclusive() {
     );
 
     let tagged_at_2 = run_ok(&sam, &reference, &env, &["--max-unconverted-count", "2"]);
-    assert!(has_tag(&tagged_at_2[0], [b'X', b'X']), "2 ≥ 2 → tagged");
+    assert!(has_tag(&tagged_at_2[0], *b"XX"), "2 ≥ 2 → tagged");
 
     let env2 = TestEnv::new();
     let not_at_3 = run_ok(&sam, &reference, &env2, &["--max-unconverted-count", "3"]);
-    assert!(!has_tag(&not_at_3[0], [b'X', b'X']), "2 < 3 → not tagged");
+    assert!(!has_tag(&not_at_3[0], *b"XX"), "2 < 3 → not tagged");
 }
 
 #[test]

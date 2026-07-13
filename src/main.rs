@@ -1207,7 +1207,7 @@ mod tests {
     #[test]
     fn parse_tag_spec_default() {
         let t = parse_tag_spec("XX:Z:UC").unwrap();
-        assert_eq!(t.tag, [b'X', b'X']);
+        assert_eq!(t.tag, *b"XX");
         assert_eq!(t.value, b"UC");
     }
 
@@ -1261,7 +1261,7 @@ mod tests {
             ignore_template_ends: 0,
             ignore_supplementary_evidence: false,
             tag: parse_tag_spec("XX:Z:UC").unwrap(),
-            count_tag: [b'c', b'h'],
+            count_tag: *b"ch",
             no_count_tag: false,
             no_qc_fail: false,
             remove_unconverted: false,

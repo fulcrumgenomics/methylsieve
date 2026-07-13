@@ -29,7 +29,7 @@ fn control_reads_are_separated_and_chimeric_is_counted() {
 
     for rec in &recs {
         let name = rec.name().unwrap().to_string();
-        let tagged = has_tag(rec, [b'X', b'X']);
+        let tagged = has_tag(rec, *b"XX");
         match name.as_str() {
             "main" | "chim" => assert!(tagged, "{name} should be tagged"),
             "ctrl" => assert!(!tagged, "control read must never be tagged"),

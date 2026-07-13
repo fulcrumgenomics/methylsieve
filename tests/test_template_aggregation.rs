@@ -39,7 +39,7 @@ fn aggregates_r1_r2_and_supplementary_then_tags_all() {
     let recs = run_ok(&sam, &reference, &env, &[]);
     assert_eq!(recs.len(), 3);
     for rec in &recs {
-        assert!(has_tag(rec, [b'X', b'X']), "tag must propagate to every record");
+        assert!(has_tag(rec, *b"XX"), "tag must propagate to every record");
     }
 }
 
@@ -66,6 +66,6 @@ fn secondary_alignments_do_not_contribute_evidence() {
     let recs = run_ok(&sam, &reference, &env, &[]);
     assert_eq!(recs.len(), 3);
     for rec in &recs {
-        assert!(!has_tag(rec, [b'X', b'X']), "secondary evidence must not trigger a tag");
+        assert!(!has_tag(rec, *b"XX"), "secondary evidence must not trigger a tag");
     }
 }
