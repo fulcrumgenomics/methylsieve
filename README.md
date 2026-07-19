@@ -2,6 +2,7 @@
 [![Version at crates.io](https://img.shields.io/crates/v/methylsieve)](https://crates.io/crates/methylsieve)
 [![Bioconda](https://img.shields.io/conda/vn/bioconda/methylsieve.svg?label=bioconda)](https://bioconda.github.io/recipes/methylsieve/README.html)
 [![License](http://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/fulcrumgenomics/methylsieve/blob/main/LICENSE)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21445804.svg)](https://doi.org/10.5281/zenodo.21445804)
 
 # methylsieve
 
