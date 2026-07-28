@@ -31,7 +31,7 @@ pre-release-commit-message = "chore: release version {{version}}"
 tag-message = "Release {{version}}"
 
 # Run the same gate CI runs before allowing a release to proceed.
-pre-release-hook = ["sh", "-c", "cargo ci-fmt && cargo ci-lint && cargo ci-test"]
+pre-release-hook = ["sh", "-c", "cargo ci-fmt && cargo ci-lint && cargo ci-test && cargo ci-doc"]
 
 # Roll the CHANGELOG forward as part of the release commit. The `[Unreleased]`
 # heading gains a new dated version section beneath it (the accumulated notes
