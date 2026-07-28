@@ -230,7 +230,7 @@ impl Default for MbiasAccumulator {
     }
 }
 
-/// Tunables for [`detect_mask_length`].
+/// Tunables for [`detect_mask`].
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DetectParams {
     /// Keep from the first cycle whose smoothed rate reaches this fraction of the
