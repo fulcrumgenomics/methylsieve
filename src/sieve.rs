@@ -748,61 +748,79 @@ impl RecordProcessor {
         // The count tag is a per-template aggregate (u/n over the decision
         // contexts): build the value once, stamp every record. Applied on every
         // template, flagged or not, so a user can inspect surprises either way.
-        let mut count_buf = CountTagValue::new();
-        let count_value = self.opts.count_tag.map(|_| count_buf.render(counts.0, counts.1));
+        let mut count_buf = [0u8; COUNT_TAG_WIDTH];
+        let count_value: Option<&[u8]> = self
+            .opts
+            .count_tag
+            .is_some()
+            .then(|| render_counts(&mut count_buf, counts.0, counts.1));
         for rec in block.iter_mut() {
             if action == Action::Mark {
                 if self.opts.qc_fail {
                     rec.set_flags(rec.flags() | FLAG_QC_FAIL);
                 }
-                rec.tags_editor().update_string(&self.opts.tag.tag, &self.opts.tag.value);
+                replace_string_tag(rec, &self.opts.tag.tag, &self.opts.tag.value);
             }
             if let (Some(tag), Some(value)) = (&self.opts.count_tag, count_value) {
-                rec.tags_editor().update_string(tag, value);
+                replace_string_tag(rec, tag, value);
             }
         }
     }
 }
 
-/// Scratch buffer for the `--count-tag` value (`u/n`), rendered once per template.
+/// Set string tag `tag` on `rec` to `value`, replacing whatever was there.
+///
+/// A tag may appear only once per record, so an existing field has to be replaced
+/// rather than appended beside — and it may not be a string: nothing stops another
+/// tool from having used the same two-letter name with another type.
+///
+/// Removing first is what makes that safe. `RawTagsEditor::update_string` looks
+/// like the right call but is not: it decides to overwrite in place by comparing
+/// `value.len()` against the existing field's size *minus the `Z` layout's four
+/// framing bytes*, without checking the existing type byte. A four-byte `i`/`I`/`f`
+/// field therefore reports a three-byte value, and any three-character
+/// replacement — `0/0`, which every zero-site template renders — overwrites the
+/// payload while leaving the type byte intact, silently turning the count into a
+/// garbage integer instead of replacing it.
+///
+/// The removal walks the aux block, which is the same walk the old presence check
+/// cost, so this is no more expensive than skipping-if-present was.
+fn replace_string_tag(rec: &mut RawRecord, tag: &[u8; 2], value: &[u8]) {
+    let mut editor = rec.tags_editor();
+    editor.remove(tag);
+    editor.append_string(tag, value);
+}
+
+/// Width of a rendered `--count-tag` value: two `u64`s at 20 digits each, plus `/`.
+const COUNT_TAG_WIDTH: usize = 41;
+
+/// Render `unconv/total` into `buf`, returning the bytes written.
 ///
 /// `format!` would allocate a `String` and run `core::fmt`'s padding-aware integer
-/// path for every template. Two site counts cannot exceed 20 digits each, so the
-/// value always fits a fixed buffer written by a plain digit loop.
-struct CountTagValue {
-    buf: [u8; 41], // 20 digits + '/' + 20 digits
-    len: usize,
+/// path once per template. The value is only ever two decimal integers, so it
+/// always fits a fixed buffer written by a digit loop.
+fn render_counts(buf: &mut [u8; COUNT_TAG_WIDTH], unconv: u64, total: u64) -> &[u8] {
+    let mut end = write_u64(buf, 0, unconv);
+    buf[end] = b'/';
+    end += 1;
+    end = write_u64(buf, end, total);
+    &buf[..end]
 }
 
-impl CountTagValue {
-    fn new() -> Self {
-        Self { buf: [0; 41], len: 0 }
-    }
-
-    /// Render `unconv/total` and return the bytes, valid until the next call.
-    fn render(&mut self, unconv: u64, total: u64) -> &[u8] {
-        self.len = 0;
-        self.push_u64(unconv);
-        self.buf[self.len] = b'/';
-        self.len += 1;
-        self.push_u64(total);
-        &self.buf[..self.len]
-    }
-
-    /// Append `n`'s decimal digits, least-significant digit generated first and
-    /// then reversed in place.
-    fn push_u64(&mut self, mut n: u64) {
-        let start = self.len;
-        loop {
-            self.buf[self.len] = b'0' + (n % 10) as u8;
-            self.len += 1;
-            n /= 10;
-            if n == 0 {
-                break;
-            }
+/// Write `n`'s decimal digits into `buf` starting at `at`, returning the new end.
+/// Digits fall out least-significant first, so the run is reversed in place.
+fn write_u64(buf: &mut [u8; COUNT_TAG_WIDTH], at: usize, mut n: u64) -> usize {
+    let mut end = at;
+    loop {
+        buf[end] = b'0' + (n % 10) as u8;
+        end += 1;
+        n /= 10;
+        if n == 0 {
+            break;
         }
-        self.buf[start..self.len].reverse();
     }
+    buf[at..end].reverse();
+    end
 }
 
 /// Whether a processed template should be emitted or dropped.
@@ -1404,19 +1422,23 @@ mod tests {
 
     #[test]
     fn count_tag_value_renders_like_format() {
-        let mut v = CountTagValue::new();
+        let mut buf = [0u8; COUNT_TAG_WIDTH];
         // Zero, single digit, and a value whose low digit is 0 (the digit loop
         // must not stop early on it).
-        assert_eq!(v.render(0, 0), b"0/0");
-        assert_eq!(v.render(3, 10), b"3/10");
-        assert_eq!(v.render(100, 1000), b"100/1000");
+        assert_eq!(render_counts(&mut buf, 0, 0), b"0/0");
+        assert_eq!(render_counts(&mut buf, 3, 10), b"3/10");
+        assert_eq!(render_counts(&mut buf, 100, 1000), b"100/1000");
         // The buffer is sized for the widest possible pair, and must reset between
         // calls rather than leaving the previous value's tail behind.
         assert_eq!(
-            v.render(u64::MAX, u64::MAX),
+            render_counts(&mut buf, u64::MAX, u64::MAX),
             b"18446744073709551615/18446744073709551615".as_slice()
         );
-        assert_eq!(v.render(7, 9), b"7/9", "reused buffer is truncated to the new value");
+        assert_eq!(
+            render_counts(&mut buf, 7, 9),
+            b"7/9",
+            "reused buffer is truncated to the new value"
+        );
     }
 
     #[test]
@@ -1650,9 +1672,9 @@ mod tests {
 
     #[test]
     fn fused_walk_honors_every_window_when_a_record_has_several() {
-        // The fused scan compares the first stored exclusion inline and scans only
-        // the remainder, so a record with several windows must still have all of
-        // them excluded from the tally — while M-bias records every site.
+        // The fused scan tests every stored exclusion per site, so a record
+        // carrying several windows must have all of them excluded from the tally —
+        // while M-bias still records every site.
         let seq = "CA".repeat(20); // 40 bp: a CpA C at every even stored position
         let reference = Reference::from_encoded_contigs(vec![enc(&seq)]);
         let proc = RecordProcessor::new(reference, opts(cph_mask(), 3));

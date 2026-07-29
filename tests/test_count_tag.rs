@@ -156,3 +156,51 @@ fn count_tag_name_already_used_with_another_type_is_replaced() {
     assert_eq!(tag_string(&recs[0], *b"ch").as_deref(), Some("3/10"));
     assert_eq!(tag_string(&recs[0], *b"MD").as_deref(), Some("20"), "later tags survive");
 }
+
+/// 10 bp of the same alternating reference: 5 monitored sites, so the count
+/// renders as three characters. That width matters — see the test below.
+const REF10: &str = "CACACACACA";
+
+/// C at the first `unconv` monitored positions of [`REF10`], T at the rest.
+fn read10_with_unconverted(unconv: usize) -> String {
+    (0..10)
+        .map(|i| {
+            if i % 2 == 1 {
+                'A'
+            } else if i / 2 < unconv {
+                'C'
+            } else {
+                'T'
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn count_tag_replacing_a_four_byte_foreign_tag_keeps_its_string_type() {
+    // The dangerous width coincidence: a four-byte `i`/`I`/`f` field occupies the
+    // same bytes a three-character `Z` value would, and a replacement that only
+    // compares those lengths will overwrite the payload while leaving the type byte
+    // alone — destroying the value instead of replacing it. Three characters is not
+    // exotic: it is what `0/0` renders, on every zero-site template.
+    let env = TestEnv::new();
+    let reference = RefBuilder::new().contig("chr1", REF10);
+    let sam = SamBuilder::new().sq("chr1", REF10.len()).record_with_aux(
+        "r",
+        0,
+        "chr1",
+        1,
+        "10M",
+        &read10_with_unconverted(2),
+        &q40(10),
+        &["ch:i:100000", "MD:Z:10"], // 100000 needs the full four bytes
+    );
+
+    let recs = run_ok(&sam, &reference, &env, &[]);
+    assert_eq!(physical_tag_counts(&env.output, *b"ch"), vec![1], "exactly one ch field");
+    assert_eq!(
+        tag_string(&recs[0], *b"ch").as_deref(),
+        Some("2/5"),
+        "count tag is a Z string, not the old field's type with new bytes in it"
+    );
+}
