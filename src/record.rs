@@ -1,10 +1,12 @@
 //! Low-level BAM record geometry shared by the tally engine ([`crate::sieve`])
-//! and the masker ([`crate::mask`]): SAM flag constants, flag predicates, the
-//! per-record monitored-strand / read-role rules, and CIGAR-aware mapping
-//! between stored read positions and reference coordinates.
+//! and the masker ([`crate::mask`]): the once-per-record decoded layout
+//! ([`RecordGeom`]), SAM flag constants, flag predicates, the per-record
+//! monitored-strand / read-role rules, and CIGAR-aware mapping between stored
+//! read positions and reference coordinates.
 //!
-//! These are per-*record* helpers (called O(records), not O(bases)), so they sit
-//! outside the per-base tally hot loop in `sieve`.
+//! Apart from [`RecordGeom`]'s per-base accessors these are per-*record* helpers
+//! (called O(records), not O(bases)), so they sit outside the per-base tally hot
+//! loop in `sieve`.
 
 use fgumi_raw_bam::RawRecord;
 
@@ -30,6 +32,92 @@ pub(crate) const FLAG_SECONDARY: u16 = 0x100;
 pub(crate) const FLAG_QC_FAIL: u16 = 0x200;
 /// SAM FLAG 0x800: supplementary (chimeric) alignment.
 pub(crate) const FLAG_SUPPLEMENTARY: u16 = 0x800;
+
+// ── Decoded record layout ───────────────────────────────────────────────────
+
+/// One record's decoded layout: the fixed-header fields plus borrowed CIGAR,
+/// packed-SEQ and QUAL slices.
+///
+/// [`RawRecord`]'s `get_qual` / `get_base` re-derive `qual_offset` / `seq_offset`
+/// from the record bytes on **every call** — seven byte loads plus the address
+/// arithmetic — which the per-site tally paid once per monitored cytosine, tens
+/// of times per record. Resolving the slices once per record turns each of those
+/// into a single bounds-checked index, and shrinks [`crate::sieve`]'s per-site
+/// classifier enough for it to inline into the scan loop.
+///
+/// `Copy`, so it threads through the tally kernels in registers.
+#[derive(Clone, Copy)]
+pub(crate) struct RecordGeom<'a> {
+    flags: u16,
+    pos: i32,
+    ref_id: i32,
+    /// Stored SEQ length; read positions are valid in `0..seq_len`.
+    seq_len: usize,
+    /// Raw CIGAR bytes (4 per op), for [`Self::cigar_ops`].
+    cigar: &'a [u8],
+    /// 4-bit packed SEQ, two bases per byte.
+    seq: &'a [u8],
+    /// Per-base QUAL, `seq_len` bytes. All `0xFF` when QUAL is the `*` sentinel.
+    quals: &'a [u8],
+}
+
+impl<'a> RecordGeom<'a> {
+    /// Decode `rec`'s layout once. The field accessors below each recompute
+    /// their offsets, so this is the only place that cost is paid per record.
+    #[must_use]
+    pub(crate) fn new(rec: &'a RawRecord) -> Self {
+        Self {
+            flags: rec.flags(),
+            pos: rec.pos(),
+            ref_id: rec.ref_id(),
+            seq_len: rec.l_seq() as usize,
+            cigar: rec.cigar_raw_bytes(),
+            seq: rec.sequence_packed(),
+            quals: rec.quality_scores(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn flags(&self) -> u16 {
+        self.flags
+    }
+
+    /// 0-based leftmost aligned position; negative for an unplaced record.
+    #[inline]
+    pub(crate) fn pos(&self) -> i32 {
+        self.pos
+    }
+
+    #[inline]
+    pub(crate) fn ref_id(&self) -> i32 {
+        self.ref_id
+    }
+
+    #[inline]
+    pub(crate) fn seq_len(&self) -> usize {
+        self.seq_len
+    }
+
+    /// Raw CIGAR ops (`len << 4 | op`), in order.
+    #[inline]
+    pub(crate) fn cigar_ops(&self) -> impl Iterator<Item = u32> + 'a {
+        self.cigar.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+    }
+
+    /// QUAL at stored read position `rp` (`rp < seq_len`).
+    #[inline]
+    pub(crate) fn qual(&self, rp: usize) -> u8 {
+        self.quals[rp]
+    }
+
+    /// 4-bit BAM base code at stored read position `rp` (`rp < seq_len`):
+    /// A=1, C=2, G=4, T=8, N=15. High nibble holds the even position.
+    #[inline]
+    pub(crate) fn base(&self, rp: usize) -> u8 {
+        let byte = self.seq[rp >> 1];
+        if rp & 1 == 0 { byte >> 4 } else { byte & 0xF }
+    }
+}
 
 /// Whether `flags` has **any** bit in `bit` set (`flags & bit != 0`). For a
 /// single-bit `bit` this is the obvious "is this flag set?"; for an OR'd mask it
