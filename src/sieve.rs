@@ -593,12 +593,12 @@ impl RecordProcessor {
                     let k1 = len
                         .min(seq_len.saturating_sub(read_pos))
                         .min(ref_len.saturating_sub(ref_pos));
-                    for k in 0..k1 {
-                        let gp = ref_pos + k;
-                        if !refc.monitors(gp, monitored_base) {
-                            continue;
-                        }
-                        let rp = read_pos + k;
+                    // Read and reference positions advance together across an
+                    // M-span, so each visited `gp` implies its `rp`. Copied out of
+                    // the running cursors so the closure doesn't borrow them.
+                    let (span_ref, span_read) = (ref_pos, read_pos);
+                    refc.for_each_monitored(ref_pos, ref_pos + k1, monitored_base, |gp| {
+                        let rp = span_read + (gp - span_ref);
                         if let Some((ctx, unconverted)) =
                             classify_site(geom, refc, rp, gp, monitor_c, min_bq)
                         {
@@ -614,7 +614,7 @@ impl RecordProcessor {
                                 counters.record(ctx, unconverted);
                             }
                         }
-                    }
+                    });
                     read_pos += len;
                     ref_pos += len;
                 }
@@ -1203,16 +1203,12 @@ fn tally_run(
     p: &SpanParams,
     counters: &mut PerContextCounters,
 ) {
-    for k in lo..hi {
-        let gp = gp_start + k;
-        // Reference check first: rejects ~79% of bases (only ~21% are the
-        // monitored C/G) before the gather work. `monitors` compares in the
-        // encoding's native space (no per-base decode for packed layouts).
-        if !refc.monitors(gp, p.monitored_base) {
-            continue;
-        }
-        tally_site(geom, refc, rp_start + k, gp, p, counters);
-    }
+    // The reference scan comes first and rejects ~79% of bases (only ~21% are the
+    // monitored C/G) before any gather work; `for_each_monitored` does it 32 bases
+    // per word rather than one probe at a time.
+    refc.for_each_monitored(gp_start + lo, gp_start + hi, p.monitored_base, |gp| {
+        tally_site(geom, refc, rp_start + (gp - gp_start), gp, p, counters);
+    });
 }
 
 /// Scalar reference-span tally: walk `len` aligned positions from read position

@@ -158,15 +158,83 @@ impl TwoBitCodes<'_> {
         // A/C/G/T are 1/2/4/8 = 1 << (0/1/2/3).
         1u8 << val
     }
-    /// Whether the base at `pos` equals the 4-bit BAM `code` (a fixed monitored
-    /// base, C=2 or G=4, across a scan). Compares in 2-bit space: `code == 1 <<
-    /// val`, so `val == log2(code)`. This drops the per-base `1 << val` shift
-    /// from the hot reference scan; `code.trailing_zeros()` is loop-invariant
-    /// (the monitored base), so it hoists out of the caller's scan loop.
+    /// Whether the base at `pos` equals the 4-bit BAM `code` (a monitored base,
+    /// C=2 or G=4). Compares in 2-bit space: `code == 1 << val`, so
+    /// `val == log2(code)`.
+    ///
+    /// The scan itself runs on [`Self::for_each_monitored`], which tests 32 bases
+    /// at a time; this single-base form remains as the scalar definition that the
+    /// bulk scan is asserted equal to.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn monitors(&self, pos: usize, code: u8) -> bool {
         let val = (self.data[pos >> 2] >> ((pos & 3) * 2)) & 0x3;
         val == code.trailing_zeros() as u8
+    }
+    /// Call `f(pos)` for every position in `[start, end)` whose base equals the
+    /// monitored 4-bit `code`, ascending — the bulk form of [`Self::monitors`],
+    /// and the tally's per-aligned-base scan.
+    ///
+    /// Only ~21% of reference positions are the monitored C/G, so probing them
+    /// one at a time spends most of its work rejecting. Instead this tests 32
+    /// bases per 64-bit word: XOR against `code` splatted into every 2-bit field
+    /// makes matching fields `00`, and a zero-field detect turns those into a
+    /// bitmask iterated by `trailing_zeros`, so the visited set is exactly
+    /// `(start..end).filter(|p| self.monitors(p, code))`.
+    ///
+    /// Both span edges are handled by clearing bits rather than by scalar loops,
+    /// and a window running past the packed store is zero-filled (2-bit `0` is A,
+    /// never a monitored base). That leaves **one** `f` call site, which is what
+    /// lets the caller's per-site body inline into this loop — with three call
+    /// sites LLVM outlines it and charges a call per site, undoing the win.
+    #[inline]
+    pub(crate) fn for_each_monitored(
+        &self,
+        start: usize,
+        end: usize,
+        code: u8,
+        mut f: impl FnMut(usize),
+    ) {
+        if start >= end {
+            return;
+        }
+        // `code` as a 2-bit value repeated across all 32 fields. `0x5555… * v`
+        // carries nothing for `v <= 3`, which holds for any single-base code.
+        let splat = 0x5555_5555_5555_5555u64 * u64::from(code.trailing_zeros());
+
+        // Windows are byte-aligned so a little-endian `u64` at byte `base / 4`
+        // holds the base at `base + i` in bits `2i` — the match bitmask then
+        // indexes positions directly. The first window may start below `start`.
+        let mut base = start - start % 4;
+        while base < end {
+            let byte = base / 4;
+            let word = match self.data.get(byte..byte + 8) {
+                Some(chunk) => u64::from_le_bytes(chunk.try_into().expect("8 bytes")),
+                // Final window of the contig: pad the missing bytes with zeros.
+                None => {
+                    let mut buf = [0u8; 8];
+                    let avail = &self.data[byte..];
+                    buf[..avail.len()].copy_from_slice(avail);
+                    u64::from_le_bytes(buf)
+                }
+            };
+            let zero = !(word ^ splat);
+            let mut matches = zero & (zero >> 1) & 0x5555_5555_5555_5555;
+            // Clear matches outside `[start, end)`. Each shift amount is < 64:
+            // `start - base` is at most 3, and `end - base` is only used when it
+            // is under 32.
+            if base < start {
+                matches &= !((1u64 << (2 * (start - base))) - 1);
+            }
+            if end - base < 32 {
+                matches &= (1u64 << (2 * (end - base))) - 1;
+            }
+            while matches != 0 {
+                f(base + matches.trailing_zeros() as usize / 2);
+                matches &= matches - 1; // clear the lowest set bit
+            }
+            base += 32;
+        }
     }
     /// Top-strand context implied by the base at `pos`, which the caller passes as
     /// the monitored C's 3' neighbor (`gp + 1`).
@@ -597,6 +665,78 @@ mod tests {
                 assert_eq!(view.monitors(i, code), view.code(i) == code, "pos {i} code {code}");
             }
         }
+    }
+
+    /// Positions `for_each_monitored` visits, as a vector.
+    fn monitored_positions(
+        view: &TwoBitCodes<'_>,
+        start: usize,
+        end: usize,
+        code: u8,
+    ) -> Vec<usize> {
+        let mut got = Vec::new();
+        view.for_each_monitored(start, end, code, |p| got.push(p));
+        got
+    }
+
+    /// The scalar predicate applied over the same span — the definition
+    /// `for_each_monitored` must reproduce exactly.
+    fn scalar_positions(view: &TwoBitCodes<'_>, start: usize, end: usize, code: u8) -> Vec<usize> {
+        (start..end).filter(|&p| view.monitors(p, code)).collect()
+    }
+
+    #[test]
+    fn for_each_monitored_matches_scalar_probe_at_every_offset_and_length() {
+        // 200 bases with C/G at irregular positions, so matches land on both
+        // parities and straddle byte (4-base) and word (32-base) boundaries.
+        // Every start offset covers all four byte alignments of the head loop,
+        // and lengths run out to the contig end so the partial-final-word mask
+        // and the near-the-end scalar fallback are both exercised.
+        let codes: Vec<u8> =
+            (0..200u32).map(|i| encode_ref_base(b"ACGTGCTAAC"[(i as usize * 7) % 10])).collect();
+        let packed = pack_codes_twobit(&codes);
+        let view = TwoBitCodes { data: &packed.data, len: packed.len };
+
+        for &code in &[BASE_C, BASE_G] {
+            for start in 0..40 {
+                for end in start..=view.len() {
+                    assert_eq!(
+                        monitored_positions(&view, start, end, code),
+                        scalar_positions(&view, start, end, code),
+                        "code={code} start={start} end={end}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn for_each_monitored_handles_contigs_shorter_than_one_word() {
+        // Under 32 bases no whole 64-bit word is ever loadable, so the scan runs
+        // entirely on the head/tail scalar paths.
+        for len in 1..40usize {
+            let codes: Vec<u8> = (0..len).map(|i| encode_ref_base(b"CGAT"[(i * 3) % 4])).collect();
+            let packed = pack_codes_twobit(&codes);
+            let view = TwoBitCodes { data: &packed.data, len: packed.len };
+            for &code in &[BASE_C, BASE_G] {
+                assert_eq!(
+                    monitored_positions(&view, 0, len, code),
+                    scalar_positions(&view, 0, len, code),
+                    "len={len} code={code}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn for_each_monitored_visits_nothing_for_an_empty_span() {
+        let codes: Vec<u8> = "CCCCCCCCCC".bytes().map(encode_ref_base).collect();
+        let packed = pack_codes_twobit(&codes);
+        let view = TwoBitCodes { data: &packed.data, len: packed.len };
+        assert!(monitored_positions(&view, 5, 5, BASE_C).is_empty());
+        // An all-C contig: every position in the span matches, none outside it.
+        assert_eq!(monitored_positions(&view, 3, 7, BASE_C), vec![3, 4, 5, 6]);
+        assert!(monitored_positions(&view, 0, 10, BASE_G).is_empty());
     }
 
     #[test]
