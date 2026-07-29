@@ -85,3 +85,27 @@ fn count_tag_disabled_with_no_count_tag() {
     let recs = run_ok(&sam, &reference, &env, &["--no-count-tag"]);
     assert!(!has_tag(&recs[0], *b"ch"), "--no-count-tag suppresses the count tag");
 }
+
+#[test]
+fn count_tag_is_appended_alongside_pre_existing_aux() {
+    // Every other test here stamps a record with no aux at all. This one already
+    // carries fields, so it covers appending to a populated aux block: the new tag
+    // lands and the existing fields survive intact.
+    let env = TestEnv::new();
+    let reference = RefBuilder::new().contig("chr1", REF);
+    let sam = SamBuilder::new().sq("chr1", REF.len()).record_with_aux(
+        "r",
+        0,
+        "chr1",
+        1,
+        "20M",
+        &read_with_unconverted(3),
+        &q40(20),
+        &["XA:Z:chr1,+100,20M,0;", "MD:Z:20"],
+    );
+
+    let recs = run_ok(&sam, &reference, &env, &[]);
+    assert_eq!(tag_string(&recs[0], *b"ch").as_deref(), Some("3/10"));
+    assert_eq!(tag_string(&recs[0], *b"XA").as_deref(), Some("chr1,+100,20M,0;"));
+    assert_eq!(tag_string(&recs[0], *b"MD").as_deref(), Some("20"));
+}

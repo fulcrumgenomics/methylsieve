@@ -50,7 +50,7 @@ impl SamBuilder {
     /// Append a SAM record (11 standard fields; optional trailing aux fields).
     #[allow(clippy::too_many_arguments)]
     pub fn record(
-        mut self,
+        self,
         qname: &str,
         flag: u16,
         rname: &str,
@@ -59,10 +59,31 @@ impl SamBuilder {
         seq: &str,
         qual: &str,
     ) -> Self {
+        self.record_with_aux(qname, flag, rname, pos, cigar, seq, qual, &[])
+    }
+
+    /// A record carrying extra aux fields, each a full `TAG:TYPE:VALUE` string.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_with_aux(
+        mut self,
+        qname: &str,
+        flag: u16,
+        rname: &str,
+        pos: u32,
+        cigar: &str,
+        seq: &str,
+        qual: &str,
+        aux: &[&str],
+    ) -> Self {
         let seq = if seq.is_empty() { "*" } else { seq };
         let qual = if qual.is_empty() { "*" } else { qual };
-        self.records
-            .push(format!("{qname}\t{flag}\t{rname}\t{pos}\t60\t{cigar}\t*\t0\t0\t{seq}\t{qual}"));
+        let mut line =
+            format!("{qname}\t{flag}\t{rname}\t{pos}\t60\t{cigar}\t*\t0\t0\t{seq}\t{qual}");
+        for field in aux {
+            line.push('\t');
+            line.push_str(field);
+        }
+        self.records.push(line);
         self
     }
 

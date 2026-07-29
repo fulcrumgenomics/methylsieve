@@ -741,7 +741,8 @@ impl RecordProcessor {
         // The count tag is a per-template aggregate (u/n over the decision
         // contexts): build the value once, stamp every record. Applied on every
         // template, flagged or not, so a user can inspect surprises either way.
-        let count_value = self.opts.count_tag.map(|_| format!("{}/{}", counts.0, counts.1));
+        let mut count_buf = CountTagValue::new();
+        let count_value = self.opts.count_tag.map(|_| count_buf.render(counts.0, counts.1));
         for rec in block.iter_mut() {
             if action == Action::Mark {
                 if self.opts.qc_fail {
@@ -752,12 +753,53 @@ impl RecordProcessor {
                     rec.tags_editor().append_string(&self.opts.tag.tag, &self.opts.tag.value);
                 }
             }
-            if let (Some(tag), Some(value)) = (&self.opts.count_tag, &count_value)
+            if let (Some(tag), Some(value)) = (&self.opts.count_tag, count_value)
                 && rec.tags().find_string(tag).is_none()
             {
-                rec.tags_editor().append_string(tag, value.as_bytes());
+                rec.tags_editor().append_string(tag, value);
             }
         }
+    }
+}
+
+/// Scratch buffer for the `--count-tag` value (`u/n`), rendered once per template.
+///
+/// `format!` would allocate a `String` and run `core::fmt`'s padding-aware integer
+/// path for every template. Two site counts cannot exceed 20 digits each, so the
+/// value always fits a fixed buffer written by a plain digit loop.
+struct CountTagValue {
+    buf: [u8; 41], // 20 digits + '/' + 20 digits
+    len: usize,
+}
+
+impl CountTagValue {
+    fn new() -> Self {
+        Self { buf: [0; 41], len: 0 }
+    }
+
+    /// Render `unconv/total` and return the bytes, valid until the next call.
+    fn render(&mut self, unconv: u64, total: u64) -> &[u8] {
+        self.len = 0;
+        self.push_u64(unconv);
+        self.buf[self.len] = b'/';
+        self.len += 1;
+        self.push_u64(total);
+        &self.buf[..self.len]
+    }
+
+    /// Append `n`'s decimal digits, least-significant digit generated first and
+    /// then reversed in place.
+    fn push_u64(&mut self, mut n: u64) {
+        let start = self.len;
+        loop {
+            self.buf[self.len] = b'0' + (n % 10) as u8;
+            self.len += 1;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        self.buf[start..self.len].reverse();
     }
 }
 
@@ -1359,6 +1401,23 @@ mod tests {
     }
 
     #[test]
+    fn count_tag_value_renders_like_format() {
+        let mut v = CountTagValue::new();
+        // Zero, single digit, and a value whose low digit is 0 (the digit loop
+        // must not stop early on it).
+        assert_eq!(v.render(0, 0), b"0/0");
+        assert_eq!(v.render(3, 10), b"3/10");
+        assert_eq!(v.render(100, 1000), b"100/1000");
+        // The buffer is sized for the widest possible pair, and must reset between
+        // calls rather than leaving the previous value's tail behind.
+        assert_eq!(
+            v.render(u64::MAX, u64::MAX),
+            b"18446744073709551615/18446744073709551615".as_slice()
+        );
+        assert_eq!(v.render(7, 9), b"7/9", "reused buffer is truncated to the new value");
+    }
+
+    #[test]
     fn adaptive_below_floor_uses_count() {
         // 3 unconverted of 4 sites, floor 40 → proportion abstains, count (≥3)
         // decides → flagged.
@@ -1585,6 +1644,33 @@ mod tests {
             .map(|c| c.total())
             .sum();
         assert_eq!(recorded, 5, "M-bias records every site, ignoring the tally mask window");
+    }
+
+    #[test]
+    fn fused_walk_honors_every_window_when_a_record_has_several() {
+        // The fused scan compares the first stored exclusion inline and scans only
+        // the remainder, so a record with several windows must still have all of
+        // them excluded from the tally — while M-bias records every site.
+        let seq = "CA".repeat(20); // 40 bp: a CpA C at every even stored position
+        let reference = Reference::from_encoded_contigs(vec![enc(&seq)]);
+        let proc = RecordProcessor::new(reference, opts(cph_mask(), 3));
+        let recs = parse_sam_records(&[&sam_line(0, 1, "40M", &seq, &"I".repeat(40))], 40);
+        // Nine disjoint single-base windows over the CpA C's at stored 0,2,…,16.
+        let windows: Vec<(usize, usize)> = (0..9).map(|k| (2 * k, 2 * k + 1)).collect();
+        let skips = RecordSkips { stored: &windows, genomic: None };
+        let mut counters = PerContextCounters::default();
+        let mut acc = MbiasAccumulator::new();
+        proc.tally_and_accumulate(&RecordGeom::new(&recs[0]), skips, &mut counters, &mut acc);
+
+        // 20 CpA sites, 9 masked → 11 counted. Testing only the first window would
+        // leave 19; testing none would leave 20.
+        assert_eq!(counters.total[Context::CpA.index()], 11, "all nine windows honored");
+        let recorded: u64 = acc
+            .cycles(ReadRole::Se, ReadEnd::FivePrime, Context::CpA)
+            .iter()
+            .map(|c| c.total())
+            .sum();
+        assert_eq!(recorded, 20, "M-bias still records every site");
     }
 
     #[test]
