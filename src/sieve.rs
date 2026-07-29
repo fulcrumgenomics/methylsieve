@@ -737,6 +737,13 @@ impl RecordProcessor {
     /// place; does not write. `counts` is the template's `(unconverted, total)`
     /// over the decision contexts (for `--count-tag`). Not called for
     /// [`Action::Remove`] (the caller drops the template instead).
+    ///
+    /// Both tags are *updated*, not appended: a tag may only appear once per
+    /// record, and a value already present is not necessarily this run's — the
+    /// counts shrink under `--mbias-mask`, which drops masked bases below the
+    /// base-quality gate, so a re-run's `u/n` differs from the one it inherits.
+    /// Overwriting keeps the count describing the decision stamped beside it, and
+    /// keeps the record valid when some other tool already used the same tag name.
     fn stamp(&self, block: &mut [RawRecord], action: Action, counts: (u64, u64)) {
         // The count tag is a per-template aggregate (u/n over the decision
         // contexts): build the value once, stamp every record. Applied on every
@@ -748,15 +755,10 @@ impl RecordProcessor {
                 if self.opts.qc_fail {
                     rec.set_flags(rec.flags() | FLAG_QC_FAIL);
                 }
-                // Idempotent: don't append a second copy on a re-run.
-                if rec.tags().find_string(&self.opts.tag.tag).is_none() {
-                    rec.tags_editor().append_string(&self.opts.tag.tag, &self.opts.tag.value);
-                }
+                rec.tags_editor().update_string(&self.opts.tag.tag, &self.opts.tag.value);
             }
-            if let (Some(tag), Some(value)) = (&self.opts.count_tag, count_value)
-                && rec.tags().find_string(tag).is_none()
-            {
-                rec.tags_editor().append_string(tag, value);
+            if let (Some(tag), Some(value)) = (&self.opts.count_tag, count_value) {
+                rec.tags_editor().update_string(tag, value);
             }
         }
     }

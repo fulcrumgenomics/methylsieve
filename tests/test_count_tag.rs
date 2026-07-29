@@ -109,3 +109,50 @@ fn count_tag_is_appended_alongside_pre_existing_aux() {
     assert_eq!(tag_string(&recs[0], *b"XA").as_deref(), Some("chr1,+100,20M,0;"));
     assert_eq!(tag_string(&recs[0], *b"MD").as_deref(), Some("20"));
 }
+
+#[test]
+fn stale_count_tag_from_a_previous_run_is_overwritten() {
+    // A tag may appear only once per record, so an inherited value has to be
+    // replaced rather than appended-beside or left alone. Leaving it alone would
+    // make the count disagree with the decision stamped next to it — the counts
+    // legitimately change between runs, since masking drops bases below the
+    // base-quality gate.
+    let env = TestEnv::new();
+    let reference = RefBuilder::new().contig("chr1", REF);
+    let sam = SamBuilder::new().sq("chr1", REF.len()).record_with_aux(
+        "r",
+        0,
+        "chr1",
+        1,
+        "20M",
+        &read_with_unconverted(3),
+        &q40(20),
+        &["ch:Z:99/99"],
+    );
+
+    let recs = run_ok(&sam, &reference, &env, &[]);
+    assert_eq!(tag_string(&recs[0], *b"ch").as_deref(), Some("3/10"), "stale value replaced");
+}
+
+#[test]
+fn count_tag_name_already_used_with_another_type_is_replaced() {
+    // Nothing stops another tool from defining `ch` — and picking a different
+    // type. Appending ours beside it would emit two `ch` fields, which is invalid.
+    let env = TestEnv::new();
+    let reference = RefBuilder::new().contig("chr1", REF);
+    let sam = SamBuilder::new().sq("chr1", REF.len()).record_with_aux(
+        "r",
+        0,
+        "chr1",
+        1,
+        "20M",
+        &read_with_unconverted(3),
+        &q40(20),
+        &["ch:i:5", "MD:Z:20"],
+    );
+
+    let recs = run_ok(&sam, &reference, &env, &[]);
+    assert_eq!(physical_tag_counts(&env.output, *b"ch"), vec![1], "exactly one ch field");
+    assert_eq!(tag_string(&recs[0], *b"ch").as_deref(), Some("3/10"));
+    assert_eq!(tag_string(&recs[0], *b"MD").as_deref(), Some("20"), "later tags survive");
+}
