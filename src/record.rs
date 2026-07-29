@@ -62,8 +62,8 @@ pub(crate) struct RecordGeom<'a> {
 }
 
 impl<'a> RecordGeom<'a> {
-    /// Decode `rec`'s layout once. The field accessors below each recompute
-    /// their offsets, so this is the only place that cost is paid per record.
+    /// Decode `rec`'s layout once. Each [`RawRecord`] accessor called here re-derives
+    /// the record's field offsets, so this is the only place that cost is paid.
     #[must_use]
     pub(crate) fn new(rec: &'a RawRecord) -> Self {
         Self {

@@ -131,9 +131,9 @@ impl Context {
 /// concrete context instead of being skipped (immaterial in practice — these
 /// sit in assembly gaps).
 ///
-/// The hottest predicates ([`Self::monitors`], [`Self::ctx_top`],
-/// [`Self::ctx_bottom`]) compare/classify directly in 2-bit space to avoid
-/// decoding to the 4-bit code per base.
+/// The hot accessors ([`Self::for_each_monitored`], [`Self::ctx_top`],
+/// [`Self::ctx_bottom`]) work directly in 2-bit space, so a scan never decodes to
+/// the 4-bit code per base.
 #[derive(Clone, Copy)]
 pub(crate) struct TwoBitCodes<'a> {
     data: &'a [u8],
@@ -147,9 +147,9 @@ impl TwoBitCodes<'_> {
     pub(crate) fn len(&self) -> usize {
         self.len
     }
-    /// The 4-bit BAM base code at `pos` (`pos < len`). Production decodes via the
-    /// specialized [`Self::monitors`] / [`Self::ctx_top`] / [`Self::ctx_bottom`]
-    /// in 2-bit space; this full decode is used by tests.
+    /// The 4-bit BAM base code at `pos` (`pos < len`). Production never decodes a
+    /// whole base — it scans with [`Self::for_each_monitored`] and classifies with
+    /// [`Self::ctx_top`] / [`Self::ctx_bottom`], all in 2-bit space. Tests use this.
     #[cfg(test)]
     #[inline]
     pub(crate) fn code(&self, pos: usize) -> u8 {
@@ -172,21 +172,27 @@ impl TwoBitCodes<'_> {
         val == code.trailing_zeros() as u8
     }
     /// Call `f(pos)` for every position in `[start, end)` whose base equals the
-    /// monitored 4-bit `code`, ascending — the bulk form of [`Self::monitors`],
-    /// and the tally's per-aligned-base scan.
+    /// monitored 4-bit `code`, ascending. This is the tally's per-aligned-base
+    /// reference scan.
+    ///
+    /// `end` must not exceed [`Self::len`]; a span reaching more than one 32-base
+    /// window past the packed store panics rather than visiting nothing. Every
+    /// caller clips its span to the contig first.
     ///
     /// Only ~21% of reference positions are the monitored C/G, so probing them
     /// one at a time spends most of its work rejecting. Instead this tests 32
     /// bases per 64-bit word: XOR against `code` splatted into every 2-bit field
     /// makes matching fields `00`, and a zero-field detect turns those into a
-    /// bitmask iterated by `trailing_zeros`, so the visited set is exactly
-    /// `(start..end).filter(|p| self.monitors(p, code))`.
+    /// bitmask iterated by `trailing_zeros`. The visited set is exactly
+    /// `(start..end).filter(|p| monitors(p, code))` for the single-base predicate
+    /// the tests assert this against.
     ///
     /// Both span edges are handled by clearing bits rather than by scalar loops,
-    /// and a window running past the packed store is zero-filled (2-bit `0` is A,
-    /// never a monitored base). That leaves **one** `f` call site, which is what
-    /// lets the caller's per-site body inline into this loop — with three call
-    /// sites LLVM outlines it and charges a call per site, undoing the win.
+    /// and the contig's final window is zero-filled where the packed store runs out
+    /// (2-bit `0` is A, never a monitored base). That leaves **one** `f` call site,
+    /// which is what lets the caller's per-site body inline into this loop — with
+    /// three call sites LLVM outlines it and charges a call per site, undoing the
+    /// win.
     #[inline]
     pub(crate) fn for_each_monitored(
         &self,
@@ -198,6 +204,7 @@ impl TwoBitCodes<'_> {
         if start >= end {
             return;
         }
+        debug_assert!(end <= self.len, "span end {end} past contig length {}", self.len);
         // `code` as a 2-bit value repeated across all 32 fields. `0x5555… * v`
         // carries nothing for `v <= 3`, which holds for any single-base code.
         let splat = 0x5555_5555_5555_5555u64 * u64::from(code.trailing_zeros());
@@ -691,7 +698,7 @@ mod tests {
         // parities and straddle byte (4-base) and word (32-base) boundaries.
         // Every start offset covers all four byte alignments of the head loop,
         // and lengths run out to the contig end so the partial-final-word mask
-        // and the near-the-end scalar fallback are both exercised.
+        // and the zero-filled final window are both exercised.
         let codes: Vec<u8> =
             (0..200u32).map(|i| encode_ref_base(b"ACGTGCTAAC"[(i as usize * 7) % 10])).collect();
         let packed = pack_codes_twobit(&codes);
@@ -712,8 +719,8 @@ mod tests {
 
     #[test]
     fn for_each_monitored_handles_contigs_shorter_than_one_word() {
-        // Under 32 bases no whole 64-bit word is ever loadable, so the scan runs
-        // entirely on the head/tail scalar paths.
+        // Under 32 bases no whole 64-bit word is loadable, so every span is a single
+        // partial window whose tail is zero-filled past the packed store.
         for len in 1..40usize {
             let codes: Vec<u8> = (0..len).map(|i| encode_ref_base(b"CGAT"[(i * 3) % 4])).collect();
             let packed = pack_codes_twobit(&codes);
