@@ -1043,13 +1043,14 @@ pub(crate) struct PerContextCounters {
 }
 
 impl PerContextCounters {
+    /// Count one classified site. Branchless in `unconverted`: at CpG the call is
+    /// methylated ~2/3 of the time in no particular order, so a branch here
+    /// mispredicts often enough to cost more than the unconditional add.
     #[inline]
     pub(crate) fn record(&mut self, ctx: Context, unconverted: bool) {
         let i = ctx.index();
         self.total[i] += 1;
-        if unconverted {
-            self.unconv[i] += 1;
-        }
+        self.unconv[i] += u64::from(unconverted);
     }
 
     /// Add `unconv` unconverted of `total` monitored sites to `ctx` (bulk form of
