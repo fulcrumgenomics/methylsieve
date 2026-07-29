@@ -175,9 +175,10 @@ impl TwoBitCodes<'_> {
     /// monitored 4-bit `code`, ascending. This is the tally's per-aligned-base
     /// reference scan.
     ///
-    /// `end` must not exceed [`Self::len`]; a span reaching more than one 32-base
-    /// window past the packed store panics rather than visiting nothing. Every
-    /// caller clips its span to the contig first.
+    /// `end` is clamped to [`Self::len`], so a span past the contig simply finds
+    /// nothing out there. Every caller already clips, so exceeding it is a caller
+    /// bug and trips a debug assertion; the clamp is what keeps a release build
+    /// from indexing past the packed store instead.
     ///
     /// Only ~21% of reference positions are the monitored C/G, so probing them
     /// one at a time spends most of its work rejecting. Instead this tests 32
@@ -201,10 +202,15 @@ impl TwoBitCodes<'_> {
         code: u8,
         mut f: impl FnMut(usize),
     ) {
+        // A span past the contig is a caller bug — every caller clips to the
+        // contig — so say so loudly in debug. Clamp anyway: without it a release
+        // build indexes past the packed store and panics obscurely instead of
+        // simply finding no monitored bases out there.
+        debug_assert!(end <= self.len, "span end {end} past contig length {}", self.len);
+        let end = end.min(self.len);
         if start >= end {
             return;
         }
-        debug_assert!(end <= self.len, "span end {end} past contig length {}", self.len);
         // `code` as a 2-bit value repeated across all 32 fields. `0x5555… * v`
         // carries nothing for `v <= 3`, which holds for any single-base code.
         let splat = 0x5555_5555_5555_5555u64 * u64::from(code.trailing_zeros());
@@ -733,6 +739,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "past contig length")]
+    fn for_each_monitored_rejects_a_span_past_the_contig() {
+        // Callers clip their span to the contig, so overrunning it is a caller bug
+        // and debug builds say so. Release builds clamp instead, which is what keeps
+        // the zero-fill window from indexing past the packed store.
+        let codes: Vec<u8> = "CACACACACA".bytes().map(encode_ref_base).collect();
+        let packed = pack_codes_twobit(&codes);
+        let view = TwoBitCodes { data: &packed.data, len: packed.len };
+        view.for_each_monitored(0, packed.len + 64, BASE_C, |_| {});
     }
 
     #[test]
