@@ -1,6 +1,6 @@
 [package]
 name = "methylsieve"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Tim Fennell <tim@fulcrumgenomics.com>"]
 description = "Fast per-template tagging and filtering of unconverted reads in bisulfite / EM-seq SAM/BAM files"
 edition = "2024"
