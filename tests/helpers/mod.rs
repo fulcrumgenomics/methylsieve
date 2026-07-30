@@ -50,7 +50,7 @@ impl SamBuilder {
     /// Append a SAM record (11 standard fields; optional trailing aux fields).
     #[allow(clippy::too_many_arguments)]
     pub fn record(
-        mut self,
+        self,
         qname: &str,
         flag: u16,
         rname: &str,
@@ -59,10 +59,31 @@ impl SamBuilder {
         seq: &str,
         qual: &str,
     ) -> Self {
+        self.record_with_aux(qname, flag, rname, pos, cigar, seq, qual, &[])
+    }
+
+    /// A record carrying extra aux fields, each a full `TAG:TYPE:VALUE` string.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_with_aux(
+        mut self,
+        qname: &str,
+        flag: u16,
+        rname: &str,
+        pos: u32,
+        cigar: &str,
+        seq: &str,
+        qual: &str,
+        aux: &[&str],
+    ) -> Self {
         let seq = if seq.is_empty() { "*" } else { seq };
         let qual = if qual.is_empty() { "*" } else { qual };
-        self.records
-            .push(format!("{qname}\t{flag}\t{rname}\t{pos}\t60\t{cigar}\t*\t0\t0\t{seq}\t{qual}"));
+        let mut line =
+            format!("{qname}\t{flag}\t{rname}\t{pos}\t60\t{cigar}\t*\t0\t0\t{seq}\t{qual}");
+        for field in aux {
+            line.push('\t');
+            line.push_str(field);
+        }
+        self.records.push(line);
         self
     }
 
@@ -348,3 +369,23 @@ pub const FLAG_LAST_SEGMENT: u16 = 0x80;
 pub const FLAG_SECONDARY: u16 = 0x100;
 pub const FLAG_QC_FAIL: u16 = 0x200;
 pub const FLAG_SUPPLEMENTARY: u16 = 0x800;
+
+/// How many times `tag` physically appears in each record of a BAM.
+///
+/// Uses `noodles-bam`'s lazy record, whose `data()` iterates the aux block
+/// field-by-field, rather than `RecordBuf`, whose data is a map and silently
+/// collapses a duplicate. A tag may appear only once per record, so any count
+/// above one is invalid output.
+pub fn physical_tag_counts(path: &Path, tag: [u8; 2]) -> Vec<usize> {
+    use noodles_sam::alignment::record::data::field::Tag;
+    let want = Tag::new(tag[0], tag[1]);
+    let mut reader = noodles_bam::io::reader::Builder.build_from_path(path).expect("open bam");
+    reader.read_header().expect("read header");
+    let mut counts = Vec::new();
+    for result in reader.records() {
+        let rec = result.expect("read record");
+        let n = rec.data().iter().filter(|f| matches!(f, Ok((t, _)) if *t == want)).count();
+        counts.push(n);
+    }
+    counts
+}

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Substantially faster.** Reading uncompressed BAM and writing uncompressed BAM with `--mbias-mask --metrics-prefix`, both wall time and CPU time drop by roughly **40–45%** — a throughput increase of about **70–80%** — for byte-identical output. Three changes account for it: each record's CIGAR / packed-SEQ / QUAL layout is decoded **once per record** instead of being re-derived from the record bytes on every monitored cytosine; the reference scan tests **32 bases per 64-bit word**, which removes a poorly-predicted branch from every aligned base rather than paying one per base to reject the ~79% that are not the monitored C/G; and the `--count-tag` value is rendered into a fixed buffer instead of an allocated `String` per template. Nothing about the output, the CLI, or the metric files changes. The gain is dominated by work removed per base and per record, so the proportion should hold across architectures, but the exact figure will vary with hardware, read length, and how much of each record is auxiliary data.
+
+### Fixed
+- The conversion tag (`--tag`) and count tag (`--count-tag`) are now **updated** rather than appended-only-if-absent, fixing two defects in how methylsieve handled a record that already carried the tag name.
+  - A count tag inherited from an earlier run was left in place, even though this run's counts differ — masking lowers base qualities below `--min-base-quality`, so a second pass tallies fewer sites. The tag documents the numerator and denominator of the decision, so a re-run left it describing a different decision than the flag stamped beside it.
+  - When another tool had already used the tag name with a **non-string** type the check did not fire at all, because a string lookup does not match a non-`Z` value. An input carrying `ch:i:5` produced output carrying both `ch:i:5` and `ch:Z:u/n` — two fields sharing one tag, which the SAM specification does not permit.
+
 ## [0.2.0] - 2026-07-28
 
 ### Added

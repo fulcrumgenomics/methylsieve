@@ -32,8 +32,8 @@ use crate::mask::MaskWindows;
 use crate::mbias::{MbiasAccumulator, ReadEnd, ReadRole};
 use crate::record::{
     FLAG_FIRST_SEGMENT, FLAG_LAST_SEGMENT, FLAG_PAIRED, FLAG_QC_FAIL, FLAG_REVERSE, FLAG_SECONDARY,
-    FLAG_SUPPLEMENTARY, FLAG_UNMAPPED, five_prime_ref_span, has, is_primary_mapped, monitor_c_of,
-    read_role, three_prime_ref_span,
+    FLAG_SUPPLEMENTARY, FLAG_UNMAPPED, RecordGeom, five_prime_ref_span, has, is_primary_mapped,
+    monitor_c_of, read_role, three_prime_ref_span,
 };
 use crate::reference::{BASE_A, BASE_C, BASE_G, BASE_T, Context, Reference, TwoBitCodes};
 use crate::{ContextMask, TagSpec};
@@ -135,7 +135,11 @@ impl RecordProcessor {
         let mut counters = PerContextCounters::default();
         for (i, rec) in block.iter().enumerate() {
             if self.is_evidence_record(rec) {
-                let seq_len = rec.l_seq() as usize;
+                // Decode the record's layout once; the tally kernels index the
+                // resolved SEQ/QUAL slices instead of re-deriving their offsets
+                // per base (see `RecordGeom`).
+                let geom = RecordGeom::new(rec);
+                let seq_len = geom.seq_len();
                 // Stored-position exclusions for this record: own template-end trims
                 // (`--ignore-template-ends`) as intervals, plus its M-bias mask
                 // windows. The two never coexist (masking forces the trim to 0), but
@@ -175,7 +179,7 @@ impl RecordProcessor {
                     // keeps [os, mid) and skips [mid, oe); a reverse read mirrors
                     // it. Proper FR pairs have opposite strands, so the two halves
                     // partition the overlap with no double count.
-                    Some(if has(rec.flags(), FLAG_REVERSE) { (os, mid) } else { (mid, oe) })
+                    Some(if has(geom.flags(), FLAG_REVERSE) { (os, mid) } else { (mid, oe) })
                 });
                 let skips = RecordSkips { stored: &stored, genomic: overlap_iv.or(mate_terminus) };
                 // When M-bias is being collected, a primary mapped record's
@@ -188,11 +192,11 @@ impl RecordProcessor {
                 // excluded from M-bias, so spike-ins never skew the learned curve.
                 match mbias.as_deref_mut() {
                     Some(acc)
-                        if is_primary_mapped(rec.flags()) && self.is_genome_tid(rec.ref_id()) =>
+                        if is_primary_mapped(geom.flags()) && self.is_genome_tid(geom.ref_id()) =>
                     {
-                        self.tally_and_accumulate(rec, skips, &mut counters, acc);
+                        self.tally_and_accumulate(&geom, skips, &mut counters, acc);
                     }
-                    _ => self.tally_record(rec, skips, &mut counters),
+                    _ => self.tally_record(&geom, skips, &mut counters),
                 }
             }
         }
@@ -434,9 +438,14 @@ impl RecordProcessor {
 
     /// Walk one record's aligned positions and add its monitored cytosines to
     /// `counters`.
-    fn tally_record(&self, rec: &RawRecord, skips: RecordSkips, counters: &mut PerContextCounters) {
-        if let Some(c) = self.reference.codes(rec.ref_id()) {
-            self.tally_aligned(rec, c, skips, counters);
+    fn tally_record(
+        &self,
+        geom: &RecordGeom<'_>,
+        skips: RecordSkips,
+        counters: &mut PerContextCounters,
+    ) {
+        if let Some(c) = self.reference.codes(geom.ref_id()) {
+            self.tally_aligned(geom, c, skips, counters);
         }
     }
 
@@ -446,21 +455,18 @@ impl RecordProcessor {
     /// read-base compare → counter bump) is the hot path, run by [`tally_span`].
     fn tally_aligned(
         &self,
-        rec: &RawRecord,
+        geom: &RecordGeom<'_>,
         refc: TwoBitCodes<'_>,
         skips: RecordSkips,
         counters: &mut PerContextCounters,
     ) {
-        let seq_len = rec.l_seq() as usize;
-        if seq_len == 0 {
+        if geom.seq_len() == 0 {
             return;
         }
-        let ref_len = refc.len();
 
         // Per-record monitored strand (MethylDackel getStrand): treat single-end
         // and R1 the same; XOR with the record's own reverse bit.
-        let f = rec.flags();
-        let monitor_c = monitor_c_of(f);
+        let monitor_c = monitor_c_of(geom.flags());
 
         // `skips.stored` holds the stored-position exclusions (trims ∪ mask
         // windows), already resolved for this record's strand/role and sorted;
@@ -470,7 +476,7 @@ impl RecordProcessor {
         // The monitored reference base is fixed for the whole record by strand.
         let monitored_base = if monitor_c { BASE_C } else { BASE_G };
         let mut read_pos: usize = 0;
-        let pos = rec.pos();
+        let pos = geom.pos();
         if pos < 0 {
             return;
         }
@@ -480,18 +486,16 @@ impl RecordProcessor {
             monitor_c,
             monitored_base,
             min_bq,
-            seq_len,
-            ref_len,
             stored_skips: skips.stored,
             skip: skips.genomic,
         };
-        for op in rec.cigar_ops_iter() {
+        for op in geom.cigar_ops() {
             let len = (op >> 4) as usize;
             let code = op & 0xf;
             match code {
                 // M, =, X — aligned; both read and reference advance.
                 0 | 7 | 8 => {
-                    tally_span(rec, refc, read_pos, ref_pos, len, &params, counters);
+                    tally_span(geom, refc, read_pos, ref_pos, len, &params, counters);
                     read_pos += len;
                     ref_pos += len;
                 }
@@ -520,13 +524,13 @@ impl RecordProcessor {
     /// untouched, so that codegen-sensitive hot loop is unaffected.
     fn tally_and_accumulate(
         &self,
-        rec: &RawRecord,
+        geom: &RecordGeom<'_>,
         skips: RecordSkips,
         counters: &mut PerContextCounters,
         acc: &mut MbiasAccumulator,
     ) {
-        if let Some(c) = self.reference.codes(rec.ref_id()) {
-            self.fused_walk(rec, c, skips, counters, acc);
+        if let Some(c) = self.reference.codes(geom.ref_id()) {
+            self.fused_walk(geom, c, skips, counters, acc);
         }
     }
 
@@ -547,19 +551,19 @@ impl RecordProcessor {
     /// probe thus run once instead of once per walk.
     fn fused_walk(
         &self,
-        rec: &RawRecord,
+        geom: &RecordGeom<'_>,
         refc: TwoBitCodes<'_>,
         skips: RecordSkips,
         counters: &mut PerContextCounters,
         acc: &mut MbiasAccumulator,
     ) {
-        let seq_len = rec.l_seq() as usize;
-        let pos = rec.pos();
+        let seq_len = geom.seq_len();
+        let pos = geom.pos();
         if seq_len == 0 || pos < 0 {
             return;
         }
         let ref_len = refc.len();
-        let f = rec.flags();
+        let f = geom.flags();
         let monitor_c = monitor_c_of(f);
         let monitored_base = if monitor_c { BASE_C } else { BASE_G };
         let role = read_role(f);
@@ -579,7 +583,7 @@ impl RecordProcessor {
 
         let mut read_pos = 0usize;
         let mut ref_pos = pos as usize;
-        for op in rec.cigar_ops_iter() {
+        for op in geom.cigar_ops() {
             let len = (op >> 4) as usize;
             match op & 0xf {
                 // M, =, X — aligned; both read and reference advance.
@@ -589,14 +593,14 @@ impl RecordProcessor {
                     let k1 = len
                         .min(seq_len.saturating_sub(read_pos))
                         .min(ref_len.saturating_sub(ref_pos));
-                    for k in 0..k1 {
-                        let gp = ref_pos + k;
-                        if !refc.monitors(gp, monitored_base) {
-                            continue;
-                        }
-                        let rp = read_pos + k;
+                    // Read and reference positions advance together across an
+                    // M-span, so each visited `gp` implies its `rp`. Copied out of
+                    // the running cursors so the closure doesn't borrow them.
+                    let (span_ref, span_read) = (ref_pos, read_pos);
+                    refc.for_each_monitored(ref_pos, ref_pos + k1, monitored_base, |gp| {
+                        let rp = span_read + (gp - span_ref);
                         if let Some((ctx, unconverted)) =
-                            classify_site(rec, refc, rp, gp, monitor_c, min_bq, ref_len)
+                            classify_site(geom, refc, rp, gp, monitor_c, min_bq)
                         {
                             let cycle_5p = if reverse { seq_len - 1 - rp } else { rp };
                             acc.record(role, ReadEnd::FivePrime, ctx, cycle_5p, unconverted);
@@ -610,7 +614,7 @@ impl RecordProcessor {
                                 counters.record(ctx, unconverted);
                             }
                         }
-                    }
+                    });
                     read_pos += len;
                     ref_pos += len;
                 }
@@ -652,7 +656,13 @@ impl RecordProcessor {
                 && self.is_genome_tid(rec.ref_id())
                 && let Some(c) = self.reference.codes(rec.ref_id())
             {
-                self.fused_walk(rec, c, RecordSkips::default(), &mut discard, acc);
+                self.fused_walk(
+                    &RecordGeom::new(rec),
+                    c,
+                    RecordSkips::default(),
+                    &mut discard,
+                    acc,
+                );
             }
         }
     }
@@ -727,28 +737,90 @@ impl RecordProcessor {
     /// place; does not write. `counts` is the template's `(unconverted, total)`
     /// over the decision contexts (for `--count-tag`). Not called for
     /// [`Action::Remove`] (the caller drops the template instead).
+    ///
+    /// Both tags are *updated*, not appended: a tag may only appear once per
+    /// record, and a value already present is not necessarily this run's — the
+    /// counts shrink under `--mbias-mask`, which drops masked bases below the
+    /// base-quality gate, so a re-run's `u/n` differs from the one it inherits.
+    /// Overwriting keeps the count describing the decision stamped beside it, and
+    /// keeps the record valid when some other tool already used the same tag name.
     fn stamp(&self, block: &mut [RawRecord], action: Action, counts: (u64, u64)) {
         // The count tag is a per-template aggregate (u/n over the decision
         // contexts): build the value once, stamp every record. Applied on every
         // template, flagged or not, so a user can inspect surprises either way.
-        let count_value = self.opts.count_tag.map(|_| format!("{}/{}", counts.0, counts.1));
+        let mut count_buf = [0u8; COUNT_TAG_WIDTH];
+        let count_value: Option<&[u8]> = self
+            .opts
+            .count_tag
+            .is_some()
+            .then(|| render_counts(&mut count_buf, counts.0, counts.1));
         for rec in block.iter_mut() {
             if action == Action::Mark {
                 if self.opts.qc_fail {
                     rec.set_flags(rec.flags() | FLAG_QC_FAIL);
                 }
-                // Idempotent: don't append a second copy on a re-run.
-                if rec.tags().find_string(&self.opts.tag.tag).is_none() {
-                    rec.tags_editor().append_string(&self.opts.tag.tag, &self.opts.tag.value);
-                }
+                replace_string_tag(rec, &self.opts.tag.tag, &self.opts.tag.value);
             }
-            if let (Some(tag), Some(value)) = (&self.opts.count_tag, &count_value)
-                && rec.tags().find_string(tag).is_none()
-            {
-                rec.tags_editor().append_string(tag, value.as_bytes());
+            if let (Some(tag), Some(value)) = (&self.opts.count_tag, count_value) {
+                replace_string_tag(rec, tag, value);
             }
         }
     }
+}
+
+/// Set string tag `tag` on `rec` to `value`, replacing whatever was there.
+///
+/// A tag may appear only once per record, so an existing field has to be replaced
+/// rather than appended beside — and it may not be a string: nothing stops another
+/// tool from having used the same two-letter name with another type.
+///
+/// Removing first is what makes that safe. `RawTagsEditor::update_string` looks
+/// like the right call but is not: it decides to overwrite in place by comparing
+/// `value.len()` against the existing field's size *minus the `Z` layout's four
+/// framing bytes*, without checking the existing type byte. A four-byte `i`/`I`/`f`
+/// field therefore reports a three-byte value, and any three-character
+/// replacement — `0/0`, which every zero-site template renders — overwrites the
+/// payload while leaving the type byte intact, silently turning the count into a
+/// garbage integer instead of replacing it.
+///
+/// The removal walks the aux block, which is the same walk the old presence check
+/// cost, so this is no more expensive than skipping-if-present was.
+fn replace_string_tag(rec: &mut RawRecord, tag: &[u8; 2], value: &[u8]) {
+    let mut editor = rec.tags_editor();
+    editor.remove(tag);
+    editor.append_string(tag, value);
+}
+
+/// Width of a rendered `--count-tag` value: two `u64`s at 20 digits each, plus `/`.
+const COUNT_TAG_WIDTH: usize = 41;
+
+/// Render `unconv/total` into `buf`, returning the bytes written.
+///
+/// `format!` would allocate a `String` and run `core::fmt`'s padding-aware integer
+/// path once per template. The value is only ever two decimal integers, so it
+/// always fits a fixed buffer written by a digit loop.
+fn render_counts(buf: &mut [u8; COUNT_TAG_WIDTH], unconv: u64, total: u64) -> &[u8] {
+    let mut end = write_u64(buf, 0, unconv);
+    buf[end] = b'/';
+    end += 1;
+    end = write_u64(buf, end, total);
+    &buf[..end]
+}
+
+/// Write `n`'s decimal digits into `buf` starting at `at`, returning the new end.
+/// Digits fall out least-significant first, so the run is reversed in place.
+fn write_u64(buf: &mut [u8; COUNT_TAG_WIDTH], at: usize, mut n: u64) -> usize {
+    let mut end = at;
+    loop {
+        buf[end] = b'0' + (n % 10) as u8;
+        end += 1;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    buf[at..end].reverse();
+    end
 }
 
 /// Whether a processed template should be emitted or dropped.
@@ -1033,13 +1105,14 @@ pub(crate) struct PerContextCounters {
 }
 
 impl PerContextCounters {
+    /// Count one classified site. Branchless in `unconverted`: at CpG the call is
+    /// methylated ~2/3 of the time in no particular order, so a branch here
+    /// mispredicts often enough to cost more than the unconditional add.
     #[inline]
     pub(crate) fn record(&mut self, ctx: Context, unconverted: bool) {
         let i = ctx.index();
         self.total[i] += 1;
-        if unconverted {
-            self.unconv[i] += 1;
-        }
+        self.unconv[i] += u64::from(unconverted);
     }
 
     /// Add `unconv` unconverted of `total` monitored sites to `ctx` (bulk form of
@@ -1097,7 +1170,9 @@ impl PerContextCounters {
 // context. The scan over the reference span ([`tally_span`]) is the dominant
 // work; the per-site work after a match is shared via [`tally_site`].
 
-/// Fixed-per-record parameters threaded into the span kernels.
+/// Fixed-per-record parameters threaded into the span kernels. The SEQ and contig
+/// lengths are not repeated here — they come from [`RecordGeom::seq_len`] and
+/// [`TwoBitCodes::len`], which the kernels already hold.
 #[derive(Debug, Clone, Copy)]
 struct SpanParams<'a> {
     /// Whether this record monitors reference C (top) or G (bottom).
@@ -1106,10 +1181,6 @@ struct SpanParams<'a> {
     pub(crate) monitored_base: u8,
     /// Minimum base quality to tally a site.
     pub(crate) min_bq: u8,
-    /// Stored SEQ length (read positions are valid in `0..seq_len`).
-    pub(crate) seq_len: usize,
-    /// Contig length (reference positions are valid in `0..ref_len`).
-    pub(crate) ref_len: usize,
     /// Stored read-position intervals to exclude (trims ∪ mask windows), in
     /// arrival order (`tally_span` sorts and merges them). Empty in the hot path
     /// (no trim, no masking).
@@ -1132,21 +1203,20 @@ struct SpanParams<'a> {
 /// `#[inline]` so it folds into the decision hot loop with no call overhead.
 #[inline]
 fn classify_site(
-    rec: &RawRecord,
+    geom: &RecordGeom<'_>,
     refc: TwoBitCodes<'_>,
     rp: usize,
     gp: usize,
     monitor_c: bool,
     min_bq: u8,
-    ref_len: usize,
 ) -> Option<(Context, bool)> {
-    if rec.get_qual(rp) < min_bq {
+    if geom.qual(rp) < min_bq {
         return None;
     }
     // Context from the reference neighbor (chrom-end safe), decoded in the
     // encoding's native space (no per-neighbor 4-bit decode for packed layouts).
     let ctx = if monitor_c {
-        if gp + 1 >= ref_len {
+        if gp + 1 >= refc.len() {
             return None;
         }
         refc.ctx_top(gp + 1)
@@ -1156,7 +1226,7 @@ fn classify_site(
         }
         refc.ctx_bottom(gp - 1)
     }?;
-    let unconverted = match (monitor_c, rec.get_base(rp)) {
+    let unconverted = match (monitor_c, geom.base(rp)) {
         (true, BASE_C) | (false, BASE_G) => true,  // unconverted
         (true, BASE_T) | (false, BASE_A) => false, // converted
         _ => return None,                          // SNP / N — drop
@@ -1168,16 +1238,14 @@ fn classify_site(
 /// decision counters. `refc[gp]` is assumed to equal the monitored base.
 #[inline]
 fn tally_site(
-    rec: &RawRecord,
+    geom: &RecordGeom<'_>,
     refc: TwoBitCodes<'_>,
     rp: usize,
     gp: usize,
     p: &SpanParams,
     counters: &mut PerContextCounters,
 ) {
-    if let Some((ctx, unconverted)) =
-        classify_site(rec, refc, rp, gp, p.monitor_c, p.min_bq, p.ref_len)
-    {
+    if let Some((ctx, unconverted)) = classify_site(geom, refc, rp, gp, p.monitor_c, p.min_bq) {
         counters.record(ctx, unconverted);
     }
 }
@@ -1189,7 +1257,7 @@ fn tally_site(
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn tally_run(
-    rec: &RawRecord,
+    geom: &RecordGeom<'_>,
     refc: TwoBitCodes<'_>,
     rp_start: usize,
     gp_start: usize,
@@ -1198,16 +1266,12 @@ fn tally_run(
     p: &SpanParams,
     counters: &mut PerContextCounters,
 ) {
-    for k in lo..hi {
-        let gp = gp_start + k;
-        // Reference check first: rejects ~79% of bases (only ~21% are the
-        // monitored C/G) before the gather work. `monitors` compares in the
-        // encoding's native space (no per-base decode for packed layouts).
-        if !refc.monitors(gp, p.monitored_base) {
-            continue;
-        }
-        tally_site(rec, refc, rp_start + k, gp, p, counters);
-    }
+    // The reference scan comes first and rejects ~79% of bases (only ~21% are the
+    // monitored C/G) before any gather work; `for_each_monitored` does it 32 bases
+    // per word rather than one probe at a time.
+    refc.for_each_monitored(gp_start + lo, gp_start + hi, p.monitored_base, |gp| {
+        tally_site(geom, refc, rp_start + (gp - gp_start), gp, p, counters);
+    });
 }
 
 /// Scalar reference-span tally: walk `len` aligned positions from read position
@@ -1222,7 +1286,7 @@ fn tally_run(
 /// helper here stops `tally_span` from fusing into the caller and regresses the
 /// hot path.)
 fn tally_span(
-    rec: &RawRecord,
+    geom: &RecordGeom<'_>,
     refc: TwoBitCodes<'_>,
     rp_start: usize,
     gp_start: usize,
@@ -1233,20 +1297,21 @@ fn tally_span(
     // Hoist the contig/SEQ bounds out of the per-base loop: across an M-span
     // `rp = rp_start + k` and `gp = gp_start + k` move together, so the per-base
     // bounds checks collapse to a single valid `k` range `[0, k1)`.
-    let k1 = len.min(p.seq_len.saturating_sub(rp_start)).min(p.ref_len.saturating_sub(gp_start));
+    let k1 =
+        len.min(geom.seq_len().saturating_sub(rp_start)).min(refc.len().saturating_sub(gp_start));
 
     // Hot path: no stored exclusions (no trim, no masking). The genomic dedup
     // skip is the only possible exclusion, handled exactly as before so this
     // codegen-sensitive path is unchanged.
     if p.stored_skips.is_empty() {
         match p.skip {
-            None => tally_run(rec, refc, rp_start, gp_start, 0, k1, p, counters),
+            None => tally_run(geom, refc, rp_start, gp_start, 0, k1, p, counters),
             Some((s, e)) => {
                 // Skip applies where `gp ∈ [s, e)`, i.e. `k ∈ [s-gp_start, e-gp_start)`.
                 let sk0 = s.saturating_sub(gp_start).clamp(0, k1);
                 let sk1 = e.saturating_sub(gp_start).clamp(0, k1);
-                tally_run(rec, refc, rp_start, gp_start, 0, sk0, p, counters);
-                tally_run(rec, refc, rp_start, gp_start, sk1, k1, p, counters);
+                tally_run(geom, refc, rp_start, gp_start, 0, sk0, p, counters);
+                tally_run(geom, refc, rp_start, gp_start, sk1, k1, p, counters);
             }
         }
         return;
@@ -1284,7 +1349,7 @@ fn tally_span(
     while i < n {
         let (lo, mut hi) = ex[i];
         if lo > cur {
-            tally_run(rec, refc, rp_start, gp_start, cur, lo, p, counters);
+            tally_run(geom, refc, rp_start, gp_start, cur, lo, p, counters);
         }
         let mut j = i + 1;
         while j < n && ex[j].0 <= hi {
@@ -1295,7 +1360,7 @@ fn tally_span(
         i = j;
     }
     if cur < k1 {
-        tally_run(rec, refc, rp_start, gp_start, cur, k1, p, counters);
+        tally_run(geom, refc, rp_start, gp_start, cur, k1, p, counters);
     }
 }
 
@@ -1353,6 +1418,27 @@ mod tests {
         o.max_unconverted_fraction = fraction;
         o.min_sites = min_sites;
         RecordProcessor::new(Reference::from_encoded_contigs(vec![enc("C")]), o)
+    }
+
+    #[test]
+    fn count_tag_value_renders_like_format() {
+        let mut buf = [0u8; COUNT_TAG_WIDTH];
+        // Zero, single digit, and a value whose low digit is 0 (the digit loop
+        // must not stop early on it).
+        assert_eq!(render_counts(&mut buf, 0, 0), b"0/0");
+        assert_eq!(render_counts(&mut buf, 3, 10), b"3/10");
+        assert_eq!(render_counts(&mut buf, 100, 1000), b"100/1000");
+        // The buffer is sized for the widest possible pair, and must reset between
+        // calls rather than leaving the previous value's tail behind.
+        assert_eq!(
+            render_counts(&mut buf, u64::MAX, u64::MAX),
+            b"18446744073709551615/18446744073709551615".as_slice()
+        );
+        assert_eq!(
+            render_counts(&mut buf, 7, 9),
+            b"7/9",
+            "reused buffer is truncated to the new value"
+        );
     }
 
     #[test]
@@ -1506,7 +1592,7 @@ mod tests {
         let proc = RecordProcessor::new(reference, opts(cph_mask(), 3));
         let recs = parse_sam_records(&[&sam_line(0, 1, "10M", "CACACACACA", "IIIIIIIIII")], 10);
         let mut counters = PerContextCounters::default();
-        proc.tally_record(&recs[0], RecordSkips::default(), &mut counters);
+        proc.tally_record(&RecordGeom::new(&recs[0]), RecordSkips::default(), &mut counters);
         assert_eq!(counters.unconv[Context::CpA.index()], 5);
         assert_eq!(counters.total[Context::CpA.index()], 5);
         assert!(proc.decide(&counters), "5 unconverted CpA ≥ 3 → unconverted");
@@ -1518,7 +1604,7 @@ mod tests {
         let proc = RecordProcessor::new(reference, opts(cph_mask(), 3));
         let recs = parse_sam_records(&[&sam_line(0, 1, "10M", "TATATATATA", "IIIIIIIIII")], 10);
         let mut counters = PerContextCounters::default();
-        proc.tally_record(&recs[0], RecordSkips::default(), &mut counters);
+        proc.tally_record(&RecordGeom::new(&recs[0]), RecordSkips::default(), &mut counters);
         assert_eq!(counters.unconv[Context::CpA.index()], 0);
         assert_eq!(counters.total[Context::CpA.index()], 5);
         assert!(!proc.decide(&counters));
@@ -1536,7 +1622,7 @@ mod tests {
         let recs =
             parse_sam_records(&[&sam_line(FLAG_REVERSE, 1, "10M", "TGTGTGTGTG", "IIIIIIIIII")], 10);
         let mut counters = PerContextCounters::default();
-        proc.tally_record(&recs[0], RecordSkips::default(), &mut counters);
+        proc.tally_record(&RecordGeom::new(&recs[0]), RecordSkips::default(), &mut counters);
         // ref G at positions 1,3,5,7,9 (0-based); each has ref[i-1]=T → CpA.
         assert_eq!(counters.unconv[Context::CpA.index()], 5);
         assert_eq!(counters.total[Context::CpA.index()], 5);
@@ -1553,7 +1639,7 @@ mod tests {
         let recs = parse_sam_records(&[&sam_line(0, 1, "10M", "CACACACACA", "IIIIIIIIII")], 10);
         let skips = RecordSkips { stored: &[(0, 5)], genomic: None };
         let mut counters = PerContextCounters::default();
-        proc.tally_record(&recs[0], skips, &mut counters);
+        proc.tally_record(&RecordGeom::new(&recs[0]), skips, &mut counters);
         assert_eq!(counters.unconv[Context::CpA.index()], 2, "3 of 5 CpA masked out of the tally");
         assert_eq!(counters.total[Context::CpA.index()], 2);
         assert!(!proc.decide(&counters), "2 < count threshold 3 once the masked 5' sites drop");
@@ -1570,7 +1656,7 @@ mod tests {
         let skips = RecordSkips { stored: &[(0, 5)], genomic: None };
         let mut counters = PerContextCounters::default();
         let mut acc = MbiasAccumulator::new();
-        proc.tally_and_accumulate(&recs[0], skips, &mut counters, &mut acc);
+        proc.tally_and_accumulate(&RecordGeom::new(&recs[0]), skips, &mut counters, &mut acc);
 
         // Tally: masked 5' sites excluded, exactly as the non-fused path.
         assert_eq!(counters.unconv[Context::CpA.index()], 2, "fused tally honors the mask window");
@@ -1582,6 +1668,33 @@ mod tests {
             .map(|c| c.total())
             .sum();
         assert_eq!(recorded, 5, "M-bias records every site, ignoring the tally mask window");
+    }
+
+    #[test]
+    fn fused_walk_honors_every_window_when_a_record_has_several() {
+        // The fused scan tests every stored exclusion per site, so a record
+        // carrying several windows must have all of them excluded from the tally —
+        // while M-bias still records every site.
+        let seq = "CA".repeat(20); // 40 bp: a CpA C at every even stored position
+        let reference = Reference::from_encoded_contigs(vec![enc(&seq)]);
+        let proc = RecordProcessor::new(reference, opts(cph_mask(), 3));
+        let recs = parse_sam_records(&[&sam_line(0, 1, "40M", &seq, &"I".repeat(40))], 40);
+        // Nine disjoint single-base windows over the CpA C's at stored 0,2,…,16.
+        let windows: Vec<(usize, usize)> = (0..9).map(|k| (2 * k, 2 * k + 1)).collect();
+        let skips = RecordSkips { stored: &windows, genomic: None };
+        let mut counters = PerContextCounters::default();
+        let mut acc = MbiasAccumulator::new();
+        proc.tally_and_accumulate(&RecordGeom::new(&recs[0]), skips, &mut counters, &mut acc);
+
+        // 20 CpA sites, 9 masked → 11 counted. Testing only the first window would
+        // leave 19; testing none would leave 20.
+        assert_eq!(counters.total[Context::CpA.index()], 11, "all nine windows honored");
+        let recorded: u64 = acc
+            .cycles(ReadRole::Se, ReadEnd::FivePrime, Context::CpA)
+            .iter()
+            .map(|c| c.total())
+            .sum();
+        assert_eq!(recorded, 20, "M-bias still records every site");
     }
 
     #[test]
@@ -1599,7 +1712,7 @@ mod tests {
         let windows: Vec<(usize, usize)> = (0..9).map(|k| (2 * k, 2 * k + 1)).collect();
         let skips = RecordSkips { stored: &windows, genomic: None };
         let mut counters = PerContextCounters::default();
-        proc.tally_record(&recs[0], skips, &mut counters);
+        proc.tally_record(&RecordGeom::new(&recs[0]), skips, &mut counters);
         // 20 CpA total, 9 masked → 11 remain. (A fixed eight-slot buffer would
         // drop the 9th window and leave 12.)
         assert_eq!(counters.total[Context::CpA.index()], 11, "all nine windows honored");
