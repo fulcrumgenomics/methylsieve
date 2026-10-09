@@ -101,7 +101,7 @@ impl<'a> RecordGeom<'a> {
     /// Raw CIGAR ops (`len << 4 | op`), in order.
     #[inline]
     pub(crate) fn cigar_ops(&self) -> impl Iterator<Item = u32> + 'a {
-        self.cigar.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        self.cigar.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c))
     }
 
     /// QUAL at stored read position `rp` (`rp < seq_len`).
