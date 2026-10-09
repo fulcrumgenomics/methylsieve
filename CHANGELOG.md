@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The M-bias plot's y-axis is labelled "Apparent Methylation" and its title names the chemistry.
 - In `--help`, `--min-base-quality`, `--ignore-template-ends` and `--ignore-supplementary-evidence` move to a new "Tallying" section, and `--count-tag` / `--no-count-tag` move under "Decision".
 
+### Fixed
+- The conversion-matrix plot no longer leaves white holes in dense regions or draws two neighbouring cells summed into one brighter hex. The counts sit on a whole-number grid that the hexagonal grid can't line up with; each cell holding at least 4 templates is now spread evenly over its unit square before binning, so every hex collects templates in proportion to the area it covers. Sparser cells stay single points, so a lone template still draws as one hex. The axes also start just below 0, so the row of templates with no converted sites draws whole.
+
 ## [0.2.1] - 2026-07-30
 
 ### Changed

@@ -270,6 +270,16 @@ pub(crate) fn write_matrix_pdf(
     write_scenes_pdf(path, &scenes)
 }
 
+/// Sub-points per axis that each whole-number matrix cell is spread over before
+/// hexbinning (so `SPREAD²` per cell). See [`spread_cell`].
+const SPREAD: usize = 4;
+
+/// A cell's unit square overlaps at most about four hexes. A cell with fewer
+/// templates than that is drawn as one point: spreading it would only scatter
+/// fractions of a template across several hexes, turning a lone template into a
+/// cluster of faint ones.
+const MIN_TEMPLATES_TO_SPREAD: u64 = 4;
+
 /// Render one scope's hexbin page.
 fn matrix_scene(
     page: &MatrixPage<'_>,
@@ -303,9 +313,11 @@ fn matrix_scene(
             continue; // beyond the clamped range (rare outliers)
         }
         let converted_sites = checked - unconv;
-        xs.push(checked as f64);
-        ys.push(converted_sites as f64);
-        zs.push(n as f64);
+        for (x, y, z) in spread_cell(checked, converted_sites, n) {
+            xs.push(x);
+            ys.push(y);
+            zs.push(z);
+        }
         if page.boundary && !classify(unconv, checked).0 {
             boundary
                 .entry(checked)
@@ -323,8 +335,8 @@ fn matrix_scene(
         // (thousands of sites on long templates) doesn't render a multi-thousand-
         // bin hexbin for a title/summary plot.
         .with_n_bins((cap as usize).clamp(1, 300))
-        .with_x_range(0.0, span)
-        .with_y_range(0.0, span)
+        .with_x_range(-1.0, span)
+        .with_y_range(-1.0, span)
         .with_min_count(1)
         .with_stroke("#ffffff")
         .with_stroke_width(0.4)
@@ -391,6 +403,28 @@ fn matrix_scene(
     render_multiple(plots, layout)
 }
 
+/// The weighted points `(x, y, templates)` that represent the matrix cell of `n`
+/// templates at `(checked, converted)` in the hexbin.
+///
+/// The counts sit on a whole-number lattice and the hex grid can't line up with
+/// it, so one point per cell leaves some hexes with no cell (white holes in dense
+/// regions) and sums neighbouring cells into others. Spreading the cell's
+/// templates evenly over its unit square as a `SPREAD`×`SPREAD` grid of
+/// sub-points instead gives each hex templates in proportion to the area it
+/// covers. Cells below [`MIN_TEMPLATES_TO_SPREAD`] stay a single point.
+fn spread_cell(checked: u64, converted: u64, n: u64) -> Vec<(f64, f64, f64)> {
+    let (x, y) = (checked as f64, converted as f64);
+    if n < MIN_TEMPLATES_TO_SPREAD {
+        return vec![(x, y, n as f64)];
+    }
+    // Sub-point offsets across the unit cell: -0.375, -0.125, 0.125, 0.375 for four.
+    let offset = |i: usize| (i as f64 + 0.5) / SPREAD as f64 - 0.5;
+    let share = n as f64 / (SPREAD * SPREAD) as f64;
+    (0..SPREAD)
+        .flat_map(|i| (0..SPREAD).map(move |j| (x + offset(i), y + offset(j), share)))
+        .collect()
+}
+
 /// SI-compact number for colorbar tick labels and the title summary:
 /// `100000 → "100k"`, `1.2e6 → "1.2M"`, smaller values rounded to an integer.
 /// Uses conventional SI casing (`k` = 10³, `M` = 10⁶).
@@ -425,4 +459,32 @@ fn percentile_checked(matrix: &BTreeMap<(u64, u64), u64>, total: u64, frac: f64)
         }
     }
     by_checked.keys().last().copied().unwrap_or(1).div_ceil(10) * 10
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spread_cell_keeps_every_template() {
+        let total: f64 = spread_cell(20, 7, 1000).iter().map(|&(_, _, z)| z).sum();
+        assert!((total - 1000.0).abs() < 1e-9, "spread total {total}");
+    }
+
+    #[test]
+    fn spread_cell_stays_within_its_unit_square() {
+        for (x, y, _) in spread_cell(20, 7, 1000) {
+            assert!((19.5..20.5).contains(&x) && (6.5..7.5).contains(&y), "({x}, {y})");
+        }
+    }
+
+    #[test]
+    fn spread_cell_spreads_cells_at_the_threshold() {
+        assert_eq!(spread_cell(20, 7, MIN_TEMPLATES_TO_SPREAD).len(), SPREAD * SPREAD);
+    }
+
+    #[test]
+    fn spread_cell_leaves_sparse_cells_as_one_point() {
+        assert_eq!(spread_cell(20, 7, MIN_TEMPLATES_TO_SPREAD - 1), vec![(20.0, 7.0, 3.0)]);
+    }
 }
