@@ -183,8 +183,8 @@ impl DataClass {
 /// Checks once per run that the genome's conversion pattern agrees with the
 /// declared chemistry. Only a positive match to the *other* chemistry's pattern
 /// counts as a mismatch, so a failed library is never mistaken for the wrong
-/// chemistry: under EM-seq, CpG conversion can never exceed CpH conversion,
-/// however many molecules failed.
+/// chemistry: under EM-seq, however many molecules failed, CpG conversion stays
+/// at or below CpH conversion, give or take the C/T SNP rate at CpG.
 pub(crate) struct ChemistryCheck {
     chemistry: Chemistry,
     done: bool,
@@ -226,11 +226,17 @@ impl ChemistryCheck {
         Ok(())
     }
 
-    /// At end of run, if the floors were never reached, classify what was seen
-    /// and warn on a mismatch instead of failing: too few sites to be sure.
-    pub(crate) fn finish(&mut self, counts: &ConversionCounts) {
+    /// At end of run, run the check if it is still pending and `counts` clears
+    /// the floors. Below the floors, classify what was seen and warn on a
+    /// mismatch instead of failing: too few sites to be sure.
+    ///
+    /// # Errors
+    /// Returns an error when the floors are met and the data shows the other
+    /// chemistry's pattern.
+    pub(crate) fn finish(&mut self, counts: &ConversionCounts) -> Result<()> {
+        self.check_if_ready(counts)?;
         if self.done {
-            return;
+            return Ok(());
         }
         self.done = true;
         if self.contradicts(counts.classify()) {
@@ -239,7 +245,14 @@ impl ChemistryCheck {
                  {CHECK_MIN_CPH_SITES} CpH needed), so the run was not stopped.",
                 self.mismatch_message(counts)
             );
+        } else {
+            log::info!(
+                "Chemistry check: {}: too few sites to check ({CHECK_MIN_CPG_SITES} CpG and \
+                 {CHECK_MIN_CPH_SITES} CpH needed).",
+                counts.describe()
+            );
         }
+        Ok(())
     }
 
     /// Whether `class` is the pattern of the other readout.
@@ -427,7 +440,20 @@ mod tests {
     #[test]
     fn finish_never_errors_below_the_site_floors() {
         let mut check = ChemistryCheck::new(Chemistry::EmSeq);
-        check.finish(&counts(0.47, 0.006, 1000));
+        assert!(check.finish(&counts(0.47, 0.006, 1000)).is_ok());
         assert!(!check.is_pending());
+    }
+
+    #[test]
+    fn finish_errors_on_a_mismatch_once_the_floors_are_met() {
+        let mut check = ChemistryCheck::new(Chemistry::EmSeq);
+        assert!(check.finish(&counts(0.47, 0.006, 200_000)).is_err());
+    }
+
+    #[test]
+    fn finish_does_not_rerun_a_check_that_already_ran() {
+        let mut check = ChemistryCheck::new(Chemistry::EmSeq);
+        assert!(check.check_if_ready(&counts(0.02, 0.98, 200_000)).is_ok());
+        assert!(check.finish(&counts(0.47, 0.006, 400_000)).is_ok());
     }
 }

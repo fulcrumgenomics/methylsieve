@@ -64,7 +64,9 @@ impl Write for Sink {
 /// `samtools view -u`. Levels 1-9 are standard zlib levels; 10-12 are
 /// libdeflate's extra-strong tiers (much more CPU for marginal size
 /// wins). After writing all records, call [`Self::finish`] to flush
-/// and emit the BGZF EOF marker.
+/// and emit the BGZF EOF marker. Dropping the writer without finishing
+/// leaves the output without the marker, so a failed run's partial BAM
+/// reads as truncated rather than as a complete one.
 pub(crate) struct RawBamWriter {
     bgzf: Option<BgzfWriter<WriteBehind<Sink>>>,
 }
@@ -117,6 +119,17 @@ impl RawBamWriter {
             threaded.finish().context("flushing IO writer thread")?;
         }
         Ok(())
+    }
+}
+
+impl Drop for RawBamWriter {
+    /// Unfinished means the run failed. `bgzf::Writer`'s own `Drop` would write
+    /// the EOF marker and make the partial output pass as complete, so leak it
+    /// instead; the process is about to exit, and the IO thread with it.
+    fn drop(&mut self) {
+        if let Some(w) = self.bgzf.take() {
+            std::mem::forget(w);
+        }
     }
 }
 

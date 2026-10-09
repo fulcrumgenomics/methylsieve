@@ -288,8 +288,9 @@ fn matrix_scene(
 ) -> Scene {
     let matrix = page.cells;
     let contexts = page.contexts;
-    // Template totals for the title summary: how many templates the decision
-    // flags as unconverted, out of all that hit the matrix.
+    // Template totals for the title summary: how many templates fall past the
+    // boundary (the decision flags them on the genome), out of all that hit the
+    // matrix.
     let total: u64 = matrix.values().sum();
     let unconverted: u64 = if page.boundary {
         matrix.iter().filter_map(|(&(c, u), &n)| classify(u, c).0.then_some(n)).sum()
@@ -305,26 +306,17 @@ fn matrix_scene(
     let span = cap as f64 + 1.0;
 
     let (mut xs, mut ys, mut zs) = (Vec::new(), Vec::new(), Vec::new());
-    // Lowest converted-count still called "converted" per observed count → the
-    // decision boundary drawn over the hexbin.
-    let mut boundary: BTreeMap<u64, u64> = BTreeMap::new();
     for (&(checked, unconv), &n) in matrix {
         if checked > cap {
             continue; // beyond the clamped range (rare outliers)
         }
-        let converted_sites = checked - unconv;
-        for (x, y, z) in spread_cell(checked, converted_sites, n) {
+        for (x, y, z) in spread_cell(checked, checked - unconv, n) {
             xs.push(x);
             ys.push(y);
             zs.push(z);
         }
-        if page.boundary && !classify(unconv, checked).0 {
-            boundary
-                .entry(checked)
-                .and_modify(|m| *m = (*m).min(converted_sites))
-                .or_insert(converted_sites);
-        }
     }
+    let boundary = if page.boundary { decision_boundary(cap, classify) } else { BTreeMap::new() };
 
     let hex = HexbinPlot::new()
         .with_data(xs, ys)
@@ -368,8 +360,10 @@ fn matrix_scene(
         if page.is_control { format!("{} Templates", page.scope) } else { "Templates".into() };
     let summary = if page.boundary {
         let pct = if total > 0 { 100.0 * unconverted as f64 / total as f64 } else { 0.0 };
+        // Control templates are never flagged, only counted against the boundary.
+        let verdict = if page.is_control { "Past the Boundary" } else { "Flagged as Unconverted" };
         format!(
-            "{} Templates · {} ({pct:.1}%) Flagged as Unconverted",
+            "{} Templates · {} ({pct:.1}%) {verdict}",
             si_compact(total as f64),
             si_compact(unconverted as f64),
         )
@@ -403,6 +397,22 @@ fn matrix_scene(
     render_multiple(plots, layout)
 }
 
+/// The converted/unconverted boundary drawn over the hexbin: for every site count
+/// from 0 to `cap`, the fewest converted sites `classify` still calls converted.
+/// Traced from the decision rather than the observed cells, so it runs unbroken
+/// across site counts no template has, and shows even when every template is past it.
+fn decision_boundary(
+    cap: u64,
+    classify: &impl Fn(u64, u64) -> (bool, DecidedBy),
+) -> BTreeMap<u64, u64> {
+    (0..=cap)
+        .filter_map(|checked| {
+            let lowest = (0..=checked).find(|&conv| !classify(checked - conv, checked).0)?;
+            Some((checked, lowest))
+        })
+        .collect()
+}
+
 /// The weighted points `(x, y, templates)` that represent the matrix cell of `n`
 /// templates at `(checked, converted)` in the hexbin.
 ///
@@ -411,18 +421,25 @@ fn matrix_scene(
 /// regions) and sums neighbouring cells into others. Spreading the cell's
 /// templates evenly over its unit square as a `SPREAD`×`SPREAD` grid of
 /// sub-points instead gives each hex templates in proportion to the area it
-/// covers. Cells below [`MIN_TEMPLATES_TO_SPREAD`] stay a single point.
+/// covers. Cells below [`MIN_TEMPLATES_TO_SPREAD`] stay a single point. Nothing
+/// lies below zero on either axis, so a cell on a zero edge is not spread across
+/// it: the row (or column) at zero stays one row of hexes.
 fn spread_cell(checked: u64, converted: u64, n: u64) -> Vec<(f64, f64, f64)> {
     let (x, y) = (checked as f64, converted as f64);
     if n < MIN_TEMPLATES_TO_SPREAD {
         return vec![(x, y, n as f64)];
     }
     // Sub-point offsets across the unit cell: -0.375, -0.125, 0.125, 0.375 for four.
-    let offset = |i: usize| (i as f64 + 0.5) / SPREAD as f64 - 0.5;
-    let share = n as f64 / (SPREAD * SPREAD) as f64;
-    (0..SPREAD)
-        .flat_map(|i| (0..SPREAD).map(move |j| (x + offset(i), y + offset(j), share)))
-        .collect()
+    let offsets = |at_zero: bool| -> Vec<f64> {
+        if at_zero {
+            vec![0.0]
+        } else {
+            (0..SPREAD).map(|i| (i as f64 + 0.5) / SPREAD as f64 - 0.5).collect()
+        }
+    };
+    let (dxs, dys) = (offsets(checked == 0), offsets(converted == 0));
+    let share = n as f64 / (dxs.len() * dys.len()) as f64;
+    dxs.iter().flat_map(|&dx| dys.iter().map(move |&dy| (x + dx, y + dy, share))).collect()
 }
 
 /// SI-compact number for colorbar tick labels and the title summary:
@@ -464,6 +481,37 @@ fn percentile_checked(matrix: &BTreeMap<(u64, u64), u64>, total: u64, frac: f64)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// More than `max_unconverted` unconverted sites flags a template.
+    fn count_rule(max_unconverted: u64) -> impl Fn(u64, u64) -> (bool, DecidedBy) {
+        move |unconv, _checked| (unconv > max_unconverted, DecidedBy::Count)
+    }
+
+    #[test]
+    fn decision_boundary_covers_every_site_count() {
+        let boundary = decision_boundary(10, &count_rule(3));
+        assert_eq!(boundary.keys().copied().collect::<Vec<_>>(), (0..=10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn decision_boundary_is_the_fewest_converted_sites_still_converted() {
+        let boundary = decision_boundary(10, &count_rule(3));
+        assert_eq!(boundary[&2], 0, "too few sites to flag at all");
+        assert_eq!(boundary[&10], 7, "at most 3 of 10 unconverted");
+    }
+
+    #[test]
+    fn spread_cell_does_not_spread_below_zero_converted() {
+        let points = spread_cell(20, 0, 1000);
+        assert!(points.iter().all(|&(_, y, _)| y == 0.0));
+        let total: f64 = points.iter().map(|&(_, _, z)| z).sum();
+        assert!((total - 1000.0).abs() < 1e-9, "spread total {total}");
+    }
+
+    #[test]
+    fn spread_cell_keeps_zero_site_templates_at_the_origin() {
+        assert_eq!(spread_cell(0, 0, 1000), vec![(0.0, 0.0, 1000.0)]);
+    }
 
     #[test]
     fn spread_cell_keeps_every_template() {

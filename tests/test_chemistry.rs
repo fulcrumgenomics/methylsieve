@@ -65,6 +65,30 @@ fn unconverted(n: usize) -> SamBuilder {
     cacg_sam(n, 0, 0)
 }
 
+/// CpG units at the start of [`taps_like_with_converted_start`] reads that all
+/// convert.
+const CONVERTED_START_UNITS: usize = 5;
+
+/// TAPS-like reads that, read as em-seq, dip at the 5' end: the first
+/// [`CONVERTED_START_UNITS`] CpGs all convert, then read `i` converts every other
+/// CpG, alternating which by read, so the rest of the curve sits at one half. No
+/// CpH converts. Masking the dip drops a fifth of each read's CpA sites.
+fn taps_like_with_converted_start(n: usize) -> SamBuilder {
+    let len = UNITS * 4;
+    let mut b = SamBuilder::new().sq("chr1", len);
+    let qual = q40(len);
+    for i in 0..n {
+        let seq: String = (0..UNITS)
+            .map(|u| {
+                let converted = u < CONVERTED_START_UNITS || (u + i) % 2 == 0;
+                format!("CA{}G", if converted { 'T' } else { 'C' })
+            })
+            .collect();
+        b = b.record(&format!("r{i}"), 0, "chr1", 1, &format!("{len}M"), &seq, &qual);
+    }
+    b
+}
+
 // ── No unconverted call ─────────────────────────────────────────────────────
 
 #[test]
@@ -267,10 +291,55 @@ fn taps_chemistry_on_emseq_like_data_errors() {
 }
 
 #[test]
-fn mismatch_is_caught_at_the_mask_freeze() {
+fn mismatch_is_caught_when_input_ends_while_learning_the_mask() {
     let env = TestEnv::new();
     let r =
         run_methylsieve(&taps_like(READS_PAST_FLOORS), &cacg_reference(), &env, &["--mbias-mask"]);
+    assert!(!r.status_ok);
+    assert!(r.stderr.contains("Re-run with --chemistry taps"), "{}", r.stderr);
+}
+
+#[test]
+fn mismatch_is_caught_when_the_mask_buffer_fills() {
+    // The full buffer alone clears the floors, so the check runs at the freeze,
+    // on exactly the buffered templates' sites.
+    let env = TestEnv::new();
+    let buffer = READS_PAST_FLOORS.to_string();
+    let r = run_methylsieve(
+        &taps_like(2 * READS_PAST_FLOORS),
+        &cacg_reference(),
+        &env,
+        &["--mbias-mask", "--mbias-buffer-templates", &buffer],
+    );
+    assert!(!r.status_ok);
+    let buffered_sites = READS_PAST_FLOORS * UNITS;
+    assert!(r.stderr.contains(&format!("CpH conversion 0.0000 over {buffered_sites} sites")));
+}
+
+#[test]
+fn mismatch_is_caught_while_streaming_past_a_small_mask_buffer() {
+    let env = TestEnv::new();
+    let r = run_methylsieve(
+        &taps_like(READS_PAST_FLOORS),
+        &cacg_reference(),
+        &env,
+        &["--mbias-mask", "--mbias-buffer-templates", "100"],
+    );
+    assert!(!r.status_ok);
+    assert!(r.stderr.contains("Re-run with --chemistry taps"), "{}", r.stderr);
+}
+
+#[test]
+fn masked_sites_still_count_toward_the_chemistry_check() {
+    // The learned mask removes enough CpA sites from the tally to leave it below
+    // 100k, but the check counts every site seen before masking.
+    let env = TestEnv::new();
+    let r = run_methylsieve(
+        &taps_like_with_converted_start(READS_PAST_FLOORS),
+        &cacg_reference(),
+        &env,
+        &["--mbias-mask", "--mbias-buffer-templates", "100"],
+    );
     assert!(!r.status_ok);
     assert!(r.stderr.contains("Re-run with --chemistry taps"), "{}", r.stderr);
 }
@@ -329,6 +398,57 @@ fn chemistry_check_below_site_floors_warns_instead_of_erroring() {
     assert!(r.status_ok, "{}", r.stderr);
     assert!(r.stderr.contains("Re-run with --chemistry taps"), "{}", r.stderr);
     assert!(r.stderr.contains("Too few sites to be certain"), "{}", r.stderr);
+}
+
+#[test]
+fn spike_in_controls_are_excluded_from_the_chemistry_check() {
+    // A TAPS-like control twice the size of an EM-seq-like genome: counted with
+    // the genome, it would make the data look ambiguous.
+    let env = TestEnv::new();
+    let r = run_methylsieve(
+        &genome_and_control_sam(READS_PAST_FLOORS, (UNITS, 6), 2 * READS_PAST_FLOORS, (0, 12)),
+        &genome_and_control_reference(),
+        &env,
+        &["--control-contig", "ctrl"],
+    );
+    assert!(r.status_ok, "{}", r.stderr);
+    assert!(r.stderr.contains("EM-seq-like, consistent"), "{}", r.stderr);
+}
+
+// ── Run statistics ──────────────────────────────────────────────────────────
+
+#[test]
+fn taps_run_stats_report_genome_methylation() {
+    let env = TestEnv::new();
+    let r = run_methylsieve(&taps_like(10), &cacg_reference(), &env, &["--chemistry", "taps"]);
+    assert!(r.status_ok, "{}", r.stderr);
+    assert!(
+        r.stderr.contains(
+            "Genome CpG apparent methylation 0.48000 over 250 sites; CpH conversion 0.00000 \
+             over 250 sites."
+        ),
+        "{}",
+        r.stderr
+    );
+}
+
+#[test]
+fn taps_run_stats_report_na_without_genome_sites() {
+    let env = TestEnv::new();
+    let r = run_methylsieve(
+        &genome_and_control_sam(0, (0, 0), 3, (0, 20)),
+        &genome_and_control_reference(),
+        &env,
+        &["--chemistry", "taps", "--control-contig", "ctrl"],
+    );
+    assert!(r.status_ok, "{}", r.stderr);
+    assert!(
+        r.stderr.contains(
+            "Genome CpG apparent methylation n/a over 0 sites; CpH conversion n/a over 0 sites."
+        ),
+        "{}",
+        r.stderr
+    );
 }
 
 // ── Control conversion matrices ─────────────────────────────────────────────
@@ -441,4 +561,40 @@ fn emseq_summary_counts_unconverted_control_templates() {
     let ctrl = rows.iter().find(|r| r["scope"] == "ctrl").unwrap();
     assert_eq!(ctrl["n_unconverted"], "3");
     assert_eq!(ctrl["frac_unconverted"], "1.000000");
+}
+
+/// Pages in a PDF: page objects are written as `/Type/Page`, the page tree as
+/// `/Type/Pages`.
+fn pdf_page_count(path: &std::path::Path) -> usize {
+    let bytes = std::fs::read(path).expect("PDF written");
+    let marker = b"/Type/Page";
+    bytes
+        .windows(marker.len() + 1)
+        .filter(|w| w.starts_with(marker) && w[marker.len()] != b's')
+        .count()
+}
+
+#[test]
+fn emseq_conversion_matrix_pdf_has_a_page_per_scope() {
+    let env = TestEnv::new();
+    let prefix = env.metrics_prefix_arg();
+    let len = UNITS * 4;
+    let (qual, cigar) = (q40(len), format!("{len}M"));
+    let mut sam = SamBuilder::new().sq("chr1", len).sq("lambda", len).sq("puc19", len);
+    for (contig, seq) in
+        [("chr1", cacg_read(UNITS, 6)), ("lambda", cacg_read(UNITS, 0)), ("puc19", cacg_read(0, 0))]
+    {
+        for i in 0..3 {
+            sam = sam.record(&format!("{contig}{i}"), 0, contig, 1, &cigar, &seq, &qual);
+        }
+    }
+    let reference = RefBuilder::new()
+        .contig("chr1", &cacg_ref())
+        .contig("lambda", &cacg_ref())
+        .contig("puc19", &cacg_ref());
+    let args =
+        ["--control-contig", "lambda", "--control-contig", "puc19", "--metrics-prefix", &prefix];
+    run_ok(&sam, &reference, &env, &args);
+    let pdf = std::path::PathBuf::from(format!("{prefix}.conversion-matrix.pdf"));
+    assert_eq!(pdf_page_count(&pdf), 3);
 }

@@ -431,9 +431,10 @@ pub struct Args {
     /// — with the applied 5'/3' mask lengths as `r1_mask_5p`/`r2_mask_5p`/
     /// `se_mask_5p`/`se_mask_3p` columns), `PREFIX.mbias.tsv` (per-read-cycle
     /// methylation), and `PREFIX.conversion-matrix.tsv` (per-template conversion
-    /// histograms for the genome and each control), plus PDF plots
-    /// `PREFIX.mbias.pdf` (M-bias curves) and `PREFIX.conversion-matrix.pdf` (one
-    /// hexbin page per scope). Computing these is a single streaming pass; the
+    /// histograms for the genome under em-seq / bisulfite and for each control;
+    /// not written when there is neither), plus PDF plots `PREFIX.mbias.pdf`
+    /// (M-bias curves) and `PREFIX.conversion-matrix.pdf` (one hexbin page per
+    /// scope). Computing these is a single streaming pass; the
     /// output BAM is unchanged.
     #[arg(long = "metrics-prefix", help_heading = "Stats & misc")]
     pub(crate) metrics_prefix: Option<PathBuf>,
@@ -450,7 +451,7 @@ pub struct Args {
     /// is a per-TEMPLATE aggregate stamped on every record of the template (not a
     /// per-read count), so a user can see why any read was (or wasn't) flagged.
     /// On by default with tag `ch`; pass a name to rename, or `--no-count-tag`
-    /// to disable.
+    /// to disable. Never written under taps / illumina-5base.
     #[arg(long = "count-tag", value_parser = parse_tag_name, default_value = "ch",
           conflicts_with = "no_count_tag", help_heading = DECISION_HEADING)]
     pub(crate) count_tag: [u8; 2],
@@ -829,11 +830,18 @@ fn run(args: Args, explicit_decision_flags: &[&str]) -> Result<()> {
                 check.check_if_ready(&stats.genome.counters.conversion_counts())?;
             }
             Ok(())
-        })
-        .context("processing record block")?;
+        })?;
         None
     };
-    check.finish(&stats.genome.counters.conversion_counts());
+    // Masking checks the pre-mask M-bias counts throughout (see `run_masking`).
+    let check_counts = match &mbias_acc {
+        Some(acc) if args.mbias_mask => acc.conversion_counts(),
+        _ => stats.genome.counters.conversion_counts(),
+    };
+    check.finish(&check_counts)?;
+    // Finish the BAM before the metrics, so a metrics failure can't leave it
+    // looking truncated.
+    out.finish().context("finishing main output")?;
 
     print_run_stats(&stats, &args);
     warn_proportion_blind_spot(&stats, &args);
@@ -856,7 +864,6 @@ fn run(args: Args, explicit_decision_flags: &[&str]) -> Result<()> {
         .context("writing metric TSVs and plots")?;
     }
 
-    out.finish().context("finishing main output")?;
     report(&started, stats.total_templates, args.quiet);
     Ok(())
 }
@@ -1014,8 +1021,9 @@ fn mask_and_process(
 /// buffered — drain it.
 ///
 /// The chemistry check runs at the freeze, on the learn-phase M-bias counts, so a
-/// mislabelled library stops before anything is written. If those counts are
-/// too sparse it keeps trying on the post-mask tallies as templates stream.
+/// mislabelled library stops before any record is written. If those counts are
+/// too sparse, M-bias keeps accumulating as templates stream and the check runs
+/// as soon as it clears the floors.
 #[allow(clippy::too_many_arguments)] // the run's shared state; bundling it would not aid clarity
 fn run_masking(
     reader: &mut Reader,
@@ -1034,9 +1042,10 @@ fn run_masking(
         match &plan {
             // Stream phase: tally/decide/stamp on the masked geometry, then emit.
             // M-bias keeps accumulating (pre-mask) only when the whole-file curves
-            // are needed for metrics; otherwise the frozen plan never changes.
+            // are needed for metrics, or while the chemistry check still waits on
+            // its site floors; the frozen plan never changes.
             Some(p) => {
-                let feed = cfg.want_metrics.then_some(&mut *mbias);
+                let feed = (cfg.want_metrics || check.is_pending()).then_some(&mut *mbias);
                 let disp = mask_and_process(
                     processor,
                     stats,
@@ -1050,7 +1059,7 @@ fn run_masking(
                     write_block(block, out)?;
                 }
                 if check.is_pending() {
-                    check.check_if_ready(&stats.genome.counters.conversion_counts())?;
+                    check.check_if_ready(&mbias.conversion_counts())?;
                 }
                 Ok(())
             }
@@ -1085,8 +1094,7 @@ fn run_masking(
                 Ok(())
             }
         }
-    })
-    .context("processing record block")?;
+    })?;
 
     // The file ended while still learning (fewer than the target): the entire
     // input is buffered and undrained — freeze on what we have and emit it.
@@ -1206,10 +1214,12 @@ fn print_run_stats(stats: &Stats, args: &Args) {
         let cph = [Context::CpA, Context::CpC, Context::CpT];
         let cph_total: u64 = cph.iter().map(|&x| c.total_for(x)).sum();
         let cph_retained: u64 = cph.iter().map(|&x| c.unconv_for(x)).sum();
-        let rate = |n: u64, d: u64| if d > 0 { n as f64 / d as f64 } else { 0.0 };
+        let rate = |n: u64, d: u64| {
+            if d > 0 { format!("{:.5}", n as f64 / d as f64) } else { "n/a".into() }
+        };
         eprintln!(
-            "methylsieve: Genome CpG apparent methylation {:.5} over {cpg_total} sites; CpH \
-             conversion {:.5} over {cph_total} sites.",
+            "methylsieve: Genome CpG apparent methylation {} over {cpg_total} sites; CpH \
+             conversion {} over {cph_total} sites.",
             rate(cpg_meth, cpg_total),
             rate(cph_total - cph_retained, cph_total),
         );
