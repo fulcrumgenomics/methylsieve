@@ -47,6 +47,8 @@ Both run in the same pass, and methylsieve emits per-context (CpA/CpC/CpT/CpG) a
 per-spike-in conversion metrics — TSVs plus M-bias and decision-matrix plots —
 suitable for QC.
 
+TAPS/TAPS+ and Illumina 5-base libraries convert *methylated* cytosines instead. Pass `--chemistry taps` or `--chemistry illumina-5base` and methylsieve does M-bias masking and metrics as usual, but no unconverted-read filtering, because a read from those chemistries carries nothing to test it against. See [TAPS and Illumina 5-base](#taps-and-illumina-5-base).
+
 methylsieve runs inline in the alignment pipe with negligible overhead:
 
 ```bash
@@ -262,10 +264,10 @@ rate-limited alignment pipe that cost is hidden behind the aligner.
 output BAM is unchanged):
 
 - **`PREFIX.summary.tsv`** — per-context conversion summary, one row per scope (below).
-- **`PREFIX.conversion-matrix.tsv`** — the per-template decision histogram.
+- **`PREFIX.conversion-matrix.tsv`** — per-template conversion histograms, for the genome (`em-seq` / `bisulfite` only) and for each `--control-contig`.
 - **`PREFIX.mbias.tsv`** — per-read-cycle methylation (the M-bias curve).
 - **`PREFIX.mbias.pdf`** — the M-bias curves plotted, with any applied mask shaded.
-- **`PREFIX.conversion-matrix.pdf`** — the decision histogram as a density hexbin with the converted/unconverted boundary drawn.
+- **`PREFIX.conversion-matrix.pdf`** — the same histograms as density hexbins, one page per scope. Under `em-seq` / `bisulfite` each page draws the converted/unconverted boundary; under `taps` / `illumina-5base` it draws the `x = y` line of complete conversion instead.
 
 All rates are fractions in `[0, 1]`, never percentages.
 
@@ -282,18 +284,19 @@ sanity check. (Per-read, per-cycle conversion lives in `mbias.tsv`.)
 |--------|-------------|
 | `sample` | Sample name — `--sample` if given, else the unique `@RG SM:` values comma-joined, else the input file stem. |
 | `methylsieve_version` | Version of methylsieve that wrote the row. |
+| `chemistry` | The `--chemistry` the run used. |
 | `scope` | `genome`, or a `--control-contig` name. |
 | `r1_mask_5p` / `r2_mask_5p` | Applied 5' mask length (cycles) for read 1 / read 2; blank when masking was not run. |
 | `se_mask_5p` / `se_mask_3p` | Applied 5' / 3' mask length for single-end reads; blank when masking was not run. |
 | `n_templates` | Templates routed to this scope. |
 | `n_mapped` | Templates with at least one mapped primary alignment. |
 | `n_evaluated` | Templates that produced at least one monitored site. |
-| `n_unconverted` | Evaluated templates called unconverted (always 0 for control scopes). |
-| `frac_unconverted` | `n_unconverted / n_evaluated` (blank when none evaluated). |
+| `n_unconverted` | Evaluated templates called unconverted. On a control row, the templates past the boundary, which are counted but never tagged. Blank under `taps` / `illumina-5base`. |
+| `frac_unconverted` | `n_unconverted / n_evaluated` (blank when none evaluated, and under `taps` / `illumina-5base`). |
 | `chimeric_to_control_templates` | Genome templates with a supplementary alignment on a control contig (genome row only). |
 | `CpA_obs` … `CpG_obs` | Total monitored sites observed per context (`CpH_obs` = CpA + CpC + CpT). |
 | `CpA_conv_rate` … `CpG_conv_rate` | Per-context conversion rate, `1 − unconv/total` (blank when no sites). High CpG retention on a methylated control is the sanity check. |
-| `CpG_meth_rate` | CpG methylation rate, `unconv/total` (= `1 − CpG_conv_rate`) — the headline biological readout. |
+| `CpG_meth_rate` | CpG methylation rate — the headline biological readout. `unconv/total` (= `1 − CpG_conv_rate`) for `em-seq` / `bisulfite`; `CpG_conv_rate` itself for `taps` / `illumina-5base`, where a converted cytosine was methylated. |
 
 **`mbias.tsv`** has one row per `(read, end, context, cycle)` with coverage:
 `sample, read, end, context, cycle, n_methylated, n_total, frac_methylation,
@@ -301,21 +304,19 @@ ci_lo, ci_hi` (95% Agresti–Coull interval). `end` is `5p` for paired/orphan
 reads; single-end reads also report `3p`. The chosen mask lengths are reported as
 the `*_mask_*` columns of `summary.tsv` (and shaded in `mbias.pdf`).
 
-**`conversion-matrix.tsv`** is the per-template decision histogram for the
-`genome` scope — one row per observed `(checked_sites, converted_sites)` cell over
-the decision contexts. Each cell's verdict is replayed from the live thresholds,
-so it never drifts from the calls written to the BAM, making the decision boundary
-legible.
+**`conversion-matrix.tsv`** has one row per observed `(checked_sites, converted_sites)` cell per scope: the `genome` first, under `em-seq` / `bisulfite` only, then each `--control-contig`. A cell counts the sites that should convert in that scope's control: the decision contexts under `em-seq` / `bisulfite`, as in an unmethylated control such as lambda, and CpG under `taps` / `illumina-5base`, as in a CpG-methylated control. Each cell's verdict is replayed from the live thresholds, so it never drifts from the calls written to the BAM. Under `taps` / `illumina-5base` there is no verdict: their under-conversion is spread across most molecules rather than concentrated in failed ones, so a cutoff recovers little.
 
 | column | description |
 |--------|-------------|
 | `sample` | Sample name. |
+| `scope` | `genome`, or a `--control-contig` name. |
+| `context` | The contexts counted, e.g. `CpH` or `CpG`. |
 | `checked_sites` | Monitored sites examined per template in this cell — the decision denominator. |
 | `converted_sites` | Converted monitored sites (`checked_sites − unconverted`). |
 | `conversion_rate` | `converted_sites / checked_sites` (blank when `checked_sites` is 0). |
 | `n_templates` | Templates with this exact `(checked_sites, converted_sites)` pair. |
-| `decision` | The cell's verdict: `converted` or `unconverted`. |
-| `decided_by` | Which rule decided it: `too_few_sites`, `count`, `proportion`, or `either`. |
+| `decision` | The cell's verdict: `converted` or `unconverted`. Blank under `taps` / `illumina-5base`. |
+| `decided_by` | Which rule decided it: `too_few_sites`, `count`, `proportion`, or `either`. Blank under `taps` / `illumina-5base`. |
 
 ## Other behavior
 
@@ -408,6 +409,10 @@ reverse-mapped reads and supplementaries are handled correctly.
 excludes them from tagging, so the conversion rate can be read directly off the
 control.
 
+Under `taps` / `illumina-5base` the roles flip: a methylated control's CpG conversion rate is the chemistry's sensitivity, and an unmethylated control's conversion rate is its false-positive rate.
+
+With `--metrics-prefix`, each control also gets a page in `conversion-matrix.pdf` and rows in `conversion-matrix.tsv`, so molecules that failed to convert can be seen directly. Under `em-seq` / `bisulfite` an unmethylated control such as lambda is the informative one, and its `n_unconverted` counts the templates past the boundary. Under `taps` / `illumina-5base` a CpG-methylated control is, and the page shows how far its molecules sag below complete conversion.
+
 ### Reference memory
 
 The genome is preloaded once at startup, 2-bit packed (~0.8 GB for a human
@@ -420,6 +425,35 @@ Loading is index-driven: with a `samtools faidx` `.fai` beside the FASTA, each
 contig is read by its byte span in one pass that strips newlines and packs in a
 single sweep. Without a `.fai` it falls back to a slower sequential read (and
 says so) — indexing is recommended for the fastest startup.
+
+## TAPS and Illumina 5-base
+
+TAPS, TAPS+ and Illumina 5-base convert methylated cytosines to T and leave unmethylated ones as C, the reverse of bisulfite and EM-seq. Tell methylsieve which kind of library it is reading with `--chemistry`:
+
+| `--chemistry` | Converts | Unconverted-read filtering | M-bias masking and metrics |
+|---|---|---|---|
+| `em-seq` (default), `bisulfite` | unmethylated C | yes | yes |
+| `taps`, `illumina-5base` | methylated C | no | yes |
+
+**Why there is no filtering.** Under bisulfite or EM-seq, almost every CpH cytosine should read as T, so a molecule that kept them as C plainly failed to convert. Under TAPS, a C that stayed C looks exactly like an unmethylated one, so a failed molecule cannot be told apart from a hypomethylated region. The options in the two "no effect with taps / illumina-5base" help sections are still accepted, so a pipeline can switch chemistry by changing only `--chemistry`. Any of them given on the command line draws one warning. With neither `--mbias-mask` nor `--metrics-prefix`, records pass through unchanged, again with a warning.
+
+**What carries over.** M-bias is read as methylation under every chemistry, so end-repair fill-in shows up as the same dip at the start of read 2 and is masked the same way. Conversion rates in `summary.tsv` stay chemistry-neutral (the fraction of cytosines read as T), while `CpG_meth_rate`, `mbias.tsv` and the M-bias plot report methylation. Under TAPS, a molecule-level conversion failure can only be measured on a fully methylated control.
+
+**Aligning.** Use `bwa-mem3 mem --meth=taps` (note the `=`) for TAPS. Its `neutral` scoring tolerates C→T without rewarding it, and it emits methylation tags in TAPS polarity. methylsieve does not read those tags; it makes its own calls from the reference, so `--chemistry` must be set to match.
+
+**Chemistry check.** A run whose genome conversion pattern plainly belongs to the other kind of chemistry stops with an error that names the right `--chemistry`. methylsieve classifies the genome's converted fractions, with control contigs excluded:
+
+| Pattern | Rule |
+|---|---|
+| TAPS-like | CpH conversion below 5% and CpG conversion of at least 10% |
+| EM-seq-like | CpH conversion of at least 80% |
+| ambiguous | anything else; logged, never an error |
+
+The check needs 100,000 CpH and 10,000 CpG genome sites; with fewer it warns instead of stopping. An unconverted or failed library is always ambiguous: under EM-seq, conversion shrinks CpG and CpH alike, and CpG conversion can never exceed CpH conversion. Two kinds of genuine TAPS data are also ambiguous and pass unchecked: samples with under 10% CpG methylation, and genomes with over 5% CpH methylation, such as many plants. Run as `em-seq` by mistake, they look like a failed EM-seq library.
+
+**Downstream callers.** Callers that assume bisulfite polarity report the *unmethylated* fraction on TAPS data; MethylDackel's percent methylation, for example, must be read as `100 − value`. Rastair is TAPS-aware and honors base quality (`--min-baseq`, default 10), so the default mask quality of 2 removes masked bases from its calls.
+
+Illumina 5-base is handled exactly like `taps`. It has been checked on Illumina's HG002 5-Base DNA Prep demo data, whose FASTQs contain no C base calls at the final cycle. Read 1 detects methylation as C→T, so its last cycle reads as fully methylated. Trim the last two cycles of each read before aligning, for example with `chelae trim -r +T2S +T2S`.
 
 ## Examples
 

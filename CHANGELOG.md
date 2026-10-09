@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **TAPS and Illumina 5-base support** (`--chemistry`). `--chemistry` takes `em-seq` (the default), `bisulfite`, `taps` or `illumina-5base`. Under `taps` and `illumina-5base`, which convert methylated cytosines, M-bias masking and metrics work as for EM-seq, with every methylation figure read in the right polarity. There is no unconverted-read filtering, because a read from those chemistries carries nothing to test it against. The decision and unconverted-template options are still accepted so a pipeline can switch chemistry with one flag. Any given on the command line draws a warning that they have no effect. On COLO829 TAPS+ data, masking learns a 15-cycle read 2 mask. Read as retention, as an EM-seq run would, the same curve gives no mask at all.
+- **Chemistry check.** A run stops with an error when the genome's conversion pattern plainly belongs to the other kind of chemistry. TAPS-like means CpH conversion below 5% with CpG conversion of at least 10%. EM-seq-like means CpH conversion of at least 80%. Anything else is ambiguous and never stops the run, so an unconverted or failed library is never mistaken for the wrong chemistry. The check waits for 100,000 CpH and 10,000 CpG genome sites, and runs before any output is written when `--mbias-mask` is on. Smaller inputs get a warning instead.
+- **Conversion matrices for spike-in controls.** With `--metrics-prefix`, every `--control-contig` now gets its own rows in `conversion-matrix.tsv` and its own page in `conversion-matrix.pdf`, which becomes a multi-page PDF. Each control counts the sites that should convert in it: the decision contexts under `em-seq` / `bisulfite`, as in unmethylated lambda, and CpG under `taps` / `illumina-5base`, as in a CpG-methylated control. Under `em-seq` / `bisulfite` the converted/unconverted boundary is drawn on every page. Under `taps` / `illumina-5base` there is no boundary, because their under-conversion is spread across most molecules rather than concentrated in failed ones; those pages draw the `x = y` line of complete conversion instead.
+
+### Changed
+- `summary.tsv` has a new `chemistry` column after `methylsieve_version`.
+- `conversion-matrix.tsv` has new `scope` and `context` columns after `sample`, and its `decision` / `decided_by` columns are blank under `taps` / `illumina-5base`.
+- Under `em-seq` / `bisulfite`, a control row's `n_unconverted` and `frac_unconverted` in `summary.tsv` now count the control templates past the boundary, instead of always 0. Control templates are still never tagged or removed. Scripts that read its columns by position need updating.
+- The M-bias plot's y-axis is labelled "Apparent Methylation" and its title names the chemistry.
+- In `--help`, `--min-base-quality`, `--ignore-template-ends` and `--ignore-supplementary-evidence` move to a new "Tallying" section, and `--count-tag` / `--no-count-tag` move under "Decision".
+
 ## [0.2.1] - 2026-07-30
 
 ### Changed

@@ -12,6 +12,7 @@
 //! `-q` quiet.
 
 mod buffer;
+mod chemistry;
 mod mask;
 mod mbias;
 mod metrics;
@@ -32,7 +33,8 @@ use std::time::Instant;
 
 use anyhow::{Context as _, Result, bail};
 use bgzf::CompressionLevel;
-use clap::{Parser, ValueEnum};
+use clap::parser::ValueSource;
+use clap::{ArgMatches, CommandFactory, FromArgMatches, Parser, ValueEnum};
 use fgumi_raw_bam::RawRecord;
 use noodles_sam::Header;
 use noodles_sam::header::record::value::Map;
@@ -40,6 +42,7 @@ use noodles_sam::header::record::value::map::Program;
 use noodles_sam::header::record::value::map::program::tag as program_tag;
 
 use crate::buffer::TemplateArena;
+use crate::chemistry::{Chemistry, ChemistryCheck};
 use crate::mask::{MaskPlan, MaskWindows, apply_windows, compute_mask_windows};
 use crate::mbias::{DetectParams, MbiasAccumulator};
 use crate::raw_reader::RawBamReader;
@@ -50,6 +53,29 @@ use crate::sieve::{DecisionMode, Disposition, ProcessorOptions, RecordProcessor,
 
 /// Crate build identifier shown in `--version` and the `@PG VN:` tag.
 const METHYLSIEVE_BUILD: &str = env!("CARGO_PKG_VERSION");
+
+/// Flags that only shape the unconverted call, as (clap arg id, command-line
+/// spelling). They have no effect under chemistries that make no such call, and
+/// are accepted anyway so a pipeline can switch chemistry by changing one flag.
+const DECISION_FLAGS: [(&str, &str); 10] = [
+    ("contexts", "--contexts"),
+    ("mode", "--mode"),
+    ("max_unconverted_count", "--max-unconverted-count"),
+    ("max_unconverted_fraction", "--max-unconverted-fraction"),
+    ("min_sites", "--min-sites"),
+    ("tag", "--tag"),
+    ("no_qc_fail", "--no-qc-fail"),
+    ("remove_unconverted", "--remove-unconverted"),
+    ("count_tag", "--count-tag"),
+    ("no_count_tag", "--no-count-tag"),
+];
+
+/// Help heading for the options that shape the unconverted call.
+const DECISION_HEADING: &str = "Decision (no effect with taps / illumina-5base)";
+
+/// Help heading for what happens to a template called unconverted.
+const ACTIONS_HEADING: &str =
+    "Actions on unconverted templates (no effect with taps / illumina-5base)";
 
 /// Global allocator — mimalloc keeps the per-block temporary allocations that
 /// dominate the streaming worker cheap.
@@ -108,6 +134,14 @@ fn parse_compression_level(s: &str) -> Result<CompressionLevel, String> {
 pub(crate) struct ContextMask([bool; 4]);
 
 impl ContextMask {
+    /// A mask selecting only `ctx`.
+    #[must_use]
+    pub(crate) fn single(ctx: Context) -> Self {
+        let mut mask = [false; 4];
+        mask[ctx.index()] = true;
+        Self(mask)
+    }
+
     /// Whether `ctx` participates in the threshold.
     #[inline]
     #[must_use]
@@ -235,50 +269,21 @@ pub struct Args {
     #[arg(short = 'r', long = "reference", help_heading = "Inputs / outputs")]
     pub(crate) reference: PathBuf,
 
-    /// Contexts (comma-separated CpA,CpC,CpT,CpG) counted toward the
-    /// unconverted-decision threshold. The default is CpH (CpA,CpC,CpT); CpG is
-    /// excluded because genuine methylation lives there. All four contexts are
-    /// reported in the `--metrics-prefix` summary regardless of this subset.
-    #[arg(long = "contexts", default_value = "CpA,CpC,CpT", value_parser = parse_contexts,
-          help_heading = "Decision")]
-    pub(crate) contexts: ContextMask,
-
-    /// How to combine the count and proportion tests. `adaptive` (the default)
-    /// uses the proportion at/above `--min-sites` and the count below it; `count`
-    /// and `proportion` use only that one test; `either` flags when either fires.
-    /// In `proportion` mode, templates with fewer than `--min-sites` sites are
-    /// never flagged (the proportion is unestimable) — they pass through.
-    #[arg(long = "mode", value_enum, default_value_t = DecisionModeCli::Adaptive,
-          help_heading = "Decision")]
-    pub(crate) mode: DecisionModeCli,
-
-    /// Count test: a template is called unconverted when its count of
-    /// unconverted cytosines (summed over the `--contexts` subset, across all
-    /// evaluated records) is at least this value. Used by `count`, `either`, and
-    /// (below `--min-sites`) `adaptive`.
-    #[arg(long = "max-unconverted-count", default_value_t = 3, help_heading = "Decision")]
-    pub(crate) max_unconverted_count: u32,
-
-    /// Proportion test: a template is called unconverted when it has at least
-    /// `--min-sites` sites AND its unconverted fraction exceeds this value. Used
-    /// by `proportion`, `either`, and (at/above `--min-sites`) `adaptive`;
-    /// ignored by `count`. Must be in (0, 1].
-    #[arg(long = "max-unconverted-fraction", default_value_t = 0.05, help_heading = "Decision")]
-    pub(crate) max_unconverted_fraction: f64,
-
-    /// Floor for the proportion test (in `--contexts`-subset sites): below it the
-    /// proportion is unestimable and abstains. In `adaptive` this is also the
-    /// switch point — proportion at/above it, count below. The default (40) is
-    /// the smallest value that makes the `adaptive` switch continuous given
-    /// count=3 and fraction=0.05 (so a read doesn't flip its call as it crosses
-    /// the threshold).
-    #[arg(long = "min-sites", default_value_t = 40, help_heading = "Decision")]
-    pub(crate) min_sites: u32,
+    /// Library chemistry: which cytosines the conversion turns into T. `em-seq`
+    /// and `bisulfite` convert unmethylated cytosines; `taps` (TAPS and TAPS+) and
+    /// `illumina-5base` convert methylated ones. When methylated cytosines convert,
+    /// a read carries nothing to test, so no template is called unconverted: the
+    /// decision and unconverted-template options have no effect, and methylsieve
+    /// does M-bias masking and metrics only. The run stops with an error if the
+    /// genome's conversion pattern plainly belongs to the other kind of chemistry.
+    #[arg(long = "chemistry", value_enum, default_value_t = Chemistry::EmSeq,
+          help_heading = "Chemistry")]
+    pub(crate) chemistry: Chemistry,
 
     /// Skip read bases with base quality below this value when tallying. Higher
     /// values reduce sequencing-error-driven false unconverted calls but shrink
     /// the site count (so fewer templates clear `--min-sites`).
-    #[arg(long = "min-base-quality", default_value_t = 20, help_heading = "Decision")]
+    #[arg(long = "min-base-quality", default_value_t = 20, help_heading = "Tallying")]
     pub(crate) min_base_quality: u8,
 
     /// Ignore the outermost N bases at each end of the *template* (the original
@@ -293,29 +298,87 @@ pub struct Args {
     /// Superseded by `--mbias-mask`: when masking is enabled this trim is forced
     /// to 0 (both target the same fragment-end bias) and a warning is logged if a
     /// non-zero value was set explicitly.
-    #[arg(long = "ignore-template-ends", default_value_t = 0, help_heading = "Decision")]
+    #[arg(long = "ignore-template-ends", default_value_t = 0, help_heading = "Tallying")]
     pub(crate) ignore_template_ends: u32,
 
     /// Exclude supplementary alignments from conversion tallying (they still
     /// receive the tag / qc-fail flag like every other record of an unconverted
     /// template). By default supplementaries contribute evidence.
-    #[arg(long = "ignore-supplementary-evidence", help_heading = "Decision")]
+    #[arg(long = "ignore-supplementary-evidence", help_heading = "Tallying")]
     pub(crate) ignore_supplementary_evidence: bool,
+
+    /// Contexts (comma-separated CpA,CpC,CpT,CpG) counted toward the
+    /// unconverted-decision threshold. The default is CpH (CpA,CpC,CpT); CpG is
+    /// excluded because genuine methylation lives there. All four contexts are
+    /// reported in the `--metrics-prefix` summary regardless of this subset.
+    #[arg(long = "contexts", default_value = "CpA,CpC,CpT", value_parser = parse_contexts,
+          help_heading = DECISION_HEADING)]
+    pub(crate) contexts: ContextMask,
+
+    /// How to combine the count and proportion tests. `adaptive` (the default)
+    /// uses the proportion at/above `--min-sites` and the count below it; `count`
+    /// and `proportion` use only that one test; `either` flags when either fires.
+    /// In `proportion` mode, templates with fewer than `--min-sites` sites are
+    /// never flagged (the proportion is unestimable) — they pass through.
+    #[arg(long = "mode", value_enum, default_value_t = DecisionModeCli::Adaptive,
+          help_heading = DECISION_HEADING)]
+    pub(crate) mode: DecisionModeCli,
+
+    /// Count test: a template is called unconverted when its count of
+    /// unconverted cytosines (summed over the `--contexts` subset, across all
+    /// evaluated records) is at least this value. Used by `count`, `either`, and
+    /// (below `--min-sites`) `adaptive`.
+    #[arg(
+        long = "max-unconverted-count",
+        default_value_t = 3,
+        help_heading = DECISION_HEADING
+    )]
+    pub(crate) max_unconverted_count: u32,
+
+    /// Proportion test: a template is called unconverted when it has at least
+    /// `--min-sites` sites AND its unconverted fraction exceeds this value. Used
+    /// by `proportion`, `either`, and (at/above `--min-sites`) `adaptive`;
+    /// ignored by `count`. Must be in (0, 1].
+    #[arg(
+        long = "max-unconverted-fraction",
+        default_value_t = 0.05,
+        help_heading = DECISION_HEADING
+    )]
+    pub(crate) max_unconverted_fraction: f64,
+
+    /// Floor for the proportion test (in `--contexts`-subset sites): below it the
+    /// proportion is unestimable and abstains. In `adaptive` this is also the
+    /// switch point — proportion at/above it, count below. The default (40) is
+    /// the smallest value that makes the `adaptive` switch continuous given
+    /// count=3 and fraction=0.05 (so a read doesn't flip its call as it crosses
+    /// the threshold).
+    #[arg(
+        long = "min-sites",
+        default_value_t = 40,
+        help_heading = DECISION_HEADING
+    )]
+    pub(crate) min_sites: u32,
 
     /// Aux tag to set on every record of an unconverted template, as a
     /// SAM-style `TAG:Z:VALUE` spec.
     #[arg(long = "tag", default_value = "XX:Z:UC", value_parser = parse_tag_spec,
-          help_heading = "Actions on unconverted templates")]
+          help_heading = ACTIONS_HEADING)]
     pub(crate) tag: TagSpec,
 
     /// Do not OR the QC-fail flag (0x200) into unconverted records' FLAG.
     /// (QC-fail marking is on by default.)
-    #[arg(long = "no-qc-fail", help_heading = "Actions on unconverted templates")]
+    #[arg(
+        long = "no-qc-fail",
+        help_heading = ACTIONS_HEADING
+    )]
     pub(crate) no_qc_fail: bool,
 
     /// Drop every record of an unconverted template from the output entirely,
     /// instead of just tagging/flagging it.
-    #[arg(long = "remove-unconverted", help_heading = "Actions on unconverted templates")]
+    #[arg(
+        long = "remove-unconverted",
+        help_heading = ACTIONS_HEADING
+    )]
     pub(crate) remove_unconverted: bool,
 
     /// Spike-in control contig (repeatable). Reads whose primary R1 maps here
@@ -367,10 +430,11 @@ pub struct Args {
     /// per-context conversion row per scope — the genome, then each control contig
     /// — with the applied 5'/3' mask lengths as `r1_mask_5p`/`r2_mask_5p`/
     /// `se_mask_5p`/`se_mask_3p` columns), `PREFIX.mbias.tsv` (per-read-cycle
-    /// methylation), and `PREFIX.conversion-matrix.tsv` (the per-template decision
-    /// histogram), plus PDF plots `PREFIX.mbias.pdf` (M-bias curves) and
-    /// `PREFIX.conversion-matrix.pdf` (the decision hexbin). Computing these is a
-    /// single streaming pass; the output BAM is unchanged.
+    /// methylation), and `PREFIX.conversion-matrix.tsv` (per-template conversion
+    /// histograms for the genome and each control), plus PDF plots
+    /// `PREFIX.mbias.pdf` (M-bias curves) and `PREFIX.conversion-matrix.pdf` (one
+    /// hexbin page per scope). Computing these is a single streaming pass; the
+    /// output BAM is unchanged.
     #[arg(long = "metrics-prefix", help_heading = "Stats & misc")]
     pub(crate) metrics_prefix: Option<PathBuf>,
 
@@ -388,11 +452,11 @@ pub struct Args {
     /// On by default with tag `ch`; pass a name to rename, or `--no-count-tag`
     /// to disable.
     #[arg(long = "count-tag", value_parser = parse_tag_name, default_value = "ch",
-          conflicts_with = "no_count_tag", help_heading = "Stats & misc")]
+          conflicts_with = "no_count_tag", help_heading = DECISION_HEADING)]
     pub(crate) count_tag: [u8; 2],
 
     /// Disable the per-record count annotation (see `--count-tag`).
-    #[arg(long = "no-count-tag", help_heading = "Stats & misc")]
+    #[arg(long = "no-count-tag", help_heading = DECISION_HEADING)]
     pub(crate) no_count_tag: bool,
 
     /// Output fewer statistics.
@@ -418,12 +482,15 @@ pub struct Args {
     pub(crate) write_buffer_mb: u32,
 }
 
-const SHORT_ABOUT: &str = "Tag or filter unconverted reads in bisulfite / EM-seq SAM/BAM files.";
+const SHORT_ABOUT: &str = "Tag or filter unconverted reads in bisulfite / EM-seq SAM/BAM files, \
+and mask M-bias in bisulfite, EM-seq, TAPS and Illumina 5-base data.";
 const LONG_ABOUT: &str = "Tag or filter incompletely-converted reads in directional bisulfite or \
 EM-seq data.\n\
 Makes one per-template decision using all of a QNAME's primary and supplementary records \
 and propagates it to every record; with --metrics-prefix it also writes per-context / \
 per-spike-in conversion and M-bias metrics. \
+With --chemistry taps or illumina-5base, where methylated cytosines convert, no read can be \
+called unconverted, so methylsieve does M-bias masking and metrics only. \
 Input must be query-grouped and should be adapter-trimmed first: untrimmed adapter \
 read-through on short inserts can be force-aligned and read as spurious unconverted CpH. \
 Output is always BAM.";
@@ -504,8 +571,10 @@ fn main() -> ExitCode {
         .format_timestamp(None)
         .init();
 
-    let args = Args::parse();
-    match run(args) {
+    let matches = Args::command().get_matches();
+    let args = Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let explicit_decision_flags = explicit_flags(&matches, &DECISION_FLAGS);
+    match run(args, &explicit_decision_flags) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("methylsieve: {err:#}");
@@ -513,6 +582,17 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The command-line spellings of those `flags` the user actually typed, as
+/// opposed to ones left at their defaults. `flags` pairs each clap arg id with
+/// its spelling.
+fn explicit_flags(matches: &ArgMatches, flags: &[(&str, &'static str)]) -> Vec<&'static str> {
+    flags
+        .iter()
+        .filter(|(id, _)| matches.value_source(id) == Some(ValueSource::CommandLine))
+        .map(|&(_, flag)| flag)
+        .collect()
 }
 
 // ── Run orchestration ───────────────────────────────────────────────────────
@@ -562,17 +642,25 @@ impl Reader {
     }
 }
 
-/// Main entry point used by both the binary and the test harness.
+/// Run methylsieve end to end. `explicit_decision_flags` are the
+/// [`DECISION_FLAGS`] given on the command line, warned about when the chemistry
+/// makes no unconverted call.
 ///
 /// # Errors
 /// Returns an error on IO failure, malformed input, a missing/mismatched
-/// reference contig, or an unknown `--control-contig`.
-fn run(args: Args) -> Result<()> {
+/// reference contig, an unknown `--control-contig`, or data whose conversion
+/// pattern contradicts `--chemistry`.
+fn run(args: Args, explicit_decision_flags: &[&str]) -> Result<()> {
     log::info!("methylsieve by Fulcrum Genomics - https://github.com/fulcrumgenomics/methylsieve");
     args.validate()?;
     let started = StartedRun::now();
     if !args.quiet {
         eprintln!("methylsieve: Version {METHYLSIEVE_BUILD}");
+    }
+    let readout = args.chemistry.readout();
+    let calls_unconverted = readout.calls_unconverted();
+    if !calls_unconverted {
+        warn_no_unconverted_call(&args, explicit_decision_flags);
     }
 
     // Input goes through a dedicated IO read thread + ring buffer so the worker
@@ -682,11 +770,13 @@ fn run(args: Args) -> Result<()> {
         ignore_template_ends,
         ignore_supplementary_evidence: args.ignore_supplementary_evidence,
         tag: args.tag.clone(),
-        count_tag: args.effective_count_tag(),
+        count_tag: if calls_unconverted { args.effective_count_tag() } else { None },
         qc_fail: args.qc_fail(),
         remove_unconverted: args.remove_unconverted,
         scope_of_tid,
         record_matrix: args.metrics_prefix.is_some(),
+        control_contexts: control_contexts(&args),
+        call_unconverted: calls_unconverted,
     };
     let processor = RecordProcessor::new(reference, opts);
     let mut stats = Stats::new(&control_names);
@@ -695,7 +785,8 @@ fn run(args: Args) -> Result<()> {
     // requested; otherwise it stays `None` and the decision path is untouched —
     // no per-cycle bookkeeping, no measurable overhead.
     let want_mbias = args.metrics_prefix.is_some() || args.mbias_mask;
-    let mut mbias_acc = want_mbias.then(MbiasAccumulator::new);
+    let mut mbias_acc = want_mbias.then(|| MbiasAccumulator::new(readout));
+    let mut check = ChemistryCheck::new(args.chemistry);
     let detect = DetectParams {
         plateau_fraction: args.mbias_plateau_fraction,
         max_mask: args.mbias_max_mask as usize,
@@ -716,6 +807,7 @@ fn run(args: Args) -> Result<()> {
             &mut stats,
             mbias_acc.as_mut().expect("masking enables the accumulator"),
             &mut out,
+            &mut check,
             MaskingRun {
                 detect,
                 buffer_templates: args.mbias_buffer_templates,
@@ -733,11 +825,15 @@ fn run(args: Args) -> Result<()> {
             {
                 write_block(block, &mut out)?;
             }
+            if check.is_pending() {
+                check.check_if_ready(&stats.genome.counters.conversion_counts())?;
+            }
             Ok(())
         })
         .context("processing record block")?;
         None
     };
+    check.finish(&stats.genome.counters.conversion_counts());
 
     print_run_stats(&stats, &args);
     warn_proportion_blind_spot(&stats, &args);
@@ -746,6 +842,7 @@ fn run(args: Args) -> Result<()> {
         let mbias = mbias_acc.as_ref().expect("mbias accumulator present when metrics requested");
         crate::metrics::write_all(
             prefix,
+            args.chemistry,
             &stats,
             mbias,
             applied_plan.as_ref(),
@@ -753,6 +850,7 @@ fn run(args: Args) -> Result<()> {
             args.sample.as_deref(),
             args.input.as_deref(),
             &args.contexts.label(),
+            &control_contexts(&args).label(),
             |unconv, monitored| processor.classify(unconv, monitored),
         )
         .context("writing metric TSVs and plots")?;
@@ -761,6 +859,18 @@ fn run(args: Args) -> Result<()> {
     out.finish().context("finishing main output")?;
     report(&started, stats.total_templates, args.quiet);
     Ok(())
+}
+
+/// Contexts a spike-in control's conversion matrix counts: those that should
+/// convert in the control the chemistry is judged by. Bisulfite/EM-seq convert
+/// unmethylated cytosines, judged on an unmethylated control at the decision
+/// contexts; TAPS/5-base convert methylated ones, judged on a CpG-methylated one.
+fn control_contexts(args: &Args) -> ContextMask {
+    if args.chemistry.readout().calls_unconverted() {
+        args.contexts
+    } else {
+        ContextMask::single(Context::CpG)
+    }
 }
 
 /// Resolve `--control-contig` names against the header into a per-tid scope map
@@ -902,6 +1012,11 @@ fn mask_and_process(
 /// then the streamed remainder — mask it, tally/decide/stamp on the masked
 /// result, and emit. If the file ends before the target, the whole file was
 /// buffered — drain it.
+///
+/// The chemistry check runs at the freeze, on the learn-phase M-bias counts, so a
+/// mislabelled library stops before anything is written. If those counts are
+/// too sparse it keeps trying on the post-mask tallies as templates stream.
+#[allow(clippy::too_many_arguments)] // the run's shared state; bundling it would not aid clarity
 fn run_masking(
     reader: &mut Reader,
     pool: &mut Vec<RawRecord>,
@@ -909,6 +1024,7 @@ fn run_masking(
     stats: &mut Stats,
     mbias: &mut MbiasAccumulator,
     out: &mut RawBamWriter,
+    check: &mut ChemistryCheck,
     cfg: MaskingRun,
 ) -> Result<Option<MaskPlan>> {
     let mut arena = TemplateArena::with_target(cfg.buffer_templates);
@@ -933,6 +1049,9 @@ fn run_masking(
                 if disp == Disposition::Keep {
                     write_block(block, out)?;
                 }
+                if check.is_pending() {
+                    check.check_if_ready(&stats.genome.counters.conversion_counts())?;
+                }
                 Ok(())
             }
             // Learn phase: accumulate M-bias (pre-mask) only and buffer the raw
@@ -944,6 +1063,7 @@ fn run_masking(
                 if buffered && !arena.is_full() {
                     return Ok(());
                 }
+                check.check_if_ready(&mbias.conversion_counts())?;
                 let frozen = MaskPlan::learn(mbias, cfg.detect, cfg.mask_quality);
                 drain_masked(&arena, processor, stats, &frozen, &cfg, out)?;
                 if !buffered {
@@ -971,6 +1091,7 @@ fn run_masking(
     // The file ended while still learning (fewer than the target): the entire
     // input is buffered and undrained — freeze on what we have and emit it.
     if plan.is_none() {
+        check.check_if_ready(&mbias.conversion_counts())?;
         let frozen = MaskPlan::learn(mbias, cfg.detect, cfg.mask_quality);
         drain_masked(&arena, processor, stats, &frozen, &cfg, out)?;
         plan = Some(frozen);
@@ -1068,12 +1189,31 @@ fn print_run_stats(stats: &Stats, args: &Args) {
         return;
     }
     let g = &stats.genome;
-    let verb = if args.remove_unconverted { "Removed" } else { "Tagged " };
-    let frac = if g.n_evaluated > 0 { g.n_unconverted as f64 / g.n_evaluated as f64 } else { 0.0 };
-    eprintln!(
-        "methylsieve: {} {:>10} of {:>10} (frac {:.5}) evaluated genome templates as unconverted.",
-        verb, g.n_unconverted, g.n_evaluated, frac
-    );
+    let readout = args.chemistry.readout();
+    if readout.calls_unconverted() {
+        let verb = if args.remove_unconverted { "Removed" } else { "Tagged " };
+        let frac =
+            if g.n_evaluated > 0 { g.n_unconverted as f64 / g.n_evaluated as f64 } else { 0.0 };
+        eprintln!(
+            "methylsieve: {} {:>10} of {:>10} (frac {:.5}) evaluated genome templates as \
+             unconverted.",
+            verb, g.n_unconverted, g.n_evaluated, frac
+        );
+    } else {
+        let c = &g.counters;
+        let cpg_total = c.total_for(Context::CpG);
+        let cpg_meth = readout.methylated(c.unconv_for(Context::CpG), cpg_total);
+        let cph = [Context::CpA, Context::CpC, Context::CpT];
+        let cph_total: u64 = cph.iter().map(|&x| c.total_for(x)).sum();
+        let cph_retained: u64 = cph.iter().map(|&x| c.unconv_for(x)).sum();
+        let rate = |n: u64, d: u64| if d > 0 { n as f64 / d as f64 } else { 0.0 };
+        eprintln!(
+            "methylsieve: Genome CpG apparent methylation {:.5} over {cpg_total} sites; CpH \
+             conversion {:.5} over {cph_total} sites.",
+            rate(cpg_meth, cpg_total),
+            rate(cph_total - cph_retained, cph_total),
+        );
+    }
     if stats.unmapped_templates > 0 || stats.zero_site_templates > 0 {
         eprintln!(
             "methylsieve: {} templates had no mapped primary; {} produced no monitored sites.",
@@ -1086,7 +1226,10 @@ fn print_run_stats(stats: &Stats, args: &Args) {
 /// can't be evaluated by the proportion test and pass through unflagged. Other
 /// modes cover those templates with the count test, so no warning is needed.
 fn warn_proportion_blind_spot(stats: &Stats, args: &Args) {
-    if args.quiet || args.mode != DecisionModeCli::Proportion {
+    if args.quiet
+        || args.mode != DecisionModeCli::Proportion
+        || !args.chemistry.readout().calls_unconverted()
+    {
         return;
     }
     if stats.below_min_sites_templates > 0 {
@@ -1095,6 +1238,27 @@ fn warn_proportion_blind_spot(stats: &Stats, args: &Args) {
              were NOT evaluated (passed through). Use --mode adaptive or either to catch them \
              with the count test.",
             stats.below_min_sites_templates, args.min_sites
+        );
+    }
+}
+
+/// Warn about what a chemistry with no unconverted call does with the options
+/// given: decision flags that were typed have no effect, and with neither
+/// masking nor metrics there is nothing to do.
+fn warn_no_unconverted_call(args: &Args, explicit_decision_flags: &[&str]) {
+    let name = args.chemistry.name();
+    if !explicit_decision_flags.is_empty() {
+        log::warn!(
+            "{} {} no effect with --chemistry {name}: it converts methylated cytosines, so no \
+             template is called unconverted.",
+            explicit_decision_flags.join(", "),
+            if explicit_decision_flags.len() == 1 { "has" } else { "have" },
+        );
+    }
+    if !args.mbias_mask && args.metrics_prefix.is_none() {
+        log::warn!(
+            "--chemistry {name} without --mbias-mask or --metrics-prefix: records pass through \
+             unchanged."
         );
     }
 }
@@ -1245,12 +1409,46 @@ mod tests {
         assert!(a.validate().is_ok());
     }
 
+    #[test]
+    fn explicit_flags_reports_only_typed_decision_flags() {
+        let matches = Args::command()
+            .try_get_matches_from([
+                "methylsieve",
+                "-r",
+                "ref.fa",
+                "--remove-unconverted",
+                "--mode",
+                "count",
+            ])
+            .unwrap();
+        assert_eq!(explicit_flags(&matches, &DECISION_FLAGS), ["--mode", "--remove-unconverted"]);
+    }
+
+    #[test]
+    fn explicit_flags_ignores_defaults() {
+        let matches =
+            Args::command().try_get_matches_from(["methylsieve", "-r", "ref.fa"]).unwrap();
+        assert!(explicit_flags(&matches, &DECISION_FLAGS).is_empty());
+    }
+
+    #[test]
+    fn decision_flag_ids_name_real_args() {
+        // A typo in an id would silently never warn; clap knows every real id.
+        let cmd = Args::command();
+        for (id, flag) in DECISION_FLAGS {
+            let arg = cmd.get_arguments().find(|a| a.get_id() == id);
+            let arg = arg.unwrap_or_else(|| panic!("no arg with id {id}"));
+            assert_eq!(format!("--{}", arg.get_long().unwrap()), flag);
+        }
+    }
+
     fn minimal_args() -> Args {
         Args {
             input: None,
             output: None,
             compression_level: CompressionLevel::new(0).unwrap(),
             reference: PathBuf::from("ref.fa"),
+            chemistry: Chemistry::EmSeq,
             contexts: parse_contexts("CpA,CpC,CpT").unwrap(),
             mode: DecisionModeCli::Adaptive,
             max_unconverted_count: 3,

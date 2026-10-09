@@ -10,12 +10,16 @@
 //! Counts are bucketed by `(read role, read end, context, cycle)`. Each site is
 //! classified with methylsieve's own reference-based call (the same one the
 //! tally uses), so a learned mask stays consistent with what the tally excludes.
+//! The counts are chemistry-neutral (retained vs. total); the accumulator's
+//! [`Readout`] turns them into methylation, so the detector, `mbias.tsv` and the
+//! plot all work in methylation space under every chemistry.
 //!
 //! The accumulator is reached as an `Option<&mut MbiasAccumulator>` threaded
 //! through `process_block` and fed from the fused reference walk (`fused_walk`)
 //! in [`crate::sieve`]. It is present only when M-bias output or masking is
 //! enabled, so the default fast path pays nothing.
 
+use crate::chemistry::{ConversionCounts, Readout};
 use crate::reference::Context;
 
 /// Number of `(role, end, context)` cells: 3 roles × 2 ends × 4 contexts.
@@ -96,20 +100,20 @@ impl ReadEnd {
     }
 }
 
-/// Methylated / total cytosine counts at one cycle of one (role, end, context).
+/// Retained / total cytosine counts at one cycle of one (role, end, context).
 #[derive(Clone, Copy, Default, Debug)]
 pub(crate) struct CycleCounts {
-    /// Methylated (unconverted) calls at this cycle.
-    meth: u64,
+    /// Calls that still read as C (ref C read as C, or ref G read as G).
+    retained: u64,
     /// Total monitored & called cytosines at this cycle.
     total: u64,
 }
 
 impl CycleCounts {
-    /// Methylated (unconverted) call count.
+    /// Methylated call count under `readout`.
     #[must_use]
-    pub(crate) fn meth(self) -> u64 {
-        self.meth
+    pub(crate) fn methylated(self, readout: Readout) -> u64 {
+        readout.methylated(self.retained, self.total)
     }
 
     /// Total monitored & called count.
@@ -118,10 +122,10 @@ impl CycleCounts {
         self.total
     }
 
-    /// Methylation fraction, or `None` when no calls were seen.
+    /// Methylation fraction under `readout`, or `None` when no calls were seen.
     #[must_use]
-    pub(crate) fn frac(self) -> Option<f64> {
-        (self.total > 0).then(|| self.meth as f64 / self.total as f64)
+    pub(crate) fn frac_methylated(self, readout: Readout) -> Option<f64> {
+        (self.total > 0).then(|| self.methylated(readout) as f64 / self.total as f64)
     }
 }
 
@@ -145,13 +149,21 @@ pub(crate) struct MbiasAccumulator {
     data: Vec<CycleCounts>,
     /// Cycles allocated per slot. All slots share one stride for O(1) indexing.
     stride: usize,
+    /// How the library's chemistry turns retained/converted calls into methylation.
+    readout: Readout,
 }
 
 impl MbiasAccumulator {
-    /// An empty accumulator.
+    /// An empty accumulator whose counts are read as methylation under `readout`.
     #[must_use]
-    pub(crate) fn new() -> Self {
-        Self { data: Vec::new(), stride: 0 }
+    pub(crate) fn new(readout: Readout) -> Self {
+        Self { data: Vec::new(), stride: 0, readout }
+    }
+
+    /// How these counts are read as methylation.
+    #[must_use]
+    pub(crate) fn readout(&self) -> Readout {
+        self.readout
     }
 
     /// Dense slot for a `(role, end, context)` triple.
@@ -181,7 +193,8 @@ impl MbiasAccumulator {
         self.stride = new_stride;
     }
 
-    /// Record one classified site at `cycle` (distance from `end`).
+    /// Record one classified site at `cycle` (distance from `end`); `retained` is
+    /// whether it still reads as C.
     #[inline]
     pub(crate) fn record(
         &mut self,
@@ -189,7 +202,7 @@ impl MbiasAccumulator {
         end: ReadEnd,
         ctx: Context,
         cycle: usize,
-        unconverted: bool,
+        retained: bool,
     ) {
         if cycle >= self.stride {
             if cycle > MAX_CYCLE {
@@ -199,7 +212,7 @@ impl MbiasAccumulator {
         }
         let cell = &mut self.data[Self::slot(role, end, ctx) * self.stride + cycle];
         cell.total += 1;
-        cell.meth += u64::from(unconverted);
+        cell.retained += u64::from(retained);
     }
 
     /// Per-cycle counts for a `(role, end, context)`, oldest→newest cycle. The
@@ -222,11 +235,21 @@ impl MbiasAccumulator {
     pub(crate) fn has_data(&self, role: ReadRole, end: ReadEnd) -> bool {
         Context::ALL.iter().any(|&c| !self.cycles(role, end, c).is_empty())
     }
-}
 
-impl Default for MbiasAccumulator {
-    fn default() -> Self {
-        Self::new()
+    /// Per-context totals over every recorded site, for the chemistry check. Sums
+    /// the 5' cells only: every site is recorded once from the 5' end, and
+    /// single-end sites are recorded a second time from the 3' end.
+    #[must_use]
+    pub(crate) fn conversion_counts(&self) -> ConversionCounts {
+        let mut counts = ConversionCounts::default();
+        for role in ReadRole::ALL {
+            for ctx in Context::ALL {
+                for cc in self.cycles(role, ReadEnd::FivePrime, ctx) {
+                    counts.add(ctx, cc.retained, cc.total);
+                }
+            }
+        }
+        counts
     }
 }
 
@@ -301,17 +324,22 @@ pub(crate) fn detect_mask_length(
     detect_mask(acc, role, end, p).0
 }
 
-/// Per-cycle CpG methylation rates for `(role, end)`: `meth / total` where
-/// coverage is adequate, `NaN` for cycles below `min_cycle_cov` (so sparse
-/// cycles don't drive the decision).
+/// Per-cycle CpG methylation rates for `(role, end)` where coverage is adequate,
+/// `NaN` for cycles below `min_cycle_cov` (so sparse cycles don't drive the
+/// decision). Read through the accumulator's [`Readout`]: end-repair fill-in
+/// lowers *methylation* at the read start under every chemistry, but under TAPS
+/// it *raises* retention, so the detector must never see raw retention.
 fn cpg_rates(acc: &MbiasAccumulator, role: ReadRole, end: ReadEnd, min_cycle_cov: u64) -> Vec<f64> {
+    let readout = acc.readout();
     acc.cycles(role, end, Context::CpG)
         .iter()
-        .map(
-            |cc| {
-                if cc.total >= min_cycle_cov { cc.meth as f64 / cc.total as f64 } else { f64::NAN }
-            },
-        )
+        .map(|cc| {
+            if cc.total >= min_cycle_cov {
+                cc.methylated(readout) as f64 / cc.total as f64
+            } else {
+                f64::NAN
+            }
+        })
         .collect()
 }
 
@@ -361,17 +389,24 @@ fn moving_average(rates: &[f64], w: usize) -> Vec<f64> {
 mod tests {
     use super::*;
 
-    /// Fill a CpG 5' curve for `role` from an explicit per-cycle (meth, total)
-    /// list, starting at cycle 0.
+    /// Fill a CpG 5' curve for `role` from an explicit per-cycle (methylated,
+    /// total) list, starting at cycle 0, recording each call as retained or
+    /// converted according to the accumulator's readout.
     fn fill_cpg_5p(acc: &mut MbiasAccumulator, role: ReadRole, per_cycle: &[(u64, u64)]) {
+        let methylated_is_retained = acc.readout() == Readout::UnmethylatedConverts;
         for (cycle, &(meth, total)) in per_cycle.iter().enumerate() {
             for _ in 0..meth {
-                acc.record(role, ReadEnd::FivePrime, Context::CpG, cycle, true);
+                acc.record(role, ReadEnd::FivePrime, Context::CpG, cycle, methylated_is_retained);
             }
             for _ in 0..(total - meth) {
-                acc.record(role, ReadEnd::FivePrime, Context::CpG, cycle, false);
+                acc.record(role, ReadEnd::FivePrime, Context::CpG, cycle, !methylated_is_retained);
             }
         }
+    }
+
+    /// An em-seq accumulator (retained cytosines are methylated).
+    fn emseq() -> MbiasAccumulator {
+        MbiasAccumulator::new(Readout::UnmethylatedConverts)
     }
 
     /// A flat plateau of `n` cycles at rate `p` (cov 1000/cycle).
@@ -384,7 +419,7 @@ mod tests {
         // Cycles 0..3 are depressed (end-repair fill-in), then a flat 0.75
         // plateau. With fraction 0.90, threshold = 0.675; cycle 4 (0.75) is the
         // first to clear it → mask the 4 leading cycles.
-        let mut acc = MbiasAccumulator::new();
+        let mut acc = emseq();
         let mut curve = vec![(100, 1000), (300, 1000), (500, 1000), (640, 1000)];
         curve.extend(plateau_curve(40, 0.75));
         fill_cpg_5p(&mut acc, ReadRole::R2, &curve);
@@ -394,7 +429,7 @@ mod tests {
 
     #[test]
     fn already_at_plateau_masks_nothing() {
-        let mut acc = MbiasAccumulator::new();
+        let mut acc = emseq();
         fill_cpg_5p(&mut acc, ReadRole::R1, &plateau_curve(40, 0.72));
         let k = detect_mask_length(&acc, ReadRole::R1, ReadEnd::FivePrime, DetectParams::default());
         assert_eq!(k, 0);
@@ -405,7 +440,7 @@ mod tests {
         // Ramp ends by cycle 3, but cycle 20 has a single-cycle dip well below
         // threshold. First-crossing semantics ignore it (a last-deviation rule
         // would wrongly mask 20+).
-        let mut acc = MbiasAccumulator::new();
+        let mut acc = emseq();
         let mut curve = vec![(200, 1000), (400, 1000), (600, 1000)];
         curve.extend(plateau_curve(40, 0.75));
         curve[20] = (300, 1000); // interior dip to 0.30
@@ -416,7 +451,7 @@ mod tests {
 
     #[test]
     fn no_data_masks_nothing() {
-        let acc = MbiasAccumulator::new();
+        let acc = emseq();
         assert_eq!(
             detect_mask_length(&acc, ReadRole::Se, ReadEnd::ThreePrime, DetectParams::default()),
             0
@@ -428,7 +463,7 @@ mod tests {
         // A curve that rises so slowly it never reaches 90% of the plateau within
         // the cap → mask exactly max_mask. Cycles 0..35 ramp 0.00→0.34 (still well
         // below the ~0.70 plateau at 0.90× = 0.63), so no cycle ≤ cap clears it.
-        let mut acc = MbiasAccumulator::new();
+        let mut acc = emseq();
         let curve: Vec<(u64, u64)> =
             (0..50).map(|c| if c < 35 { (10 * c as u64, 1000) } else { (700, 1000) }).collect();
         fill_cpg_5p(&mut acc, ReadRole::R2, &curve);
@@ -439,15 +474,69 @@ mod tests {
 
     #[test]
     fn record_and_cycles_roundtrip() {
-        let mut acc = MbiasAccumulator::new();
+        let mut acc = emseq();
         acc.record(ReadRole::R1, ReadEnd::FivePrime, Context::CpG, 5, true);
         acc.record(ReadRole::R1, ReadEnd::FivePrime, Context::CpG, 5, false);
         let cy = acc.cycles(ReadRole::R1, ReadEnd::FivePrime, Context::CpG);
         assert_eq!(cy.len(), 6);
-        assert_eq!(cy[5].meth, 1);
+        assert_eq!(cy[5].methylated(Readout::UnmethylatedConverts), 1);
         assert_eq!(cy[5].total, 2);
-        assert_eq!(cy[5].frac(), Some(0.5));
+        assert_eq!(cy[5].frac_methylated(Readout::UnmethylatedConverts), Some(0.5));
         assert!(acc.has_data(ReadRole::R1, ReadEnd::FivePrime));
         assert!(!acc.has_data(ReadRole::R2, ReadEnd::FivePrime));
+    }
+
+    #[test]
+    fn taps_counts_converted_cpgs_as_methylated() {
+        let mut acc = MbiasAccumulator::new(Readout::MethylatedConverts);
+        acc.record(ReadRole::R1, ReadEnd::FivePrime, Context::CpG, 0, false);
+        acc.record(ReadRole::R1, ReadEnd::FivePrime, Context::CpG, 0, false);
+        acc.record(ReadRole::R1, ReadEnd::FivePrime, Context::CpG, 0, true);
+        let cc = acc.cycles(ReadRole::R1, ReadEnd::FivePrime, Context::CpG)[0];
+        assert_eq!(cc.methylated(acc.readout()), 2);
+    }
+
+    #[test]
+    fn taps_detects_mask_when_fill_in_bases_are_retained() {
+        // Under TAPS, end-repair fill-in leaves the first cycles retained (read as
+        // C, so unmethylated). The methylation ramp from the em-seq ramp test must
+        // give the same mask, even though retention *falls* along it here.
+        let mut acc = MbiasAccumulator::new(Readout::MethylatedConverts);
+        let mut curve = vec![(100, 1000), (300, 1000), (500, 1000), (640, 1000)];
+        curve.extend(plateau_curve(40, 0.75));
+        fill_cpg_5p(&mut acc, ReadRole::R2, &curve);
+        let k = detect_mask_length(&acc, ReadRole::R2, ReadEnd::FivePrime, DetectParams::default());
+        assert_eq!(k, 4);
+    }
+
+    #[test]
+    fn emseq_and_taps_detect_same_mask_on_mirrored_curves() {
+        // One set of per-cycle calls, read under both chemistries: the em-seq
+        // reading has a methylation dip at the start, the TAPS reading of the
+        // mirrored calls has the identical dip, so both must mask the same cycles.
+        let mut curve = vec![(50, 1000), (200, 1000), (450, 1000), (600, 1000), (660, 1000)];
+        curve.extend(plateau_curve(40, 0.70));
+        let mut em = emseq();
+        let mut taps = MbiasAccumulator::new(Readout::MethylatedConverts);
+        fill_cpg_5p(&mut em, ReadRole::R2, &curve);
+        fill_cpg_5p(&mut taps, ReadRole::R2, &curve);
+        let p = DetectParams::default();
+        assert_eq!(
+            detect_mask_length(&em, ReadRole::R2, ReadEnd::FivePrime, p),
+            detect_mask_length(&taps, ReadRole::R2, ReadEnd::FivePrime, p)
+        );
+    }
+
+    #[test]
+    fn conversion_counts_count_single_end_sites_once() {
+        // Single-end sites are recorded from both ends; the totals must not double them.
+        let mut acc = emseq();
+        acc.record(ReadRole::Se, ReadEnd::FivePrime, Context::CpA, 0, false);
+        acc.record(ReadRole::Se, ReadEnd::ThreePrime, Context::CpA, 9, false);
+        acc.record(ReadRole::R1, ReadEnd::FivePrime, Context::CpG, 0, true);
+        let mut expected = ConversionCounts::default();
+        expected.add(Context::CpA, 0, 1);
+        expected.add(Context::CpG, 1, 1);
+        assert_eq!(acc.conversion_counts(), expected);
     }
 }
