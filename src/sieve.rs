@@ -20,7 +20,9 @@
 //!    aggregated counts and propagate it — tag and/or QC-fail flag — to *every*
 //!    record of the template (including secondaries/supplementaries), or drop
 //!    them all with `--remove-unconverted`. Control templates are passed through
-//!    untouched but still tallied into their own stats scope.
+//!    untouched but still tallied into their own stats scope. Chemistries that
+//!    convert methylated cytosines skip this step: every template is tallied and
+//!    passed through.
 
 use std::collections::BTreeMap;
 
@@ -28,6 +30,7 @@ use anyhow::Result;
 use fgumi_raw_bam::RawRecord;
 use smallvec::SmallVec;
 
+use crate::chemistry::ConversionCounts;
 use crate::mask::MaskWindows;
 use crate::mbias::{MbiasAccumulator, ReadEnd, ReadRole};
 use crate::record::{
@@ -224,7 +227,8 @@ impl RecordProcessor {
 
         match scope_idx {
             Some(ci) => {
-                // Control template: tally, never decide, never tag.
+                // Control template: tallied, and judged against the boundary for
+                // its metrics, but never tagged or dropped.
                 let scope = &mut stats.controls[ci];
                 scope.n_templates += 1;
                 if monitored > 0 {
@@ -232,6 +236,16 @@ impl RecordProcessor {
                 }
                 scope.n_mapped += 1;
                 scope.counters.add(&counters);
+                let (unconv, checked) = (
+                    counters.unconv_in(self.opts.control_contexts),
+                    counters.total_in(self.opts.control_contexts),
+                );
+                if self.opts.record_matrix {
+                    *scope.conversion_matrix.entry((checked, unconv)).or_insert(0) += 1;
+                }
+                if self.opts.call_unconverted && self.classify(unconv, checked).0 {
+                    scope.n_unconverted += 1;
+                }
                 self.stamp(block, Action::PassThrough, counts);
                 Ok(Disposition::Keep)
             }
@@ -240,11 +254,11 @@ impl RecordProcessor {
                 stats.genome.n_templates += 1;
                 stats.genome.n_mapped += 1;
                 stats.genome.counters.add(&counters);
-                if self.opts.record_matrix {
+                if self.opts.record_matrix && self.opts.call_unconverted {
                     // Histogram cell keyed by (checked, unconverted) over the
                     // decision contexts; the decision/decided_by are replayed
                     // per cell at output time via `classify`.
-                    *stats.conversion_matrix.entry((counts.1, counts.0)).or_insert(0) += 1;
+                    *stats.genome.conversion_matrix.entry((counts.1, counts.0)).or_insert(0) += 1;
                 }
                 if saw_control_supp {
                     stats.chimeric_to_control_templates += 1;
@@ -259,6 +273,9 @@ impl RecordProcessor {
                     if counts.1 > 0 && counts.1 < u64::from(self.opts.min_sites) {
                         stats.below_min_sites_templates += 1;
                     }
+                }
+                if !self.opts.call_unconverted {
+                    return Ok(Disposition::Keep);
                 }
 
                 let unconverted = self.decide(&counters);
@@ -912,10 +929,20 @@ pub(crate) struct ProcessorOptions {
     pub(crate) remove_unconverted: bool,
     /// Scope per BAM tid: `None` → genome, `Some(i)` → `controls[i]`.
     pub(crate) scope_of_tid: Vec<Option<usize>>,
-    /// Accumulate the per-`(checked, unconverted)` decision histogram for the
-    /// `conversion-matrix.tsv` output (under `--metrics-prefix`). Off by default
-    /// to avoid per-template map cost.
+    /// Accumulate the per-`(checked, unconverted)` template histograms for the
+    /// `conversion-matrix.tsv` output (under `--metrics-prefix`): the genome's when
+    /// the unconverted call is made, and every control's. Off by default to avoid
+    /// per-template map cost.
     pub(crate) record_matrix: bool,
+    /// Contexts a control template's matrix cell and boundary verdict are counted
+    /// over: the sites expected to convert in an unmethylated control under
+    /// bisulfite/EM-seq (`contexts`), and in a CpG-methylated control under
+    /// TAPS/5-base (CpG).
+    pub(crate) control_contexts: ContextMask,
+    /// Make the per-template unconverted call. Off when the chemistry converts
+    /// methylated cytosines (see [`crate::chemistry::Readout::calls_unconverted`]):
+    /// templates are then tallied for metrics and always kept unmodified.
+    pub(crate) call_unconverted: bool,
 }
 
 /// What to do with a template's records on emit.
@@ -1034,12 +1061,6 @@ pub(crate) struct Stats {
     pub(crate) below_min_sites_templates: u64,
     /// Total templates processed.
     pub(crate) total_templates: u64,
-    /// Genome decision histogram keyed by `(checked_sites, unconverted_sites)`
-    /// over the threshold contexts → template count. Populated only when
-    /// `record_matrix` is set (drives the `conversion-matrix.tsv` output under
-    /// `--metrics-prefix`). Note the key stores *unconverted* sites; the TSV emits
-    /// the complementary `converted_sites` (= checked − unconverted) for readers.
-    pub(crate) conversion_matrix: BTreeMap<(u64, u64), u64>,
 }
 
 impl Stats {
@@ -1054,7 +1075,6 @@ impl Stats {
             zero_site_templates: 0,
             below_min_sites_templates: 0,
             total_templates: 0,
-            conversion_matrix: BTreeMap::new(),
         }
     }
 }
@@ -1070,12 +1090,19 @@ pub(crate) struct ScopeStats {
     pub(crate) n_mapped: u64,
     /// Templates that produced at least one monitored site (in any context).
     pub(crate) n_evaluated: u64,
-    /// Templates decided unconverted (always 0 for control scopes).
+    /// Templates decided unconverted. For a control scope, those past the
+    /// boundary, which are counted but never tagged.
     pub(crate) n_unconverted: u64,
     /// Unconverted templates dropped under `--remove-unconverted`.
     pub(crate) n_removed: u64,
     /// Aggregated per-context tallies across the scope.
     pub(crate) counters: PerContextCounters,
+    /// Template histogram keyed by `(checked_sites, unconverted_sites)` over the
+    /// scope's matrix contexts → template count. Populated only when
+    /// `record_matrix` is set (drives `conversion-matrix.tsv` under
+    /// `--metrics-prefix`). The key stores *unconverted* sites; the TSV emits the
+    /// complementary `converted_sites` (= checked − unconverted) for readers.
+    pub(crate) conversion_matrix: BTreeMap<(u64, u64), u64>,
 }
 
 impl ScopeStats {
@@ -1088,6 +1115,7 @@ impl ScopeStats {
             n_unconverted: 0,
             n_removed: 0,
             counters: PerContextCounters::default(),
+            conversion_matrix: BTreeMap::new(),
         }
     }
 }
@@ -1159,6 +1187,16 @@ impl PerContextCounters {
     #[must_use]
     pub(crate) fn monitored_total(&self) -> u64 {
         self.total.iter().sum()
+    }
+
+    /// These tallies as CpG / CpH conversion evidence for the chemistry check.
+    #[must_use]
+    pub(crate) fn conversion_counts(&self) -> ConversionCounts {
+        let mut counts = ConversionCounts::default();
+        for ctx in Context::ALL {
+            counts.add(ctx, self.unconv[ctx.index()], self.total[ctx.index()]);
+        }
+        counts
     }
 }
 
@@ -1369,6 +1407,7 @@ mod tests {
     use std::io::{BufRead, Cursor};
 
     use super::*;
+    use crate::chemistry::Readout;
     use crate::reference::{Reference, encode_ref_base};
     use crate::sam_reader::SamReader;
     use crate::{TagSpec, parse_contexts};
@@ -1398,6 +1437,8 @@ mod tests {
             remove_unconverted: false,
             scope_of_tid: vec![None],
             record_matrix: false,
+            control_contexts: contexts,
+            call_unconverted: true,
         }
     }
 
@@ -1655,7 +1696,7 @@ mod tests {
         let recs = parse_sam_records(&[&sam_line(0, 1, "10M", "CACACACACA", "IIIIIIIIII")], 10);
         let skips = RecordSkips { stored: &[(0, 5)], genomic: None };
         let mut counters = PerContextCounters::default();
-        let mut acc = MbiasAccumulator::new();
+        let mut acc = MbiasAccumulator::new(Readout::UnmethylatedConverts);
         proc.tally_and_accumulate(&RecordGeom::new(&recs[0]), skips, &mut counters, &mut acc);
 
         // Tally: masked 5' sites excluded, exactly as the non-fused path.
@@ -1683,7 +1724,7 @@ mod tests {
         let windows: Vec<(usize, usize)> = (0..9).map(|k| (2 * k, 2 * k + 1)).collect();
         let skips = RecordSkips { stored: &windows, genomic: None };
         let mut counters = PerContextCounters::default();
-        let mut acc = MbiasAccumulator::new();
+        let mut acc = MbiasAccumulator::new(Readout::UnmethylatedConverts);
         proc.tally_and_accumulate(&RecordGeom::new(&recs[0]), skips, &mut counters, &mut acc);
 
         // 20 CpA sites, 9 masked → 11 counted. Testing only the first window would
