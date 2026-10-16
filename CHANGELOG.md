@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-16
+
 ### Added
 - **TAPS and Illumina 5-base support** (`--chemistry`). `--chemistry` takes `em-seq` (the default), `bisulfite`, `taps` or `illumina-5base`. Under `taps` and `illumina-5base`, which convert methylated cytosines, M-bias masking and metrics work as for EM-seq, with every methylation figure read in the right polarity. There is no unconverted-read filtering, because a read from those chemistries carries nothing to test it against. The decision and unconverted-template options are still accepted so a pipeline can switch chemistry with one flag. Any given on the command line draws a warning that they have no effect. On COLO829 TAPS+ data, masking learns a 15-cycle read 2 mask. Read as retention, as an EM-seq run would, the same curve gives no mask at all.
 - **Chemistry check.** A run stops with an error when the genome's conversion pattern plainly belongs to the other kind of chemistry. TAPS-like means CpH conversion below 5% with CpG conversion of at least 10%. EM-seq-like means CpH conversion of at least 80%. Anything else is ambiguous and never stops the run, so an unconverted or failed library is never mistaken for the wrong chemistry. The check waits for 100,000 CpH and 10,000 CpG genome sites and stops the run as soon as they are met. With `--mbias-mask` it first runs when the mask is learned, so a mismatch stops the run before any record is written whenever the buffered templates clear those floors. Smaller inputs get a warning instead.
@@ -158,7 +160,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   highest), so neither read's calls dominate the whole overlap. Improves accuracy
   for short-insert / cfDNA libraries and avoids redundant work.
 
-[Unreleased]: https://github.com/fulcrumgenomics/methylsieve/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/fulcrumgenomics/methylsieve/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/fulcrumgenomics/methylsieve/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/fulcrumgenomics/methylsieve/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/fulcrumgenomics/methylsieve/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/fulcrumgenomics/methylsieve/releases/tag/v0.1.0
